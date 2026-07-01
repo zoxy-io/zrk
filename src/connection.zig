@@ -1,0 +1,326 @@
+//! A single load-generating connection: connect, then repeatedly pace-and-send
+//! one request at a time, recording coordinated-omission-corrected latency.
+//!
+//! One request is in flight per connection at a time (like wrk/wrk2). Achieving
+//! a high total rate is a matter of running many connections; each connection
+//! paces its own sends to a fixed schedule so that, when the server falls
+//! behind, backlogged requests still accrue latency against their *intended*
+//! send time rather than their actual send time.
+
+const std = @import("std");
+const Io = std.Io;
+const net = std.Io.net;
+
+const hdr = @import("hdr.zig");
+const httpmod = @import("http.zig");
+const tlsmod = @import("tls.zig");
+const StatusClass = httpmod.StatusClass;
+
+/// Per-connection counters. Aggregated across connections/threads for reporting.
+pub const Counters = struct {
+    /// Requests that received a complete response.
+    completed: u64 = 0,
+    /// Total response bytes read off the wire.
+    bytes: u64 = 0,
+    /// Responses whose status was not 2xx or 3xx (wrk's "Non-2xx/3xx").
+    status_errors: u64 = 0,
+    /// Failures establishing a connection.
+    connect_errors: u64 = 0,
+    /// Failures while writing a request.
+    write_errors: u64 = 0,
+    /// Failures while reading/parsing a response.
+    read_errors: u64 = 0,
+
+    pub fn add(self: *Counters, other: Counters) void {
+        self.completed += other.completed;
+        self.bytes += other.bytes;
+        self.status_errors += other.status_errors;
+        self.connect_errors += other.connect_errors;
+        self.write_errors += other.write_errors;
+        self.read_errors += other.read_errors;
+    }
+};
+
+/// A double-buffer for exposing a connection's live latency/counters to the
+/// dashboard thread without racing the hot path. The connection thread copies
+/// its live state here at most once per publish interval, under `mutex`; the
+/// dashboard reads it under the same lock. Cheap because it happens ~once/sec.
+pub const Publish = struct {
+    mutex: Io.Mutex = .init,
+    /// Snapshot histogram (must share the live histogram's layout).
+    hist: *hdr.Histogram,
+    counters: Counters = .{},
+    interval_ns: u64,
+    /// Monotonic-ns timestamp of the next scheduled publish (0 = publish asap).
+    next_ns: i128 = 0,
+};
+
+/// Everything a connection fiber needs. `histogram` and `counters` are owned by
+/// the connection's thread and must not be shared across threads without
+/// external synchronization (that is what `publish` is for).
+pub const Params = struct {
+    io: Io,
+    address: net.IpAddress,
+    host: []const u8,
+    request: []const u8,
+    is_tls: bool,
+    insecure: bool,
+    /// Nanoseconds between scheduled sends for THIS connection.
+    interval_ns: u64,
+    connect_timeout_ns: u64,
+    /// Monotonic timestamp at which the connection should stop sending.
+    end: Io.Timestamp,
+    /// Set to true (by the coordinator) to request an early graceful stop.
+    stop: *std.atomic.Value(bool),
+    histogram: *hdr.Histogram,
+    counters: *Counters,
+    /// Optional live-snapshot channel for the dashboard.
+    publish: ?*Publish = null,
+    /// Allocator for TLS certificate verification (borrowed).
+    allocator: std.mem.Allocator = undefined,
+    /// Pinned per-connection TLS buffers/client; required when `is_tls`.
+    tls_state: ?*tlsmod.State = null,
+    /// Shared trust store; null means verification is skipped.
+    ca_store: ?*tlsmod.CaStore = null,
+};
+
+const read_buffer_size = 16 * 1024;
+const write_buffer_size = 8 * 1024;
+
+/// Run one connection until `end` (or `stop`). Never returns an error: all
+/// failures are folded into `counters` and recovered from by reconnecting.
+pub fn run(p: *Params) void {
+    const io = p.io;
+
+    var read_buf: [read_buffer_size]u8 = undefined;
+    var write_buf: [write_buffer_size]u8 = undefined;
+
+    // Each connection keeps its own schedule, anchored when it first connects.
+    var next_send: ?Io.Timestamp = null;
+    const interval = Io.Duration.fromNanoseconds(@intCast(p.interval_ns));
+
+    while (!p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds) {
+        // (Re)connect.
+        var stream = connect(io, p.address, p.connect_timeout_ns) catch {
+            noteError(p, .connect);
+            // Back off briefly so a refused port doesn't spin the CPU.
+            io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
+            continue;
+        };
+        var conn_open = true;
+        defer if (conn_open) stream.close(io);
+
+        // Establish the transport (plaintext, or a TLS session over the stream)
+        // and obtain the reader/writer the HTTP layer talks to.
+        var app_reader: *Io.Reader = undefined;
+        var app_writer: *Io.Writer = undefined;
+        var plain_reader: net.Stream.Reader = undefined;
+        var plain_writer: net.Stream.Writer = undefined;
+        if (p.is_tls) {
+            const ts = p.tls_state.?;
+            ts.handshake(io, p.allocator, stream, p.host, p.insecure, p.ca_store) catch {
+                // A failed handshake counts as a connect error; try again later.
+                noteError(p, .connect);
+                stream.close(io);
+                conn_open = false;
+                io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
+                continue;
+            };
+            app_reader = ts.reader();
+            app_writer = ts.writer();
+        } else {
+            plain_reader = stream.reader(io, &read_buf);
+            plain_writer = stream.writer(io, &write_buf);
+            app_reader = &plain_reader.interface;
+            app_writer = &plain_writer.interface;
+        }
+
+        // Serve requests on this connection until it must close or the test ends.
+        while (conn_open and !p.stop.load(.monotonic)) {
+            const t = now(io);
+            if (t.nanoseconds >= p.end.nanoseconds) return;
+
+            // Anchor the schedule on the first request.
+            if (next_send == null) next_send = t;
+            const scheduled = next_send.?;
+
+            // Pace: if we're ahead of schedule, wait; if behind, fire immediately.
+            if (scheduled.nanoseconds > t.nanoseconds) {
+                const wait = Io.Duration.fromNanoseconds(scheduled.nanoseconds - t.nanoseconds);
+                io.sleep(wait, .awake) catch return;
+            }
+            next_send = scheduled.addDuration(interval);
+
+            // Send the (fixed) request.
+            app_writer.writeAll(p.request) catch {
+                noteError(p, .write);
+                stream.close(io);
+                conn_open = false;
+                break;
+            };
+            // For TLS the app writer only encrypts into the socket writer's
+            // buffer; the underlying stream writer must be flushed to actually
+            // send the ciphertext.
+            const flush_ok = blk: {
+                app_writer.flush() catch break :blk false;
+                if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch break :blk false;
+                break :blk true;
+            };
+            if (!flush_ok) {
+                noteError(p, .write);
+                stream.close(io);
+                conn_open = false;
+                break;
+            }
+
+            // Read the response.
+            const resp = httpmod.parseResponse(app_reader) catch {
+                noteError(p, .read);
+                stream.close(io);
+                conn_open = false;
+                break;
+            };
+
+            // Coordinated-omission-corrected latency: measured from the time the
+            // request *should* have been sent, not when it actually went out.
+            const done = now(io);
+            const latency_ns = done.nanoseconds - scheduled.nanoseconds;
+            const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
+            p.histogram.record(latency_us);
+
+            p.counters.completed += 1;
+            p.counters.bytes += resp.bytes;
+            switch (StatusClass.of(resp.status)) {
+                .success, .redirect => {},
+                else => p.counters.status_errors += 1,
+            }
+
+            maybePublish(p, done.nanoseconds);
+
+            if (!resp.keep_alive) {
+                stream.close(io);
+                conn_open = false;
+            }
+        }
+    }
+}
+
+fn now(io: Io) Io.Timestamp {
+    return Io.Timestamp.now(io, .awake);
+}
+
+/// Record a socket error, unless we are shutting down — errors caused by
+/// cancelling in-flight I/O at end-of-test are artifacts, not real failures.
+fn noteError(p: *Params, kind: enum { connect, write, read }) void {
+    if (p.stop.load(.monotonic)) return;
+    switch (kind) {
+        .connect => p.counters.connect_errors += 1,
+        .write => p.counters.write_errors += 1,
+        .read => p.counters.read_errors += 1,
+    }
+}
+
+/// Publish a snapshot of this connection's live state for the dashboard, but at
+/// most once per publish interval so the hot path stays essentially lock-free.
+fn maybePublish(p: *Params, now_ns: i128) void {
+    const pub_ptr = p.publish orelse return;
+    if (now_ns < pub_ptr.next_ns) return;
+    pub_ptr.mutex.lockUncancelable(p.io);
+    defer pub_ptr.mutex.unlock(p.io);
+    p.histogram.copyInto(pub_ptr.hist);
+    pub_ptr.counters = p.counters.*;
+    pub_ptr.next_ns = now_ns + @as(i128, @intCast(pub_ptr.interval_ns));
+}
+
+fn connect(io: Io, address: net.IpAddress, timeout_ns: u64) !net.Stream {
+    // NOTE: connect-with-timeout is not yet implemented by the std Io backends
+    // in this Zig version (it panics), so we connect without one for now.
+    // Per-request timeouts are handled at a higher level.
+    _ = timeout_ns;
+    return address.connect(io, .{ .mode = .stream });
+}
+
+// --- tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// A tiny keep-alive HTTP server used to exercise the real client path. Accepts
+/// a single connection (the client holds one keep-alive connection for the whole
+/// test) and answers every request with a fixed 200 response until the client
+/// closes, at which point it returns.
+fn testServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    serveConn(io, &stream);
+    stream.close(io);
+}
+
+fn serveConn(io: Io, stream: *net.Stream) void {
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    while (true) {
+        // Consume one request (headers up to the blank line); the client sends
+        // no body.
+        while (true) {
+            const line = r.interface.takeDelimiterInclusive('\n') catch return;
+            if (line.len <= 2) break; // "\r\n" or "\n": end of headers
+        }
+        w.interface.writeAll(response) catch return;
+        w.interface.flush() catch return;
+    }
+}
+
+test "run drives keep-alive requests against a local server" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Bind to an ephemeral port on loopback.
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .interval_ns = 2 * std.time.ns_per_ms, // ~500 req/s
+        .connect_timeout_ns = 0,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    // The client closed its connection when `run` returned, so the server fiber
+    // has finished; join it, then release the listening socket.
+    group.await(io) catch {};
+    server.deinit(io);
+
+    const response_len: u64 = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".len;
+    try testing.expect(counters.completed > 0);
+    try testing.expectEqual(@as(u64, 0), counters.status_errors);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+    try testing.expectEqual(@as(u64, 0), counters.write_errors);
+    try testing.expectEqual(counters.completed, histogram.count());
+    // Every response is fully consumed and counted (headers + body).
+    try testing.expectEqual(counters.completed * response_len, counters.bytes);
+}
