@@ -30,6 +30,8 @@ pub const Counters = struct {
     write_errors: u64 = 0,
     /// Failures while reading/parsing a response.
     read_errors: u64 = 0,
+    /// Requests abandoned because the response exceeded `--timeout`.
+    timeouts: u64 = 0,
 
     pub fn add(self: *Counters, other: Counters) void {
         self.completed += other.completed;
@@ -38,6 +40,12 @@ pub const Counters = struct {
         self.connect_errors += other.connect_errors;
         self.write_errors += other.write_errors;
         self.read_errors += other.read_errors;
+        self.timeouts += other.timeouts;
+    }
+
+    /// Total socket-level failures (connect + read + write + timeout).
+    pub fn socketErrors(self: Counters) u64 {
+        return self.connect_errors + self.read_errors + self.write_errors + self.timeouts;
     }
 };
 
@@ -67,7 +75,8 @@ pub const Params = struct {
     insecure: bool,
     /// Nanoseconds between scheduled sends for THIS connection.
     interval_ns: u64,
-    connect_timeout_ns: u64,
+    /// Per-request response timeout (0 = no timeout).
+    timeout_ns: u64,
     /// Monotonic timestamp at which the connection should stop sending.
     end: Io.Timestamp,
     /// Set to true (by the coordinator) to request an early graceful stop.
@@ -101,7 +110,7 @@ pub fn run(p: *Params) void {
 
     while (!p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds) {
         // (Re)connect.
-        var stream = connect(io, p.address, p.connect_timeout_ns) catch {
+        var stream = connect(io, p.address) catch {
             noteError(p, .connect);
             // Back off briefly so a refused port doesn't spin the CPU.
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
@@ -151,58 +160,129 @@ pub fn run(p: *Params) void {
             }
             next_send = scheduled.addDuration(interval);
 
-            // Send the (fixed) request.
-            app_writer.writeAll(p.request) catch {
-                noteError(p, .write);
-                stream.close(io);
-                conn_open = false;
-                break;
-            };
-            // For TLS the app writer only encrypts into the socket writer's
-            // buffer; the underlying stream writer must be flushed to actually
-            // send the ciphertext.
-            const flush_ok = blk: {
-                app_writer.flush() catch break :blk false;
-                if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch break :blk false;
-                break :blk true;
-            };
-            if (!flush_ok) {
-                noteError(p, .write);
-                stream.close(io);
-                conn_open = false;
-                break;
-            }
+            // Send the request and read its response, bounded by the response
+            // timeout. On the Threaded backend a blocking read can't be given a
+            // deadline directly, so we race the whole request against a timer and
+            // cancel the loser.
+            switch (performTimed(p, io, app_reader, app_writer)) {
+                .canceled => return, // connection cancelled at end-of-test
+                .timed_out => {
+                    if (!p.stop.load(.monotonic)) p.counters.timeouts += 1;
+                    stream.close(io);
+                    conn_open = false;
+                    break;
+                },
+                .write_failed => {
+                    noteError(p, .write);
+                    stream.close(io);
+                    conn_open = false;
+                    break;
+                },
+                .read_failed => {
+                    noteError(p, .read);
+                    stream.close(io);
+                    conn_open = false;
+                    break;
+                },
+                .ok => |resp| {
+                    // Coordinated-omission-corrected latency: measured from the
+                    // time the request *should* have been sent, not when it
+                    // actually went out.
+                    const done = now(io);
+                    const latency_ns = done.nanoseconds - scheduled.nanoseconds;
+                    const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
+                    p.histogram.record(latency_us);
 
-            // Read the response.
-            const resp = httpmod.parseResponse(app_reader) catch {
-                noteError(p, .read);
-                stream.close(io);
-                conn_open = false;
-                break;
-            };
+                    p.counters.completed += 1;
+                    p.counters.bytes += resp.bytes;
+                    switch (StatusClass.of(resp.status)) {
+                        .success, .redirect => {},
+                        else => p.counters.status_errors += 1,
+                    }
 
-            // Coordinated-omission-corrected latency: measured from the time the
-            // request *should* have been sent, not when it actually went out.
-            const done = now(io);
-            const latency_ns = done.nanoseconds - scheduled.nanoseconds;
-            const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
-            p.histogram.record(latency_us);
+                    maybePublish(p, done.nanoseconds);
 
-            p.counters.completed += 1;
-            p.counters.bytes += resp.bytes;
-            switch (StatusClass.of(resp.status)) {
-                .success, .redirect => {},
-                else => p.counters.status_errors += 1,
-            }
-
-            maybePublish(p, done.nanoseconds);
-
-            if (!resp.keep_alive) {
-                stream.close(io);
-                conn_open = false;
+                    if (!resp.keep_alive) {
+                        stream.close(io);
+                        conn_open = false;
+                    }
+                },
             }
         }
     }
+}
+
+/// Result of one send+receive attempt.
+const Outcome = union(enum) {
+    ok: httpmod.Response,
+    write_failed,
+    read_failed,
+    timed_out,
+    /// The connection fiber itself was cancelled (end-of-test).
+    canceled,
+};
+
+/// Result of the request work fiber (no timeout dimension).
+const WorkResult = union(enum) {
+    ok: httpmod.Response,
+    write_failed,
+    read_failed,
+};
+
+/// Perform one request, giving up after `p.timeout_ns`. The actual request runs
+/// on a separate fiber so that a stalled server read can be abandoned; a timer
+/// fiber races it and whichever finishes first wins.
+fn performTimed(p: *Params, io: Io, app_reader: *Io.Reader, app_writer: *Io.Writer) Outcome {
+    const Raced = union(enum) { done: WorkResult, timed_out: void };
+
+    // No timeout requested (or degenerate): run inline.
+    if (p.timeout_ns == 0) return fromWork(performWork(p, app_reader, app_writer));
+
+    var buf: [2]Raced = undefined;
+    var sel = Io.Select(Raced).init(io, &buf);
+
+    sel.concurrent(.done, performWork, .{ p, app_reader, app_writer }) catch {
+        // Cannot spawn the worker: fall back to a plain blocking request.
+        return fromWork(performWork(p, app_reader, app_writer));
+    };
+    sel.concurrent(.timed_out, timeoutTimer, .{ io, p.timeout_ns }) catch {
+        // No timer available: just wait for the worker.
+    };
+
+    const winner = sel.await() catch {
+        _ = sel.cancel();
+        return .canceled;
+    };
+    _ = sel.cancel(); // cancel the loser (interrupts its blocked read, if any)
+
+    return switch (winner) {
+        .done => |wr| fromWork(wr),
+        .timed_out => .timed_out,
+    };
+}
+
+fn fromWork(wr: WorkResult) Outcome {
+    return switch (wr) {
+        .ok => |r| .{ .ok = r },
+        .write_failed => .write_failed,
+        .read_failed => .read_failed,
+    };
+}
+
+/// Send the fixed request and parse one response. Runs either inline or on a
+/// worker fiber; touches only the transport, never the shared counters.
+fn performWork(p: *Params, app_reader: *Io.Reader, app_writer: *Io.Writer) WorkResult {
+    app_writer.writeAll(p.request) catch return .write_failed;
+    app_writer.flush() catch return .write_failed;
+    // For TLS the app writer only encrypts into the socket writer's buffer; the
+    // underlying stream writer must be flushed to actually send the ciphertext.
+    if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch return .write_failed;
+    const resp = httpmod.parseResponse(app_reader) catch return .read_failed;
+    return .{ .ok = resp };
+}
+
+fn timeoutTimer(io: Io, ns: u64) void {
+    io.sleep(Io.Duration.fromNanoseconds(@intCast(ns)), .awake) catch {};
 }
 
 fn now(io: Io) Io.Timestamp {
@@ -232,11 +312,10 @@ fn maybePublish(p: *Params, now_ns: i128) void {
     pub_ptr.next_ns = now_ns + @as(i128, @intCast(pub_ptr.interval_ns));
 }
 
-fn connect(io: Io, address: net.IpAddress, timeout_ns: u64) !net.Stream {
-    // NOTE: connect-with-timeout is not yet implemented by the std Io backends
-    // in this Zig version (it panics), so we connect without one for now.
-    // Per-request timeouts are handled at a higher level.
-    _ = timeout_ns;
+fn connect(io: Io, address: net.IpAddress) !net.Stream {
+    // NOTE: connect-with-timeout is not implemented by the std Io backend in
+    // this Zig version (it panics), so the connect itself uses the OS default.
+    // The response timeout is enforced per-request in `performTimed`.
     return address.connect(io, .{ .mode = .stream });
 }
 
@@ -302,7 +381,7 @@ test "run drives keep-alive requests against a local server" {
         .is_tls = false,
         .insecure = false,
         .interval_ns = 2 * std.time.ns_per_ms, // ~500 req/s
-        .connect_timeout_ns = 0,
+        .timeout_ns = 0,
         .end = end,
         .stop = &stop,
         .histogram = &histogram,
@@ -323,4 +402,65 @@ test "run drives keep-alive requests against a local server" {
     try testing.expectEqual(counters.completed, histogram.count());
     // Every response is fully consumed and counted (headers + body).
     try testing.expectEqual(counters.completed * response_len, counters.bytes);
+}
+
+/// Accepts one connection, reads the request, then holds the connection open
+/// without ever responding (interrupted by cancellation at test end).
+fn stallServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    while (true) {
+        const line = r.interface.takeDelimiterInclusive('\n') catch return;
+        if (line.len <= 2) break;
+    }
+    io.sleep(Io.Duration.fromSeconds(30), .awake) catch {};
+}
+
+test "run reports timeouts against a non-responsive server" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    try group.concurrent(io, stallServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(500));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .interval_ns = 2 * std.time.ns_per_ms,
+        .timeout_ns = 100 * std.time.ns_per_ms, // 100ms response timeout
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    // Interrupt the server (blocked in accept/sleep) and join.
+    group.cancel(io);
+    server.deinit(io);
+
+    // The server never responds, so nothing completes, but the response timeout
+    // must fire at least once within the run.
+    try testing.expectEqual(@as(u64, 0), counters.completed);
+    try testing.expect(counters.timeouts > 0);
 }
