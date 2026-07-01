@@ -74,7 +74,7 @@ pub const Dashboard = struct {
                 elapsed_s,             rate,
                 Dur.of(snap.hist.valueAtPercentile(50)), Dur.of(p99),
                 Dur.of(snap.hist.valueAtPercentile(99.9)), Dur.of(snap.hist.max()),
-                socketErrors(snap.counters) + snap.counters.status_errors,
+                snap.counters.socketErrors() + snap.counters.status_errors,
             });
         }
         try self.fw.interface.flush();
@@ -93,7 +93,7 @@ pub const Dashboard = struct {
         try writeBytes(w, @floatFromInt(c.bytes));
         try w.writeAll("\n");
 
-        const errs = socketErrors(c);
+        const errs = c.socketErrors();
         if (errs > 0 or c.status_errors > 0) {
             try w.print("  socket errors {d}      non-2xx/3xx {d}\n", .{ errs, c.status_errors });
         }
@@ -169,10 +169,9 @@ pub const Dashboard = struct {
         try writeBytes(w, @floatFromInt(c.bytes));
         try w.writeAll(" read\n");
         if (c.status_errors > 0) try w.print("  Non-2xx or 3xx responses: {d}\n", .{c.status_errors});
-        const errs = socketErrors(c);
-        if (errs > 0) {
-            try w.print("  Socket errors: connect {d}, read {d}, write {d}\n", .{
-                c.connect_errors, c.read_errors, c.write_errors,
+        if (c.socketErrors() > 0) {
+            try w.print("  Socket errors: connect {d}, read {d}, write {d}, timeout {d}\n", .{
+                c.connect_errors, c.read_errors, c.write_errors, c.timeouts,
             });
         }
         try w.print("Requests/sec: {d:.2}\n", .{rps});
@@ -196,10 +195,6 @@ pub const Dashboard = struct {
         }
     }
 };
-
-fn socketErrors(c: connection.Counters) u64 {
-    return c.connect_errors + c.read_errors + c.write_errors;
-}
 
 /// Duration formatting helper for latency values expressed in microseconds.
 const Dur = struct {

@@ -77,7 +77,7 @@ fn run(arena: std.mem.Allocator, io: Io, cfg: *const cli.Config) !void {
         .is_tls = cfg.url.isTls(),
         .insecure = cfg.insecure,
         .interval_ns = interval_ns,
-        .connect_timeout_ns = cfg.timeout_ns,
+        .timeout_ns = cfg.timeout_ns,
         .end = end,
         .stop = &stop,
         .allocator = arena,

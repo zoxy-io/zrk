@@ -103,7 +103,9 @@ a TTY, so piping just works.
 - Concurrency is thread-per-connection on the `std.Io.Threaded` backend, since
   the io_uring backend does not compile in the current Zig 0.16 toolchain. This
   is fine for moderate connection counts.
-- `--timeout` currently bounds shutdown behavior but not individual connects
-  (connect-with-timeout is unimplemented in the std backend and panics).
+- `--timeout` bounds the **response** (a request whose response doesn't arrive
+  in time is abandoned and counted as `Socket errors: ... timeout N`, matching
+  wrk2). The *connect* itself still uses the OS default, since
+  connect-with-timeout is unimplemented in the std backend and panics.
 - `-k` skips certificate verification; with the std TLS client this also omits
   SNI, so name-based virtual hosts may respond differently under `-k`.
