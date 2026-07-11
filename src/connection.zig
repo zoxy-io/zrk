@@ -254,14 +254,17 @@ const Watchdog = struct {
     io: Io,
     stream: *net.Stream,
     timeout_ns: u64,
-    /// Monotonic-ns deadline of the in-flight request; 0 = idle.
-    deadline_ns: std.atomic.Value(i128) = .init(0),
+    /// Monotonic-ns deadline of the in-flight request; 0 = idle. i64 (not
+    /// the timestamp's native i128) because 128-bit atomics don't exist on
+    /// x86_64; saturating i64 nanoseconds still spans ~292 years of uptime.
+    deadline_ns: std.atomic.Value(i64) = .init(0),
     /// True once the stream has been shut down; read by the request loop
     /// to tell a timeout from a genuine transport failure.
     fired: std.atomic.Value(bool) = .init(false),
 
     fn arm(w: *Watchdog, t: Io.Timestamp) void {
-        w.deadline_ns.store(t.nanoseconds + @as(i128, @intCast(w.timeout_ns)), .release);
+        const deadline = std.math.lossyCast(i64, t.nanoseconds + @as(i128, w.timeout_ns));
+        w.deadline_ns.store(deadline, .release);
     }
 
     fn disarm(w: *Watchdog) void {
@@ -278,16 +281,16 @@ const Watchdog = struct {
         const io = w.io;
         while (true) {
             const deadline = w.deadline_ns.load(.acquire);
-            const t = now(io).nanoseconds;
+            const t = std.math.lossyCast(i64, now(io).nanoseconds);
             if (deadline != 0 and t >= deadline) {
                 w.fired.store(true, .release);
                 w.stream.shutdown(io, .both) catch {};
                 return;
             }
-            const sleep_ns: i128 = if (deadline != 0)
+            const sleep_ns: i64 = if (deadline != 0)
                 deadline - t
             else
-                @max(w.timeout_ns / 2, std.time.ns_per_ms);
+                @intCast(@max(w.timeout_ns / 2, std.time.ns_per_ms));
             io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch return;
         }
     }
