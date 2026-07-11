@@ -116,8 +116,6 @@ pub fn run(p: *Params) void {
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
             continue;
         };
-        var conn_open = true;
-        defer if (conn_open) stream.close(io);
 
         // Establish the transport (plaintext, or a TLS session over the stream)
         // and obtain the reader/writer the HTTP layer talks to.
@@ -131,7 +129,6 @@ pub fn run(p: *Params) void {
                 // A failed handshake counts as a connect error; try again later.
                 noteError(p, .connect);
                 stream.close(io);
-                conn_open = false;
                 io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
                 continue;
             };
@@ -142,6 +139,32 @@ pub fn run(p: *Params) void {
             plain_writer = stream.writer(io, &write_buf);
             app_reader = &plain_reader.interface;
             app_writer = &plain_writer.interface;
+        }
+
+        // The response timeout is enforced by one watchdog task per
+        // *connection*, armed/disarmed with an atomic store per request.
+        // The previous design raced every request against a freshly
+        // spawned timer task and canceled the loser; on the Threaded
+        // backend that per-request spawn/cancel pair costs milliseconds
+        // (macOS especially), capping every connection near 500 req/s no
+        // matter how fast the target answers.
+        var watchdog: Watchdog = .{ .io = io, .stream = &stream, .timeout_ns = p.timeout_ns };
+        var watchdog_group: Io.Group = .init;
+        var watchdog_active = false;
+        if (p.timeout_ns != 0) {
+            if (watchdog_group.concurrent(io, Watchdog.watch, .{&watchdog})) |_| {
+                watchdog_active = true;
+            } else |_| {
+                // No task available: requests run untimed, as before.
+            }
+        }
+        var conn_open = true;
+        // Teardown order matters: cancel joins the watchdog before the
+        // stream closes, so the watchdog can never shut down a closed
+        // (and possibly kernel-reused) fd.
+        defer {
+            if (watchdog_active) watchdog_group.cancel(io);
+            stream.close(io);
         }
 
         // Serve requests on this connection until it must close or the test ends.
@@ -160,29 +183,30 @@ pub fn run(p: *Params) void {
             }
             next_send = scheduled.addDuration(interval);
 
-            // Send the request and read its response, bounded by the response
-            // timeout. On the Threaded backend a blocking read can't be given a
-            // deadline directly, so we race the whole request against a timer and
-            // cancel the loser.
-            switch (performTimed(p, io, app_reader, app_writer)) {
-                .canceled => return, // connection cancelled at end-of-test
-                .timed_out => {
-                    if (!p.stop.load(.monotonic)) p.counters.timeouts += 1;
-                    stream.close(io);
-                    conn_open = false;
-                    break;
-                },
+            // Send the request and read its response inline on this thread;
+            // the watchdog turns a stalled read into a socket shutdown, which
+            // surfaces here as a read failure that `fired` reclassifies.
+            if (watchdog_active) watchdog.arm(now(io));
+            const work = performWork(p, app_reader, app_writer);
+            if (watchdog_active) watchdog.disarm();
+            const timed_out = watchdog_active and watchdog.fired.load(.acquire);
+
+            switch (work) {
                 .write_failed => {
-                    noteError(p, .write);
-                    stream.close(io);
+                    if (timed_out) {
+                        if (!p.stop.load(.monotonic)) p.counters.timeouts += 1;
+                    } else {
+                        noteError(p, .write);
+                    }
                     conn_open = false;
-                    break;
                 },
                 .read_failed => {
-                    noteError(p, .read);
-                    stream.close(io);
+                    if (timed_out) {
+                        if (!p.stop.load(.monotonic)) p.counters.timeouts += 1;
+                    } else {
+                        noteError(p, .read);
+                    }
                     conn_open = false;
-                    break;
                 },
                 .ok => |resp| {
                     // Coordinated-omission-corrected latency: measured from the
@@ -202,8 +226,10 @@ pub fn run(p: *Params) void {
 
                     maybePublish(p, done.nanoseconds);
 
-                    if (!resp.keep_alive) {
-                        stream.close(io);
+                    // A fired watchdog shut the socket down even though the
+                    // response won the race; the response still counts, but
+                    // the connection is dead.
+                    if (timed_out or !resp.keep_alive) {
                         conn_open = false;
                     }
                 },
@@ -213,64 +239,62 @@ pub fn run(p: *Params) void {
 }
 
 /// Result of one send+receive attempt.
-const Outcome = union(enum) {
-    ok: httpmod.Response,
-    write_failed,
-    read_failed,
-    timed_out,
-    /// The connection fiber itself was cancelled (end-of-test).
-    canceled,
-};
-
-/// Result of the request work fiber (no timeout dimension).
 const WorkResult = union(enum) {
     ok: httpmod.Response,
     write_failed,
     read_failed,
 };
 
-/// Perform one request, giving up after `p.timeout_ns`. The actual request runs
-/// on a separate fiber so that a stalled server read can be abandoned; a timer
-/// fiber races it and whichever finishes first wins.
-fn performTimed(p: *Params, io: Io, app_reader: *Io.Reader, app_writer: *Io.Writer) Outcome {
-    const Raced = union(enum) { done: WorkResult, timed_out: void };
+/// One per connection: watches the in-flight request's deadline and, on
+/// expiry, shuts the stream down so the blocked read unblocks with an error
+/// the request loop reclassifies as a timeout (the wrk approach, adapted to
+/// blocking threads). Arming costs one atomic store on the request path —
+/// no per-request task spawns.
+const Watchdog = struct {
+    io: Io,
+    stream: *net.Stream,
+    timeout_ns: u64,
+    /// Monotonic-ns deadline of the in-flight request; 0 = idle.
+    deadline_ns: std.atomic.Value(i128) = .init(0),
+    /// True once the stream has been shut down; read by the request loop
+    /// to tell a timeout from a genuine transport failure.
+    fired: std.atomic.Value(bool) = .init(false),
 
-    // No timeout requested (or degenerate): run inline.
-    if (p.timeout_ns == 0) return fromWork(performWork(p, app_reader, app_writer));
+    fn arm(w: *Watchdog, t: Io.Timestamp) void {
+        w.deadline_ns.store(t.nanoseconds + @as(i128, @intCast(w.timeout_ns)), .release);
+    }
 
-    var buf: [2]Raced = undefined;
-    var sel = Io.Select(Raced).init(io, &buf);
+    fn disarm(w: *Watchdog) void {
+        w.deadline_ns.store(0, .release);
+    }
 
-    sel.concurrent(.done, performWork, .{ p, app_reader, app_writer }) catch {
-        // Cannot spawn the worker: fall back to a plain blocking request.
-        return fromWork(performWork(p, app_reader, app_writer));
-    };
-    sel.concurrent(.timed_out, timeoutTimer, .{ io, p.timeout_ns }) catch {
-        // No timer available: just wait for the worker.
-    };
+    /// Runs until it fires or is canceled at connection teardown. While a
+    /// request is in flight it sleeps exactly to that deadline (successive
+    /// deadlines only move forward, so it can never oversleep a later one);
+    /// while idle it ticks at half the timeout, so a request armed mid-tick
+    /// is caught at most 1.5x the timeout late. Deliberate slack: this
+    /// guards against stalls, it is not a precision timer.
+    fn watch(w: *Watchdog) void {
+        const io = w.io;
+        while (true) {
+            const deadline = w.deadline_ns.load(.acquire);
+            const t = now(io).nanoseconds;
+            if (deadline != 0 and t >= deadline) {
+                w.fired.store(true, .release);
+                w.stream.shutdown(io, .both) catch {};
+                return;
+            }
+            const sleep_ns: i128 = if (deadline != 0)
+                deadline - t
+            else
+                @max(w.timeout_ns / 2, std.time.ns_per_ms);
+            io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch return;
+        }
+    }
+};
 
-    const winner = sel.await() catch {
-        _ = sel.cancel();
-        return .canceled;
-    };
-    _ = sel.cancel(); // cancel the loser (interrupts its blocked read, if any)
-
-    return switch (winner) {
-        .done => |wr| fromWork(wr),
-        .timed_out => .timed_out,
-    };
-}
-
-fn fromWork(wr: WorkResult) Outcome {
-    return switch (wr) {
-        .ok => |r| .{ .ok = r },
-        .write_failed => .write_failed,
-        .read_failed => .read_failed,
-    };
-}
-
-/// Send the fixed request and parse one response. Runs either inline or on a
-/// worker fiber; touches only the transport, never the shared counters.
+/// Send the fixed request and parse one response; touches only the
+/// transport, never the shared counters.
 fn performWork(p: *Params, app_reader: *Io.Reader, app_writer: *Io.Writer) WorkResult {
     app_writer.writeAll(p.request) catch return .write_failed;
     app_writer.flush() catch return .write_failed;
@@ -279,10 +303,6 @@ fn performWork(p: *Params, app_reader: *Io.Reader, app_writer: *Io.Writer) WorkR
     if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch return .write_failed;
     const resp = httpmod.parseResponse(app_reader) catch return .read_failed;
     return .{ .ok = resp };
-}
-
-fn timeoutTimer(io: Io, ns: u64) void {
-    io.sleep(Io.Duration.fromNanoseconds(@intCast(ns)), .awake) catch {};
 }
 
 fn now(io: Io) Io.Timestamp {
@@ -315,7 +335,7 @@ fn maybePublish(p: *Params, now_ns: i128) void {
 fn connect(io: Io, address: net.IpAddress) !net.Stream {
     // NOTE: connect-with-timeout is not implemented by the std Io backend in
     // this Zig version (it panics), so the connect itself uses the OS default.
-    // The response timeout is enforced per-request in `performTimed`.
+    // The response timeout is enforced per-request by the `Watchdog`.
     return address.connect(io, .{ .mode = .stream });
 }
 
