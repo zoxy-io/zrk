@@ -74,6 +74,9 @@ pub const Config = struct {
     /// If set, stream one NDJSON object per `--interval` with that window's
     /// throughput and latency percentiles (a time series, ideal for ramps).
     timeseries_path: ?[]const u8 = null,
+    /// Augment each `--timeseries` row with that interval's full latency
+    /// distribution as an HdrHistogram V2 base64 blob (lossless, mergeable).
+    timeseries_histogram: bool = false,
 
     /// Record a (coordinated-omission-corrected) latency sample for requests
     /// that hit `--timeout`, so the tail isn't silently truncated. On by
@@ -138,6 +141,8 @@ pub const usage =
     \\                            distribution (.hgrm) to FILE
     \\      --timeseries  <FILE>  Stream per-interval NDJSON (throughput +
     \\                            latency percentiles) to FILE
+    \\      --timeseries-histogram  Add each interval's full latency histogram
+    \\                            (HdrHistogram base64) to every --timeseries row
     \\      --no-record-timeouts  Drop timed-out requests from the latency
     \\                            histogram (default: record them)
     \\
@@ -201,6 +206,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.hdr_path = try nextValue(tokens, &i);
         } else if (eq(arg, "--timeseries")) {
             cfg.timeseries_path = try nextValue(tokens, &i);
+        } else if (eq(arg, "--timeseries-histogram")) {
+            cfg.timeseries_histogram = true;
         } else if (eq(arg, "--slo-p99")) {
             cfg.slo_p99_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--max-error-rate")) {

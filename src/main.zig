@@ -61,7 +61,10 @@ pub fn main(init: std.process.Init) !void {
         ts_obj = try report.TimeSeries.init(arena, &ts_fw.interface, &cfg);
         ts_ptr = &ts_obj;
     }
-    defer if (cfg.timeseries_path != null) ts_file.close(io);
+    defer if (cfg.timeseries_path != null) {
+        ts_obj.deinit();
+        ts_file.close(io);
+    };
 
     var progress: Progress = .{ .dash = if (json) null else &dash, .ts = ts_ptr };
     const active = progress.dash != null or progress.ts != null;
