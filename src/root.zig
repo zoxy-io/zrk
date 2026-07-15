@@ -10,9 +10,11 @@ pub const Histogram = hdr.Histogram;
 
 pub const cli = @import("cli.zig");
 pub const http = @import("http.zig");
+pub const pace = @import("pace.zig");
 pub const connection = @import("connection.zig");
 pub const runner = @import("runner.zig");
 pub const stats = @import("stats.zig");
+pub const report = @import("report.zig");
 pub const tui = @import("tui.zig");
 pub const tls = @import("tls.zig");
 

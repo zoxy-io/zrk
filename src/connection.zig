@@ -14,6 +14,7 @@ const net = std.Io.net;
 const hdr = @import("hdr.zig");
 const httpmod = @import("http.zig");
 const tlsmod = @import("tls.zig");
+const pace = @import("pace.zig");
 const StatusClass = httpmod.StatusClass;
 
 /// Per-connection counters. Aggregated across connections/threads for reporting.
@@ -32,6 +33,9 @@ pub const Counters = struct {
     read_errors: u64 = 0,
     /// Requests abandoned because the response exceeded `--timeout`.
     timeouts: u64 = 0,
+    /// Completed responses bucketed by status class, indexed by status/100
+    /// (so [1]=1xx .. [5]=5xx; index 0 is unused). Sums to `completed`.
+    status_class: [6]u64 = [_]u64{0} ** 6,
 
     pub fn add(self: *Counters, other: Counters) void {
         self.completed += other.completed;
@@ -41,6 +45,17 @@ pub const Counters = struct {
         self.write_errors += other.write_errors;
         self.read_errors += other.read_errors;
         self.timeouts += other.timeouts;
+        for (&self.status_class, other.status_class) |*d, s| d.* += s;
+    }
+
+    /// Record a completed response's status: bump its class bucket and, for
+    /// non-2xx/3xx, the `status_errors` tally (wrk's "Non-2xx/3xx").
+    pub fn recordStatus(self: *Counters, status: u16) void {
+        self.status_class[@min(status / 100, 5)] += 1;
+        switch (StatusClass.of(status)) {
+            .success, .redirect => {},
+            else => self.status_errors += 1,
+        }
     }
 
     /// Total socket-level failures (connect + read + write + timeout).
@@ -73,10 +88,13 @@ pub const Params = struct {
     request: []const u8,
     is_tls: bool,
     insecure: bool,
-    /// Nanoseconds between scheduled sends for THIS connection.
-    interval_ns: u64,
+    /// Send schedule for THIS connection (constant spacing or a linear ramp).
+    schedule: pace.Schedule,
     /// Per-request response timeout (0 = no timeout).
     timeout_ns: u64,
+    /// Record a coordinated-omission-corrected latency sample when a request
+    /// times out, instead of dropping it (which would truncate the tail).
+    record_timeouts: bool = true,
     /// Monotonic timestamp at which the connection should stop sending.
     end: Io.Timestamp,
     /// Set to true (by the coordinator) to request an early graceful stop.
@@ -104,9 +122,11 @@ pub fn run(p: *Params) void {
     var read_buf: [read_buffer_size]u8 = undefined;
     var write_buf: [write_buffer_size]u8 = undefined;
 
-    // Each connection keeps its own schedule, anchored when it first connects.
-    var next_send: ?Io.Timestamp = null;
-    const interval = Io.Duration.fromNanoseconds(@intCast(p.interval_ns));
+    // Each connection keeps its own schedule, anchored when it first connects;
+    // `send_index` is the coordinated-omission-correct request counter that
+    // drives it, persisting across reconnects so a stall is caught up (not reset).
+    var anchor: ?Io.Timestamp = null;
+    var send_index: u64 = 0;
 
     while (!p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds) {
         // (Re)connect.
@@ -172,16 +192,18 @@ pub fn run(p: *Params) void {
             const t = now(io);
             if (t.nanoseconds >= p.end.nanoseconds) return;
 
-            // Anchor the schedule on the first request.
-            if (next_send == null) next_send = t;
-            const scheduled = next_send.?;
+            // Anchor the schedule on the first request; each send's intended
+            // time is a closed-form function of its index (constant or ramp).
+            if (anchor == null) anchor = t;
+            const offset = p.schedule.offsetNs(send_index);
+            const scheduled = anchor.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
 
             // Pace: if we're ahead of schedule, wait; if behind, fire immediately.
             if (scheduled.nanoseconds > t.nanoseconds) {
                 const wait = Io.Duration.fromNanoseconds(scheduled.nanoseconds - t.nanoseconds);
                 io.sleep(wait, .awake) catch return;
             }
-            next_send = scheduled.addDuration(interval);
+            send_index += 1;
 
             // Send the request and read its response inline on this thread;
             // the watchdog turns a stalled read into a socket shutdown, which
@@ -193,19 +215,11 @@ pub fn run(p: *Params) void {
 
             switch (work) {
                 .write_failed => {
-                    if (timed_out) {
-                        if (!p.stop.load(.monotonic)) p.counters.timeouts += 1;
-                    } else {
-                        noteError(p, .write);
-                    }
+                    if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .write);
                     conn_open = false;
                 },
                 .read_failed => {
-                    if (timed_out) {
-                        if (!p.stop.load(.monotonic)) p.counters.timeouts += 1;
-                    } else {
-                        noteError(p, .read);
-                    }
+                    if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .read);
                     conn_open = false;
                 },
                 .ok => |resp| {
@@ -219,10 +233,7 @@ pub fn run(p: *Params) void {
 
                     p.counters.completed += 1;
                     p.counters.bytes += resp.bytes;
-                    switch (StatusClass.of(resp.status)) {
-                        .success, .redirect => {},
-                        else => p.counters.status_errors += 1,
-                    }
+                    p.counters.recordStatus(resp.status);
 
                     maybePublish(p, done.nanoseconds);
 
@@ -323,6 +334,22 @@ fn noteError(p: *Params, kind: enum { connect, write, read }) void {
     }
 }
 
+/// A timed-out request (the watchdog shut the socket down): count it and, unless
+/// `--no-record-timeouts` is set, log a coordinated-omission-corrected latency
+/// sample measured from the scheduled send time, so the tail reflects the stall
+/// instead of dropping the worst samples. Skipped during shutdown, where a
+/// timeout is a teardown artifact rather than a real failure.
+fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
+    if (p.stop.load(.monotonic)) return;
+    p.counters.timeouts += 1;
+    if (p.record_timeouts) {
+        const done = now(io);
+        const latency_ns = done.nanoseconds - scheduled.nanoseconds;
+        const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
+        p.histogram.record(latency_us);
+    }
+}
+
 /// Publish a snapshot of this connection's live state for the dashboard, but at
 /// most once per publish interval so the hot path stays essentially lock-free.
 fn maybePublish(p: *Params, now_ns: i128) void {
@@ -403,7 +430,7 @@ test "run drives keep-alive requests against a local server" {
         .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
         .is_tls = false,
         .insecure = false,
-        .interval_ns = 2 * std.time.ns_per_ms, // ~500 req/s
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } }, // ~500 req/s
         .timeout_ns = 0,
         .end = end,
         .stop = &stop,
@@ -469,7 +496,7 @@ test "run reports timeouts against a non-responsive server" {
         .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
         .is_tls = false,
         .insecure = false,
-        .interval_ns = 2 * std.time.ns_per_ms,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
         .timeout_ns = 100 * std.time.ns_per_ms, // 100ms response timeout
         .end = end,
         .stop = &stop,
@@ -486,4 +513,52 @@ test "run reports timeouts against a non-responsive server" {
     // must fire at least once within the run.
     try testing.expectEqual(@as(u64, 0), counters.completed);
     try testing.expect(counters.timeouts > 0);
+    // With record_timeouts on (the default), each timeout contributes exactly one
+    // coordinated-omission-corrected latency sample so the tail isn't truncated.
+    try testing.expectEqual(counters.timeouts, histogram.count());
+}
+
+test "run with record_timeouts disabled drops timed-out samples" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    try group.concurrent(io, stallServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(500));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
+        .timeout_ns = 100 * std.time.ns_per_ms,
+        .record_timeouts = false,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.cancel(io);
+    server.deinit(io);
+
+    try testing.expect(counters.timeouts > 0);
+    try testing.expectEqual(@as(u64, 0), histogram.count());
 }
