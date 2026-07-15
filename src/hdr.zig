@@ -21,6 +21,16 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
+// HdrHistogram V2 interchange cookies (see `encodeBase64`). The low nibble of
+// the cookie's third byte carries a word-size marker that decoders mask off with
+// `cookie_base_mask`; the canonical library sets it to 0x10, which we match for
+// byte-identical output.
+const v2_encoding_base: u32 = 0x1c849303;
+const v2_compressed_base: u32 = 0x1c849304;
+const encoding_cookie: u32 = v2_encoding_base | 0x10; // 0x1c849313
+const compressed_cookie: u32 = v2_compressed_base | 0x10; // 0x1c849314
+const cookie_base_mask: u32 = ~@as(u32, 0xf0);
+
 pub const Histogram = struct {
     /// Smallest value that can be distinguished from 0. Values below this are
     /// clamped up to it when recorded.
@@ -231,6 +241,28 @@ pub const Histogram = struct {
         dst.max_value = self.max_value;
     }
 
+    /// Set `self` to the element-wise difference `a - b` (all three sharing the
+    /// layout). Turns two cumulative snapshots into the interval between them.
+    /// The subtraction saturates (so a transiently-racy `b > a` can't underflow),
+    /// and total/min/max are rebuilt by scanning so percentile queries on the
+    /// result are correct.
+    pub fn setToDifference(self: *Histogram, a: *const Histogram, b: *const Histogram) void {
+        assert(self.counts_len == a.counts_len and a.counts_len == b.counts_len);
+        self.total_count = 0;
+        self.min_value = std.math.maxInt(u64);
+        self.max_value = 0;
+        for (self.counts, a.counts, b.counts, 0..) |*dst, av, bv, i| {
+            const c = av -| bv;
+            dst.* = c;
+            if (c != 0) {
+                self.total_count += c;
+                const v = self.valueFromIndex(@intCast(i));
+                if (v < self.min_value) self.min_value = v;
+                if (v > self.max_value) self.max_value = v;
+            }
+        }
+    }
+
     // --- queries -------------------------------------------------------------
 
     pub fn count(self: *const Histogram) u64 {
@@ -293,7 +325,263 @@ pub const Histogram = struct {
     pub fn valuesAreEquivalent(self: *const Histogram, a: u64, b: u64) bool {
         return self.lowestEquivalentValue(a) == self.lowestEquivalentValue(b);
     }
+
+    // --- export --------------------------------------------------------------
+
+    /// Write the classic HdrHistogram percentile distribution (`.hgrm`) — the
+    /// same four-column format produced by `outputPercentileDistribution` and by
+    /// wrk2's `--latency`, directly loadable by the HdrHistogram online plotter.
+    ///
+    /// `value_scale` divides each recorded value before printing (e.g. pass 1000
+    /// to render microsecond samples as milliseconds). `ticks_per_half_distance`
+    /// controls tail resolution; 5 matches HdrHistogram's default.
+    pub fn writePercentileDistribution(
+        self: *const Histogram,
+        w: *std.Io.Writer,
+        value_scale: f64,
+        ticks_per_half_distance: u32,
+    ) !void {
+        try w.writeAll("       Value     Percentile TotalCount 1/(1-Percentile)\n\n");
+
+        if (self.total_count != 0) {
+            var percentile_to_iterate_to: f64 = 0;
+            var running: u64 = 0;
+            var done = false;
+            var i: usize = 0;
+            while (i < self.counts.len and !done) : (i += 1) {
+                running += self.counts[i];
+                while (running >= countAtPercentile(self.total_count, percentile_to_iterate_to)) {
+                    const at_top = running >= self.total_count;
+                    const value = self.highestEquivalentValue(self.valueFromIndex(@intCast(i)));
+                    const level: f64 = if (at_top) 100.0 else percentile_to_iterate_to;
+                    try w.print("{d:15.3} {d:14.6} {d:10} ", .{
+                        @as(f64, @floatFromInt(value)) / value_scale,
+                        level / 100.0,
+                        running,
+                    });
+                    if (level < 100.0) {
+                        try w.print("{d:14.2}\n", .{1.0 / (1.0 - level / 100.0)});
+                    } else {
+                        try w.writeAll("           inf\n");
+                    }
+                    if (at_top) {
+                        done = true;
+                        break;
+                    }
+                    percentile_to_iterate_to += nextPercentileStep(percentile_to_iterate_to, ticks_per_half_distance);
+                    if (percentile_to_iterate_to > 100.0) {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        try w.print("#[Mean    = {d:12.3}, StdDeviation   = {d:12.3}]\n", .{
+            self.mean() / value_scale, self.stdDev() / value_scale,
+        });
+        try w.print("#[Max     = {d:12.3}, Total count    = {d:12}]\n", .{
+            @as(f64, @floatFromInt(self.max())) / value_scale, self.total_count,
+        });
+        try w.print("#[Buckets = {d:12}, SubBuckets     = {d:12}]\n", .{
+            self.bucket_count, self.sub_bucket_count,
+        });
+    }
+
+    /// Encode this histogram as an HdrHistogram **V2 compressed** base64 string —
+    /// the canonical interchange form. It is losslessly decodable and mergeable
+    /// by any HdrHistogram library (Java/Go/JS/Rust/…), so a harness can store
+    /// the raw distribution and re-percentile or merge runs after the fact.
+    ///
+    /// Layout: base64( compressedCookie:u32be, len:u32be, zlib( encodedForm ) ),
+    /// where the encoded form is a 40-byte header (cookie, payload length,
+    /// normalizing offset, sig figs, lowest, highest, int→double ratio) followed
+    /// by the counts as ZigZag LEB128 varints with negative values run-length
+    /// encoding consecutive zeros. Caller owns the returned slice.
+    pub fn encodeBase64(self: *const Histogram, gpa: Allocator) ![]u8 {
+        // Payload: counts[0..=index(maxValue)] as ZigZag varints, zeros RLE'd.
+        const counts_limit: u32 = self.countsIndexFor(self.max_value) + 1;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+        var i: u32 = 0;
+        while (i < counts_limit) {
+            if (self.counts[i] == 0) {
+                var zeros: u64 = 1;
+                i += 1;
+                while (i < counts_limit and self.counts[i] == 0) : (i += 1) zeros += 1;
+                try appendZigZag(&payload, gpa, if (zeros > 1) -@as(i64, @intCast(zeros)) else 0);
+            } else {
+                try appendZigZag(&payload, gpa, @intCast(self.counts[i]));
+                i += 1;
+            }
+        }
+
+        // Uncompressed encoded form: 40-byte header + payload.
+        const encoded = try gpa.alloc(u8, 40 + payload.items.len);
+        defer gpa.free(encoded);
+        std.mem.writeInt(u32, encoded[0..][0..4], encoding_cookie, .big);
+        std.mem.writeInt(u32, encoded[4..][0..4], @intCast(payload.items.len), .big);
+        std.mem.writeInt(u32, encoded[8..][0..4], 0, .big); // normalizing index offset
+        std.mem.writeInt(u32, encoded[12..][0..4], @as(u32, self.sig_figs), .big);
+        std.mem.writeInt(u64, encoded[16..][0..8], self.lowest_discernible, .big);
+        std.mem.writeInt(u64, encoded[24..][0..8], self.highest_trackable, .big);
+        std.mem.writeInt(u64, encoded[32..][0..8], @bitCast(@as(f64, 1.0)), .big); // int→double ratio
+        @memcpy(encoded[40..], payload.items);
+
+        // zlib-compress, then frame with the compressed cookie + length.
+        const zbytes = try zlibCompress(gpa, encoded);
+        defer gpa.free(zbytes);
+        const framed = try gpa.alloc(u8, 8 + zbytes.len);
+        defer gpa.free(framed);
+        std.mem.writeInt(u32, framed[0..][0..4], compressed_cookie, .big);
+        std.mem.writeInt(u32, framed[4..][0..4], @intCast(zbytes.len), .big);
+        @memcpy(framed[8..], zbytes);
+
+        // Standard base64 (padded), matching the canonical library.
+        const enc = std.base64.standard.Encoder;
+        const out = try gpa.alloc(u8, enc.calcSize(framed.len));
+        _ = enc.encode(out, framed);
+        return out;
+    }
 };
+
+/// Decode an HdrHistogram V2 compressed base64 string (as produced by
+/// `encodeBase64` or any HdrHistogram library) into a fresh histogram. The
+/// caller owns it and must `deinit`. Enables merging previously-stored runs.
+pub fn decodeBase64(gpa: Allocator, str: []const u8) !Histogram {
+    const dec = std.base64.standard.Decoder;
+    const framed = try gpa.alloc(u8, try dec.calcSizeForSlice(str));
+    defer gpa.free(framed);
+    try dec.decode(framed, str);
+    if (framed.len < 8) return error.InvalidHistogram;
+
+    const cookie = std.mem.readInt(u32, framed[0..][0..4], .big);
+    if ((cookie & cookie_base_mask) != v2_compressed_base) return error.InvalidCookie;
+    const zlen = std.mem.readInt(u32, framed[4..][0..4], .big);
+    if (8 + @as(usize, zlen) > framed.len) return error.InvalidHistogram;
+
+    const encoded = try zlibDecompress(gpa, framed[8 .. 8 + zlen]);
+    defer gpa.free(encoded);
+    if (encoded.len < 40) return error.InvalidHistogram;
+
+    const enc_cookie = std.mem.readInt(u32, encoded[0..][0..4], .big);
+    if ((enc_cookie & cookie_base_mask) != v2_encoding_base) return error.InvalidCookie;
+    const payload_len = std.mem.readInt(u32, encoded[4..][0..4], .big);
+    const sig_figs: u8 = @intCast(std.mem.readInt(u32, encoded[12..][0..4], .big));
+    const lowest = std.mem.readInt(u64, encoded[16..][0..8], .big);
+    const highest = std.mem.readInt(u64, encoded[24..][0..8], .big);
+    if (40 + @as(usize, payload_len) > encoded.len) return error.InvalidHistogram;
+
+    var hist = try Histogram.init(gpa, lowest, highest, sig_figs);
+    errdefer hist.deinit();
+
+    // Expand the ZigZag/RLE payload back into the counts array.
+    const payload = encoded[40 .. 40 + payload_len];
+    var idx: u32 = 0;
+    var pos: usize = 0;
+    while (pos < payload.len and idx < hist.counts_len) {
+        const v = readZigZag(payload, &pos);
+        if (v < 0) {
+            idx += @intCast(-v); // run of zeros
+        } else {
+            hist.counts[idx] = @intCast(v);
+            idx += 1;
+        }
+    }
+
+    // Rebuild total/min/max from the restored counts.
+    hist.total_count = 0;
+    hist.min_value = std.math.maxInt(u64);
+    hist.max_value = 0;
+    for (hist.counts, 0..) |c, j| {
+        if (c == 0) continue;
+        hist.total_count += c;
+        const val = hist.valueFromIndex(@intCast(j));
+        if (val < hist.min_value) hist.min_value = val;
+        if (val > hist.max_value) hist.max_value = val;
+    }
+    return hist;
+}
+
+/// Append `v` as a ZigZag LEB128-64b9B varint (HdrHistogram's V2 scheme): 7 bits
+/// per byte with a high continuation bit, and a full 8-bit ninth byte.
+fn appendZigZag(list: *std.ArrayList(u8), gpa: Allocator, v: i64) !void {
+    const uv: u64 = @bitCast(v);
+    var value: u64 = (uv << 1) ^ @as(u64, @bitCast(v >> 63)); // ZigZag encode
+    var emitted: usize = 0;
+    while (emitted < 8) : (emitted += 1) {
+        if (value >> 7 == 0) {
+            try list.append(gpa, @intCast(value));
+            return;
+        }
+        try list.append(gpa, @as(u8, @intCast(value & 0x7f)) | 0x80);
+        value >>= 7;
+    }
+    try list.append(gpa, @intCast(value & 0xff)); // 9th byte: full 8 bits
+}
+
+/// Inverse of `appendZigZag`, advancing `pos` past the consumed bytes.
+fn readZigZag(bytes: []const u8, pos: *usize) i64 {
+    var value: u64 = 0;
+    var shift: u6 = 0;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const b = bytes[pos.*];
+        pos.* += 1;
+        if (i == 8) {
+            value |= @as(u64, b) << 56; // 9th byte carries the top 8 bits
+            break;
+        }
+        value |= @as(u64, b & 0x7f) << shift;
+        if (b & 0x80 == 0) break;
+        shift += 7;
+    }
+    const neg: u64 = ~(value & 1) +% 1; // 0 -> 0, 1 -> all-ones
+    return @bitCast((value >> 1) ^ neg); // ZigZag decode
+}
+
+/// zlib-compress `data` (the format HdrHistogram's Java `Deflater` produces).
+fn zlibCompress(gpa: Allocator, data: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    const scratch = try gpa.alloc(u8, data.len + data.len / 2 + 256);
+    defer gpa.free(scratch);
+    var out: std.Io.Writer = .fixed(scratch);
+    var comp = try flate.Compress.init(&out, window, .zlib, .default);
+    try comp.writer.writeAll(data);
+    try comp.finish();
+    return gpa.dupe(u8, out.buffered());
+}
+
+/// Inflate a zlib stream produced by `zlibCompress` (or any conformant encoder).
+fn zlibDecompress(gpa: Allocator, data: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    var in: std.Io.Reader = .fixed(data);
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    var decomp = flate.Decompress.init(&in, .zlib, window);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    _ = try decomp.reader.streamRemaining(&out.writer);
+    return out.toOwnedSlice();
+}
+
+/// Cumulative-count rank corresponding to a percentile (rounded, min 1).
+fn countAtPercentile(total: u64, percentile: f64) u64 {
+    const p = std.math.clamp(percentile, 0.0, 100.0);
+    const c: u64 = @intFromFloat(@round((p / 100.0) * @as(f64, @floatFromInt(total))));
+    return @max(c, 1);
+}
+
+/// Next percentile checkpoint step: the tail is sampled progressively finer,
+/// doubling the number of ticks at each "half distance" toward 100%.
+fn nextPercentileStep(current: f64, ticks_per_half_distance: u32) f64 {
+    const half_distance_exp = @floor(std.math.log2(100.0 / (100.0 - current))) + 1;
+    const reporting_ticks = @as(f64, @floatFromInt(ticks_per_half_distance)) *
+        std.math.pow(f64, 2, half_distance_exp);
+    return 100.0 / reporting_ticks;
+}
 
 // --- tests -------------------------------------------------------------------
 
@@ -381,6 +669,89 @@ test "merge via add" {
     try testing.expect(p50 >= 495 and p50 <= 505);
 }
 
+test "setToDifference yields the interval between two cumulative snapshots" {
+    var early = try newDefault(); // cumulative snapshot at t1
+    defer early.deinit();
+    var late = try newDefault(); // cumulative snapshot at t2 (superset)
+    defer late.deinit();
+    var delta = try newDefault();
+    defer delta.deinit();
+
+    // t1: 100 samples at ~1ms.
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) early.record(1000);
+    early.copyInto(&late);
+    // t2 adds 50 samples at ~9ms on top of the earlier 100.
+    i = 0;
+    while (i < 50) : (i += 1) late.record(9000);
+
+    delta.setToDifference(&late, &early);
+    try testing.expectEqual(@as(u64, 50), delta.count());
+    // The interval contains only the new (9ms) samples.
+    try testing.expect(delta.valuesAreEquivalent(delta.valueAtPercentile(50), 9000));
+    try testing.expect(delta.valuesAreEquivalent(delta.min(), 9000));
+}
+
+test "zigzag varint: explicit encodings and round-trip" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    // ZigZag: 0->0, 1->2, -1->1, -2->3.
+    try appendZigZag(&list, testing.allocator, 0);
+    try appendZigZag(&list, testing.allocator, 1);
+    try appendZigZag(&list, testing.allocator, -1);
+    try appendZigZag(&list, testing.allocator, -2);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x02, 0x01, 0x03 }, list.items);
+
+    // Round-trip a spread incl. multi-byte and full-width magnitudes.
+    const vals = [_]i64{ 0, 1, -1, 63, 64, -64, 1000, -1000, 1 << 20, -(1 << 40), std.math.maxInt(i64), std.math.minInt(i64) };
+    var enc: std.ArrayList(u8) = .empty;
+    defer enc.deinit(testing.allocator);
+    for (vals) |v| try appendZigZag(&enc, testing.allocator, v);
+    var pos: usize = 0;
+    for (vals) |v| try testing.expectEqual(v, readZigZag(enc.items, &pos));
+    try testing.expectEqual(enc.items.len, pos);
+}
+
+test "encodeBase64/decodeBase64 round-trip preserves the distribution" {
+    var h = try newDefault();
+    defer h.deinit();
+    // Clusters with zero-runs between them and a far tail outlier.
+    var i: u64 = 0;
+    while (i < 500) : (i += 1) h.record(200 + i);
+    while (i < 800) : (i += 1) h.record(5000 + (i - 500) * 3);
+    h.record(30_000_000); // 30s outlier
+
+    const b64 = try h.encodeBase64(testing.allocator);
+    defer testing.allocator.free(b64);
+    // Base64 of the compressed V2 form always begins "HIST".
+    try testing.expect(std.mem.startsWith(u8, b64, "HIST"));
+
+    var d = try decodeBase64(testing.allocator, b64);
+    defer d.deinit();
+
+    try testing.expectEqual(h.count(), d.count());
+    try testing.expectEqual(h.min(), d.min());
+    try testing.expectEqual(h.max(), d.max());
+    // Bucket-for-bucket identical => every percentile matches.
+    try testing.expectEqualSlices(u64, h.counts, d.counts);
+    try testing.expectEqual(h.valueAtPercentile(99.9), d.valueAtPercentile(99.9));
+}
+
+test "empty histogram encodes and decodes" {
+    var h = try newDefault();
+    defer h.deinit();
+    const b64 = try h.encodeBase64(testing.allocator);
+    defer testing.allocator.free(b64);
+    var d = try decodeBase64(testing.allocator, b64);
+    defer d.deinit();
+    try testing.expectEqual(@as(u64, 0), d.count());
+}
+
+test "decodeBase64 rejects a bad cookie" {
+    // Valid base64 (12 zero bytes), but the leading cookie is wrong.
+    try testing.expectError(error.InvalidCookie, decodeBase64(testing.allocator, "AAAAAAAAAAAAAAAA"));
+}
+
 test "copyInto snapshot" {
     var a = try newDefault();
     defer a.deinit();
@@ -411,4 +782,33 @@ test "mean of constant distribution" {
     const m = h.mean();
     try testing.expect(m >= 999 and m <= 1001);
     try testing.expect(h.stdDev() < 1.0);
+}
+
+test "percentile distribution export is well-formed and terminates" {
+    var h = try newDefault();
+    defer h.deinit();
+    var i: u64 = 1;
+    while (i <= 1000) : (i += 1) h.record(i);
+
+    var alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    try h.writePercentileDistribution(&alloc.writer, 1.0, 5);
+    const out = alloc.written();
+
+    try testing.expect(std.mem.startsWith(u8, out, "       Value     Percentile TotalCount"));
+    // First data line is the 0th percentile; the distribution ends at 1.000000.
+    try testing.expect(std.mem.indexOf(u8, out, " 0.000000 ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " 1.000000 ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "#[Mean") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Total count    =         1000") != null);
+}
+
+test "percentile distribution export on empty histogram" {
+    var h = try newDefault();
+    defer h.deinit();
+    var alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    try h.writePercentileDistribution(&alloc.writer, 1.0, 5);
+    // No data rows, but the header and footer stats must still be present.
+    try testing.expect(std.mem.indexOf(u8, alloc.written(), "#[Buckets") != null);
 }

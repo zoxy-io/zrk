@@ -11,6 +11,7 @@ const net = std.Io.net;
 const cli = @import("cli.zig");
 const connection = @import("connection.zig");
 const httpmod = @import("http.zig");
+const pace = @import("pace.zig");
 const stats = @import("stats.zig");
 const tlsmod = @import("tls.zig");
 
@@ -58,11 +59,13 @@ pub fn run(
 
     var stop = std.atomic.Value(bool).init(false);
 
-    // Per-connection scheduled send spacing: the total target rate split
-    // evenly across connections.
-    const interval_ns: u64 = @intFromFloat(
-        @as(f64, std.time.ns_per_s) * @as(f64, @floatFromInt(cfg.connections)) / @as(f64, @floatFromInt(cfg.rate)),
-    );
+    // Per-connection send schedule: a constant spacing, or a linear ramp from
+    // `rate` to `rate_end` over the run, split evenly across connections.
+    const duration_s: f64 = @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s;
+    const schedule = if (cfg.rate_end) |end_rate|
+        pace.Schedule.linearTotal(cfg.rate, end_rate, cfg.connections, duration_s)
+    else
+        pace.Schedule.constantTotal(cfg.rate, cfg.connections);
 
     const start = Io.Timestamp.now(io, .awake);
     const end = start.addDuration(Io.Duration.fromNanoseconds(@intCast(cfg.duration_ns)));
@@ -74,8 +77,9 @@ pub fn run(
         .request = request,
         .is_tls = cfg.url.isTls(),
         .insecure = cfg.insecure,
-        .interval_ns = interval_ns,
+        .schedule = schedule,
         .timeout_ns = cfg.timeout_ns,
+        .record_timeouts = cfg.record_timeouts,
         .end = end,
         .stop = &stop,
         .allocator = arena,

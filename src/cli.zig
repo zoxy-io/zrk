@@ -7,7 +7,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// zrk version string, surfaced by `--version` and embedded in JSON reports.
+pub const version = "0.1.0";
+
 pub const Scheme = enum { http, https };
+
+/// Final-report output format. `text` is the human wrk2-style report (and live
+/// dashboard); `json` is a single machine-readable summary object.
+pub const Format = enum { text, json };
 
 pub const Url = struct {
     scheme: Scheme,
@@ -32,7 +39,11 @@ pub const Config = struct {
     /// Total test duration.
     duration_ns: u64 = 10 * std.time.ns_per_s,
     /// Target throughput in requests/second (total, across all connections).
+    /// With `rate_end` set this is the ramp's *start* rate.
     rate: u64 = 1000,
+    /// End rate for a linear ramp (null = constant `rate`). When set, the total
+    /// target rate ramps linearly from `rate` to `rate_end` over the duration.
+    rate_end: ?u64 = null,
     /// Per-request timeout.
     timeout_ns: u64 = 2 * std.time.ns_per_s,
     /// Dashboard refresh / snapshot period.
@@ -49,6 +60,27 @@ pub const Config = struct {
     /// Emit append-only text lines instead of a redrawing TUI (for CI/pipes).
     plain: bool = false,
 
+    /// Final-report format written at end of run.
+    format: Format = .text,
+    /// Where the final report goes (null = stdout).
+    output_path: ?[]const u8 = null,
+    /// If set, also write the HdrHistogram percentile distribution (.hgrm,
+    /// wrk2/HdrHistogram-plotter compatible) to this path.
+    hdr_path: ?[]const u8 = null,
+    /// If set, stream one NDJSON object per `--interval` with that window's
+    /// throughput and latency percentiles (a time series, ideal for ramps).
+    timeseries_path: ?[]const u8 = null,
+
+    /// Record a (coordinated-omission-corrected) latency sample for requests
+    /// that hit `--timeout`, so the tail isn't silently truncated. On by
+    /// default; `--no-record-timeouts` restores wrk2's drop-on-timeout behavior.
+    record_timeouts: bool = true,
+
+    /// CI gate: fail (exit 3) if the final p99 exceeds this many nanoseconds.
+    slo_p99_ns: ?u64 = null,
+    /// CI gate: fail (exit 3) if the error rate exceeds this fraction (0..1).
+    max_error_rate: ?f64 = null,
+
     url: Url = undefined,
 };
 
@@ -60,16 +92,18 @@ pub const ParseError = error{
     InvalidDuration,
     InvalidUrl,
     InvalidHeader,
+    InvalidFormat,
     ZeroConnections,
     ZeroThreads,
     ZeroRate,
     OutOfMemory,
 };
 
-/// Result of parsing: either a usable config, or a request to print help/usage.
+/// Result of parsing: a usable config, or a request to print help / version.
 pub const Parsed = union(enum) {
     config: Config,
     help,
+    version,
 };
 
 pub const usage =
@@ -81,7 +115,8 @@ pub const usage =
     \\  -t, --threads     <N>     Number of worker threads       (default 2)
     \\  -c, --connections <N>     Total connections to keep open (default 10)
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
-    \\  -R, --rate        <N>     Target requests/second (total) (default 1000)
+    \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
+    \\                            linearly from A to B over the run (default 1000)
     \\  -H, --header  <K: V>      Add a request header (repeatable)
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body        <S>     Request body
@@ -90,12 +125,28 @@ pub const usage =
     \\      --latency             Print full latency spectrum in the final report
     \\  -k, --insecure            Skip TLS certificate verification
     \\      --plain               Append-only output instead of a live dashboard
+    \\
+    \\Reporting:
+    \\      --format  <text|json> Final report format            (default text)
+    \\  -o, --output      <FILE>  Write the final report to FILE (default stdout)
+    \\      --hdr         <FILE>  Also write the HdrHistogram percentile
+    \\                            distribution (.hgrm) to FILE
+    \\      --timeseries  <FILE>  Stream per-interval NDJSON (throughput +
+    \\                            latency percentiles) to FILE
+    \\      --no-record-timeouts  Drop timed-out requests from the latency
+    \\                            histogram (default: record them)
+    \\
+    \\CI gates (exit code 3 on breach):
+    \\      --slo-p99     <T>     Fail if final p99 latency exceeds T
+    \\      --max-error-rate <F>  Fail if error rate exceeds F (0..1)
+    \\
     \\  -h, --help                Show this help
+    \\      --version             Show version
     \\
 ;
 
 /// Short options that take a value, so `-t2` can be split into `-t 2`.
-const value_short_opts = "tcdRHmb";
+const value_short_opts = "tcdRHmbo";
 
 /// Parse argv (excluding the program name). Header slices and the header array
 /// are allocated from `arena`; string values point into `args` (borrowed).
@@ -125,6 +176,7 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         if (arg.len == 0) continue;
 
         if (eq(arg, "-h") or eq(arg, "--help")) return .help;
+        if (eq(arg, "--version")) return .version;
 
         if (eq(arg, "--latency")) {
             cfg.latency = true;
@@ -132,6 +184,22 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.insecure = true;
         } else if (eq(arg, "--plain") or eq(arg, "--no-tui")) {
             cfg.plain = true;
+        } else if (eq(arg, "--no-record-timeouts")) {
+            cfg.record_timeouts = false;
+        } else if (eq(arg, "--record-timeouts")) {
+            cfg.record_timeouts = true;
+        } else if (eq(arg, "--format")) {
+            cfg.format = try parseFormat(try nextValue(tokens, &i));
+        } else if (eq(arg, "-o") or eq(arg, "--output")) {
+            cfg.output_path = try nextValue(tokens, &i);
+        } else if (eq(arg, "--hdr")) {
+            cfg.hdr_path = try nextValue(tokens, &i);
+        } else if (eq(arg, "--timeseries")) {
+            cfg.timeseries_path = try nextValue(tokens, &i);
+        } else if (eq(arg, "--slo-p99")) {
+            cfg.slo_p99_ns = try parseDuration(try nextValue(tokens, &i));
+        } else if (eq(arg, "--max-error-rate")) {
+            cfg.max_error_rate = try parseErrorRate(try nextValue(tokens, &i));
         } else if (eq(arg, "-t") or eq(arg, "--threads")) {
             cfg.threads = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-c") or eq(arg, "--connections")) {
@@ -139,7 +207,9 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         } else if (eq(arg, "-d") or eq(arg, "--duration")) {
             cfg.duration_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "-R") or eq(arg, "--rate")) {
-            cfg.rate = try parseU64(try nextValue(tokens, &i));
+            const spec = try parseRateSpec(try nextValue(tokens, &i));
+            cfg.rate = spec.start;
+            cfg.rate_end = spec.end;
         } else if (eq(arg, "--timeout")) {
             cfg.timeout_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--interval")) {
@@ -161,6 +231,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     if (cfg.threads == 0) return error.ZeroThreads;
     if (cfg.connections == 0) return error.ZeroConnections;
     if (cfg.rate == 0) return error.ZeroRate;
+    // A ramp toward 0 req/s has no well-defined schedule; require a positive end.
+    if (cfg.rate_end) |e| if (e == 0) return error.ZeroRate;
     // Never run more worker threads than connections.
     if (cfg.threads > cfg.connections) cfg.threads = cfg.connections;
 
@@ -186,6 +258,43 @@ fn parseU32(s: []const u8) ParseError!u32 {
 
 fn parseU64(s: []const u8) ParseError!u64 {
     return std.fmt.parseInt(u64, s, 10) catch error.InvalidNumber;
+}
+
+const RateSpec = struct { start: u64, end: ?u64 };
+
+/// Parse a rate argument: either a scalar (`2000`, constant) or a linear ramp
+/// (`START:END`, e.g. `100:5000`).
+fn parseRateSpec(s: []const u8) ParseError!RateSpec {
+    if (std.mem.indexOfScalar(u8, s, ':')) |colon| {
+        return .{
+            .start = try parseU64(s[0..colon]),
+            .end = try parseU64(s[colon + 1 ..]),
+        };
+    }
+    return .{ .start = try parseU64(s), .end = null };
+}
+
+fn parseFormat(s: []const u8) ParseError!Format {
+    if (eq(s, "text")) return .text;
+    if (eq(s, "json")) return .json;
+    return error.InvalidFormat;
+}
+
+/// Parse an error-rate threshold. Accepts a bare fraction (`0.01`) or a
+/// percentage with a trailing `%` (`1%`); both mean "1%". Must be in [0, 1].
+fn parseErrorRate(s: []const u8) ParseError!f64 {
+    if (s.len == 0) return error.InvalidNumber;
+    if (s[s.len - 1] == '%') {
+        const pct = std.fmt.parseFloat(f64, s[0 .. s.len - 1]) catch return error.InvalidNumber;
+        return clampErrorRate(pct / 100.0);
+    }
+    const frac = std.fmt.parseFloat(f64, s) catch return error.InvalidNumber;
+    return clampErrorRate(frac);
+}
+
+fn clampErrorRate(v: f64) ParseError!f64 {
+    if (v < 0 or v > 1) return error.InvalidNumber;
+    return v;
 }
 
 /// Parse a "Name: Value" header. Whitespace around the value is trimmed.
@@ -373,10 +482,75 @@ test "parse help flag" {
     try testing.expect(parsed == .help);
 }
 
+test "parse version flag" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(), &[_][]const u8{"--version"});
+    try testing.expect(parsed == .version);
+}
+
+test "parse reporting and CI-gate flags" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const args = [_][]const u8{
+        "--format",         "json",
+        "-o",               "out.json",
+        "--hdr",            "lat.hgrm",
+        "--slo-p99",        "250ms",
+        "--max-error-rate", "1%",
+        "--no-record-timeouts",
+        "http://127.0.0.1:8080/",
+    };
+    const cfg = (try parse(arena_state.allocator(), &args)).config;
+    try testing.expectEqual(Format.json, cfg.format);
+    try testing.expectEqualStrings("out.json", cfg.output_path.?);
+    try testing.expectEqualStrings("lat.hgrm", cfg.hdr_path.?);
+    try testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), cfg.slo_p99_ns.?);
+    try testing.expectApproxEqAbs(@as(f64, 0.01), cfg.max_error_rate.?, 1e-9);
+    try testing.expect(!cfg.record_timeouts);
+}
+
+test "record_timeouts defaults on; error rate accepts fraction" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const args = [_][]const u8{ "--max-error-rate", "0.05", "http://x/" };
+    const cfg = (try parse(arena_state.allocator(), &args)).config;
+    try testing.expect(cfg.record_timeouts);
+    try testing.expectApproxEqAbs(@as(f64, 0.05), cfg.max_error_rate.?, 1e-9);
+}
+
+test "invalid format and out-of-range error rate are rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectError(error.InvalidFormat, parse(a, &[_][]const u8{ "--format", "yaml", "http://x/" }));
+    try testing.expectError(error.InvalidNumber, parse(a, &[_][]const u8{ "--max-error-rate", "2", "http://x/" }));
+}
+
 test "parse missing url errors" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try testing.expectError(error.MissingUrl, parse(arena_state.allocator(), &[_][]const u8{ "-t", "2" }));
+}
+
+test "rate parses scalar and ramp forms" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const constant = (try parse(a, &[_][]const u8{ "-R", "2000", "http://x/" })).config;
+    try testing.expectEqual(@as(u64, 2000), constant.rate);
+    try testing.expectEqual(@as(?u64, null), constant.rate_end);
+
+    const ramp = (try parse(a, &[_][]const u8{ "-R", "100:5000", "http://x/" })).config;
+    try testing.expectEqual(@as(u64, 100), ramp.rate);
+    try testing.expectEqual(@as(?u64, 5000), ramp.rate_end);
+
+    // Attached short form and ramp-to-zero rejection.
+    const attached = (try parse(a, &[_][]const u8{ "-R100:5000", "http://x/" })).config;
+    try testing.expectEqual(@as(u64, 100), attached.rate);
+    try testing.expectEqual(@as(?u64, 5000), attached.rate_end);
+    try testing.expectError(error.ZeroRate, parse(a, &[_][]const u8{ "-R", "100:0", "http://x/" }));
 }
 
 test "threads clamped to connections" {
