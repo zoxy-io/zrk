@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
         try printUsageError(io, err);
         std.process.exit(2);
     };
-    const cfg: cli.Config = switch (parsed) {
+    var cfg: cli.Config = switch (parsed) {
         .help => {
             try writeAll(io, .stdout(), cli.usage);
             return;
@@ -30,6 +30,15 @@ pub fn main(init: std.process.Init) !void {
         },
         .config => |c| c,
     };
+
+    // Resolve `-b @FILE` / `-b @-` now that we have I/O; the runner only ever
+    // sees `cfg.body` as raw bytes.
+    if (cfg.body_path) |path| {
+        cfg.body = readBody(arena, io, path) catch |err| {
+            try printBodyError(io, path, err);
+            std.process.exit(2);
+        };
+    }
 
     const json = cfg.format == .json;
 
@@ -113,6 +122,31 @@ fn openOut(io: Io, path: ?[]const u8, close: *bool) !Io.File {
     }
     close.* = false;
     return Io.File.stdout();
+}
+
+/// Upper bound on a request body read from a file/stdin, so a wrong path can't
+/// exhaust memory. 64 MiB is far larger than any realistic load-test payload.
+const max_body_bytes = 64 << 20;
+
+/// Read the request body from `path` (or stdin when `path` is "-"). Returned
+/// bytes live in `arena`.
+fn readBody(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+    if (std.mem.eql(u8, path, "-")) {
+        var buf: [4096]u8 = undefined;
+        var fr: Io.File.Reader = .init(.stdin(), io, &buf);
+        var aw: Io.Writer.Allocating = .init(arena);
+        _ = try fr.interface.streamRemaining(&aw.writer);
+        return aw.toOwnedSlice();
+    }
+    return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_body_bytes));
+}
+
+fn printBodyError(io: Io, path: []const u8, err: anyerror) !void {
+    var buf: [512]u8 = undefined;
+    const src = if (std.mem.eql(u8, path, "-")) "stdin" else path;
+    const msg = std.fmt.bufPrint(&buf, "zrk: cannot read body from {s}: {s}\n", .{ src, @errorName(err) }) catch
+        "zrk: cannot read request body\n";
+    try writeAll(io, .stderr(), msg);
 }
 
 fn printSloBreach(io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, slo: report.SloResult) !void {

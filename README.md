@@ -41,7 +41,8 @@ zrk [options] <url>
                             linearly from A to B over the run (default 1000)
   -H, --header  <K: V>      Add a request header (repeatable)
   -m, --method      <M>     HTTP method                    (default GET)
-  -b, --body        <S>     Request body
+  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
+                            (@- = stdin, @@x = a literal "@x")
       --timeout     <T>     Per-request timeout            (default 2s)
       --interval    <T>     Dashboard refresh interval     (default 1s)
       --latency             Print full latency spectrum in the final report
@@ -84,6 +85,10 @@ zrk -c20 -d1m -R500 --latency https://api.example.com/health
 
 # POST with a body and custom headers
 zrk -c10 -R100 -m POST -b '{"ping":1}' \
+    -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
+
+# POST a body read from a file (@- reads stdin instead)
+zrk -c10 -R100 -m POST -b @payload.json \
     -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
 
 # CI-friendly, no redrawing dashboard

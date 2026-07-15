@@ -51,6 +51,10 @@ pub const Config = struct {
 
     method: []const u8 = "GET",
     body: []const u8 = "",
+    /// When set (from `-b @FILE`), the caller reads the request body from this
+    /// path and fills in `body`. `"-"` means stdin. Parsing stays pure — the
+    /// file is not read here.
+    body_path: ?[]const u8 = null,
     headers: []const Header = &.{},
 
     /// Print the full latency percentile spectrum in the final report.
@@ -119,7 +123,8 @@ pub const usage =
     \\                            linearly from A to B over the run (default 1000)
     \\  -H, --header  <K: V>      Add a request header (repeatable)
     \\  -m, --method      <M>     HTTP method                    (default GET)
-    \\  -b, --body        <S>     Request body
+    \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
+    \\                            (@- = stdin, @@x = a literal "@x")
     \\      --timeout     <T>     Per-request timeout            (default 2s)
     \\      --interval    <T>     Dashboard refresh interval     (default 1s)
     \\      --latency             Print full latency spectrum in the final report
@@ -217,7 +222,19 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         } else if (eq(arg, "-m") or eq(arg, "--method")) {
             cfg.method = try nextValue(tokens, &i);
         } else if (eq(arg, "-b") or eq(arg, "--body")) {
-            cfg.body = try nextValue(tokens, &i);
+            const v = try nextValue(tokens, &i);
+            // curl/vegeta convention: a leading '@' reads the body from a file
+            // (`@-` = stdin), and `@@` escapes a body that literally starts '@'.
+            if (v.len >= 2 and v[0] == '@' and v[1] == '@') {
+                cfg.body = v[1..];
+                cfg.body_path = null;
+            } else if (v.len >= 1 and v[0] == '@') {
+                cfg.body_path = v[1..];
+                cfg.body = "";
+            } else {
+                cfg.body = v;
+                cfg.body_path = null;
+            }
         } else if (eq(arg, "-H") or eq(arg, "--header")) {
             try headers.append(arena, try parseHeader(try nextValue(tokens, &i)));
         } else if (arg[0] == '-' and arg.len > 1) {
@@ -473,6 +490,31 @@ test "parse full command line" {
     try testing.expectEqualStrings("application/json", cfg.headers[0].value);
     try testing.expectEqualStrings("127.0.0.1", cfg.url.host);
     try testing.expectEqual(@as(u16, 8080), cfg.url.port);
+}
+
+test "body: inline, @file, @- stdin, and @@ escape" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Inline literal is unchanged, with no file reference.
+    const inline_body = (try parse(a, &[_][]const u8{ "-b", "hello", "http://x/" })).config;
+    try testing.expectEqualStrings("hello", inline_body.body);
+    try testing.expectEqual(@as(?[]const u8, null), inline_body.body_path);
+
+    // @FILE records a path and leaves body empty (read happens in the caller).
+    const from_file = (try parse(a, &[_][]const u8{ "-b", "@payload.json", "http://x/" })).config;
+    try testing.expectEqualStrings("payload.json", from_file.body_path.?);
+    try testing.expectEqualStrings("", from_file.body);
+
+    // @- means stdin.
+    const from_stdin = (try parse(a, &[_][]const u8{ "--body", "@-", "http://x/" })).config;
+    try testing.expectEqualStrings("-", from_stdin.body_path.?);
+
+    // @@ escapes to a literal body that starts with '@'.
+    const escaped = (try parse(a, &[_][]const u8{ "-b", "@@handle", "http://x/" })).config;
+    try testing.expectEqualStrings("@handle", escaped.body);
+    try testing.expectEqual(@as(?[]const u8, null), escaped.body_path);
 }
 
 test "parse help flag" {
