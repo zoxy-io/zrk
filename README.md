@@ -56,6 +56,8 @@ zrk [options] <url>
                             distribution (.hgrm) to FILE
       --timeseries  <FILE>  Stream per-interval NDJSON (throughput +
                             latency percentiles) to FILE
+      --timeseries-histogram  Add each interval's full latency histogram
+                            (HdrHistogram base64) to every --timeseries row
       --no-record-timeouts  Drop timed-out requests from the latency histogram
                             (default: record them, so the tail isn't truncated)
 
@@ -161,6 +163,13 @@ This is the artifact a **ramp** (`-R A:B`) exists to produce: a curve of latency
 against offered load, so you can find the rate at which the server's tail breaks
 down. (The final summary's aggregate percentiles blend the whole ramp together,
 so they're less useful for a ramp than the time series is.)
+
+Add `--timeseries-histogram` to append each interval's **full** latency
+distribution as an HdrHistogram V2 base64 blob (`latency_histogram`) to every
+row. Each blob decodes losslessly, so a harness can re-percentile a single
+interval or merge any subset of them — e.g. just the windows above a target
+rate. Merging every row reproduces the run's summary histogram exactly, since
+the intervals partition the run. (Rows get noticeably larger, so it is opt-in.)
 
 Timed-out requests are recorded into the latency histogram by default (as a
 coordinated-omission-corrected sample) so the tail isn't silently truncated;

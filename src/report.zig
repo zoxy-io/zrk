@@ -136,6 +136,10 @@ pub const TimeSeries = struct {
     prev_cum: hdr.Histogram,
     /// Scratch histogram holding the current interval's delta.
     delta: hdr.Histogram,
+    /// Reset (retaining capacity) after each row's base64 encoding, so the
+    /// transient encode buffers never accumulate in the caller's arena when
+    /// `--timeseries-histogram` is on. Backed by the page allocator.
+    scratch: std.heap.ArenaAllocator,
     prev_completed: u64 = 0,
     prev_errors: u64 = 0,
     prev_elapsed_s: f64 = 0,
@@ -146,7 +150,14 @@ pub const TimeSeries = struct {
             .cfg = cfg,
             .prev_cum = try stats.newHistogram(arena),
             .delta = try stats.newHistogram(arena),
+            .scratch = .init(std.heap.page_allocator),
         };
+    }
+
+    pub fn deinit(self: *TimeSeries) void {
+        self.prev_cum.deinit();
+        self.delta.deinit();
+        self.scratch.deinit();
     }
 
     /// Offered *total* target rate (req/s) at elapsed `t_s`, honoring a ramp.
@@ -173,7 +184,7 @@ pub const TimeSeries = struct {
 
         try self.w.print(
             "{{\"t\":{d:.3},\"target_rate\":{d:.1},\"achieved_rate\":{d:.1},\"requests\":{d},\"errors\":{d}," ++
-                "\"latency_us\":{{\"p50\":{d},\"p90\":{d},\"p99\":{d},\"p99_9\":{d},\"max\":{d}}}}}\n",
+                "\"latency_us\":{{\"p50\":{d},\"p90\":{d},\"p99\":{d},\"p99_9\":{d},\"max\":{d}}}",
             .{
                 elapsed_s,                 self.targetRate(elapsed_s),
                 achieved,                  d_completed,
@@ -182,8 +193,19 @@ pub const TimeSeries = struct {
                 h.valueAtPercentile(99.9), h.max(),
             },
         );
+
+        // Optional: the interval's full distribution, losslessly mergeable.
+        // Encoded into the scratch arena, which we reset once the bytes have
+        // been copied into the writer by `print`.
+        if (self.cfg.timeseries_histogram) {
+            const b64 = try h.encodeBase64(self.scratch.allocator());
+            try self.w.print(",\"latency_histogram\":\"{s}\"", .{b64});
+            _ = self.scratch.reset(.retain_capacity);
+        }
+
         // Flush every line so the series is durable even if a later SLO gate
         // exits the process (which skips deferred cleanup).
+        try self.w.writeAll("}\n");
         try self.w.flush();
 
         snap.hist.copyInto(&self.prev_cum);
@@ -269,6 +291,57 @@ test "writeJson emits parseable, well-formed summary" {
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_us\"") != null);
     // The embedded HdrHistogram blob is present and decodes back to 100 samples.
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_histogram\": \"HIST") != null);
+}
+
+test "time series row carries the interval HDR blob when enabled" {
+    var cfg = testConfig();
+    cfg.timeseries_histogram = true;
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var ts = try TimeSeries.init(testing.allocator, &alloc.writer, &cfg);
+    defer ts.deinit();
+
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+    var i: u64 = 0;
+    while (i < 50) : (i += 1) snap.hist.record(1000 + i);
+    snap.counters.completed = 50;
+
+    try ts.record(&snap, 1.0);
+    const out = alloc.written();
+    try testing.expect(std.mem.indexOf(u8, out, "\"latency_us\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"latency_histogram\":\"HIST") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "}\n"));
+
+    // The blob decodes back to this interval's 50 samples.
+    const start = std.mem.indexOf(u8, out, "HIST").?;
+    const end = std.mem.indexOfScalarPos(u8, out, start, '"').?;
+    var decoded = try hdr.decodeBase64(testing.allocator, out[start..end]);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(u64, 50), decoded.count());
+}
+
+test "time series omits the HDR blob by default" {
+    const cfg = testConfig(); // timeseries_histogram defaults false
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var ts = try TimeSeries.init(testing.allocator, &alloc.writer, &cfg);
+    defer ts.deinit();
+
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+    snap.hist.record(1234);
+    snap.counters.completed = 1;
+
+    try ts.record(&snap, 1.0);
+    try testing.expect(std.mem.indexOf(u8, alloc.written(), "latency_histogram") == null);
 }
 
 test "errorRate and checkSlo gates" {
