@@ -93,6 +93,14 @@ pub fn run(
     // Launch each connection on its own thread. `concurrent` (unlike
     // `async`) guarantees real parallelism on the Threaded backend.
     var group: Io.Group = .init;
+    // If anything below fails, the workers must be stopped and joined before
+    // this frame unwinds: they hold pointers to `stop` (this stack) and to
+    // fleet state that the deferred `fleet.deinit` (declared earlier, so it
+    // runs after this) is about to free.
+    errdefer {
+        stop.store(true, .monotonic);
+        group.cancel(io);
+    }
     var launched: u32 = 0;
     for (params) |*p| {
         group.concurrent(io, connection.run, .{p}) catch break;
