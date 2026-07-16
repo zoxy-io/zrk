@@ -105,15 +105,24 @@ pub fn run(
     var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(arena), .counters = .{} };
     const total_s: f64 = @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s;
 
+    // Snapshot cadence: wake every interval, but never sleep past `end` — the
+    // final (possibly partial) interval still gets a progress callback, and
+    // the measured elapsed time tracks the configured duration instead of
+    // rounding up to the next interval boundary (which deflated Requests/sec
+    // whenever the duration wasn't a multiple of --interval).
     while (true) {
-        io.sleep(Io.Duration.fromNanoseconds(@intCast(cfg.interval_ns)), .awake) catch break;
+        const before = Io.Timestamp.now(io, .awake);
+        if (before.nanoseconds >= end.nanoseconds) break;
+        const interval_ns: @TypeOf(end.nanoseconds) = @intCast(cfg.interval_ns);
+        const sleep_ns = @min(end.nanoseconds - before.nanoseconds, interval_ns);
+        io.sleep(Io.Duration.fromNanoseconds(sleep_ns), .awake) catch break;
+
         const t = Io.Timestamp.now(io, .awake);
         fleet.readSnapshot(io, &snap);
         const elapsed_s: f64 = @as(f64, @floatFromInt(start.durationTo(t).nanoseconds)) / std.time.ns_per_s;
         if (progress) |callback| {
             callback(progress_context, &snap, t.nanoseconds, elapsed_s, total_s);
         }
-        if (t.nanoseconds >= end.nanoseconds) break;
     }
 
     // Signal stop, then cancel: connections idling between paced sends
@@ -151,6 +160,77 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !net.IpAddress {
         }
     } else |_| {} // error.Closed: queue drained
     return first orelse error.UnknownHostName;
+}
+
+// --- tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Consume one request's header lines through the terminating blank line.
+/// (Mirrors the fixture in connection.zig's tests.)
+fn discardRequestHead(r: *Io.Reader) !void {
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (line.len <= 2) return; // "\r\n" or "\n": end of headers
+    }
+}
+
+/// Minimal keep-alive server: accepts one connection and answers every request
+/// with a fixed 200 until the client closes.
+fn testServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    while (true) {
+        discardRequestHead(&r.interface) catch return;
+        w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") catch return;
+        w.interface.flush() catch return;
+    }
+}
+
+test "run's elapsed time tracks the duration, not the interval grid" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var cfg: cli.Config = .{
+        .connections = 1,
+        .threads = 1,
+        .rate = 200,
+        // 300ms run with a 1s snapshot interval: the old loop always slept a
+        // full interval before checking `end`, reporting ~1s elapsed for a
+        // 0.3s test and deflating Requests/sec by >3x.
+        .duration_ns = 300 * std.time.ns_per_ms,
+        .interval_ns = 1 * std.time.ns_per_s,
+        .url = try cli.parseUrl(url),
+    };
+    const result = try run(arena_state.allocator(), io, &cfg, null, null);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    try testing.expectEqual(@as(u32, 1), result.launched);
+    try testing.expect(result.snapshot.counters.completed > 0);
+    // Elapsed must track the 0.3s duration. Generous upper bound for slow CI;
+    // the quantization regression would report >= 1.0s.
+    try testing.expect(result.elapsed_s >= 0.29);
+    try testing.expect(result.elapsed_s < 0.9);
 }
 
 test {
