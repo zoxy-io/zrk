@@ -78,11 +78,13 @@ pub fn writeJson(
 
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"threads\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"record_timeouts\": {} }},\n",
         .{
-            cfg.connections,                                          cfg.threads,
-            launched,                                                 @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
-            cfg.rate,                                                 cfg.timeout_ns / std.time.ns_per_ms,
+            cfg.connections,
+            launched,
+            @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
+            cfg.rate,
+            cfg.timeout_ns / std.time.ns_per_ms,
             cfg.record_timeouts,
         },
     );
@@ -254,7 +256,6 @@ const testing = std.testing;
 fn testConfig() cli.Config {
     return .{
         .connections = 4,
-        .threads = 2,
         .rate = 1000,
         .url = cli.parseUrl("http://127.0.0.1:8080/health") catch unreachable,
     };

@@ -34,7 +34,6 @@ pub const Header = struct {
 };
 
 pub const Config = struct {
-    threads: u32 = 2,
     connections: u32 = 10,
     /// Total test duration.
     duration_ns: u64 = 10 * std.time.ns_per_s,
@@ -101,7 +100,6 @@ pub const ParseError = error{
     InvalidHeader,
     InvalidFormat,
     ZeroConnections,
-    ZeroThreads,
     ZeroRate,
     OutOfMemory,
 };
@@ -119,7 +117,6 @@ pub const usage =
     \\Usage: zrk [options] <url>
     \\
     \\Options:
-    \\  -t, --threads     <N>     Number of worker threads       (default 2)
     \\  -c, --connections <N>     Total connections to keep open (default 10)
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
     \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
@@ -155,8 +152,8 @@ pub const usage =
     \\
 ;
 
-/// Short options that take a value, so `-t2` can be split into `-t 2`.
-const value_short_opts = "tcdRHmbo";
+/// Short options that take a value, so `-c100` can be split into `-c 100`.
+const value_short_opts = "cdRHmbo";
 
 /// Parse argv (excluding the program name). Header slices and the header array
 /// are allocated from `arena`; string values point into `args` (borrowed).
@@ -212,8 +209,6 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.slo_p99_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--max-error-rate")) {
             cfg.max_error_rate = try parseErrorRate(try nextValue(tokens, &i));
-        } else if (eq(arg, "-t") or eq(arg, "--threads")) {
-            cfg.threads = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-c") or eq(arg, "--connections")) {
             cfg.connections = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-d") or eq(arg, "--duration")) {
@@ -252,13 +247,10 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         }
     }
 
-    if (cfg.threads == 0) return error.ZeroThreads;
     if (cfg.connections == 0) return error.ZeroConnections;
     if (cfg.rate == 0) return error.ZeroRate;
     // A ramp toward 0 req/s has no well-defined schedule; require a positive end.
     if (cfg.rate_end) |e| if (e == 0) return error.ZeroRate;
-    // Never run more worker threads than connections.
-    if (cfg.threads > cfg.connections) cfg.threads = cfg.connections;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
@@ -477,7 +469,6 @@ test "parse full command line" {
     const arena = arena_state.allocator();
 
     const args = [_][]const u8{
-        "-t",         "4",
         "-c",         "100",
         "-d",         "30s",
         "-R",         "2000",
@@ -487,7 +478,6 @@ test "parse full command line" {
     };
     const parsed = try parse(arena, &args);
     const cfg = parsed.config;
-    try testing.expectEqual(@as(u32, 4), cfg.threads);
     try testing.expectEqual(@as(u32, 100), cfg.connections);
     try testing.expectEqual(@as(u64, 30 * std.time.ns_per_s), cfg.duration_ns);
     try testing.expectEqual(@as(u64, 2000), cfg.rate);
@@ -579,7 +569,7 @@ test "invalid format and out-of-range error rate are rejected" {
 test "parse missing url errors" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    try testing.expectError(error.MissingUrl, parse(arena_state.allocator(), &[_][]const u8{ "-t", "2" }));
+    try testing.expectError(error.MissingUrl, parse(arena_state.allocator(), &[_][]const u8{ "-c", "2" }));
 }
 
 test "rate parses scalar and ramp forms" {
@@ -602,10 +592,10 @@ test "rate parses scalar and ramp forms" {
     try testing.expectError(error.ZeroRate, parse(a, &[_][]const u8{ "-R", "100:0", "http://x/" }));
 }
 
-test "threads clamped to connections" {
+test "removed threads flag is rejected as unknown" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const args = [_][]const u8{ "-t", "8", "-c", "4", "http://x.com/" };
-    const parsed = try parse(arena_state.allocator(), &args);
-    try testing.expectEqual(@as(u32, 4), parsed.config.threads);
+    const a = arena_state.allocator();
+    try testing.expectError(error.UnknownFlag, parse(a, &[_][]const u8{ "-t", "8", "http://x.com/" }));
+    try testing.expectError(error.UnknownFlag, parse(a, &[_][]const u8{ "--threads", "8", "http://x.com/" }));
 }
