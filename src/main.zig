@@ -79,6 +79,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (json) {
         try writeJsonReport(arena, io, &cfg, &snapshot, result.elapsed_s, result.launched);
+    } else if (cfg.output_path) |path| {
+        // Text report redirected to --output; leave a breadcrumb on stdout.
+        try writeTextReport(io, &dash, path, &snapshot, result.elapsed_s);
+        try dash.finalRedirected(path);
     } else {
         try dash.final(&snapshot, result.elapsed_s);
     }
@@ -94,6 +98,16 @@ pub fn main(init: std.process.Init) !void {
         try printSloBreach(io, &cfg, &snapshot, slo);
         std.process.exit(3);
     }
+}
+
+/// Write the wrk2-style text report to `--output` (text mode with -o set).
+fn writeTextReport(io: Io, dash: *tui.Dashboard, path: []const u8, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [8192]u8 = undefined;
+    var fw: Io.File.Writer = .init(file, io, &buf);
+    try dash.writeReport(&fw.interface, snap, elapsed_s);
+    try fw.interface.flush();
 }
 
 /// Write the JSON summary to `--output` (or stdout when unset).

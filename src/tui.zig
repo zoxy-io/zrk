@@ -139,12 +139,26 @@ pub const Dashboard = struct {
         }
     }
 
-    /// Print the wrk2-style final report. Aggregates should come from
-    /// `Fleet.readFinal` (post-join).
+    /// Print the wrk2-style final report to stdout. Aggregates should come
+    /// from `Fleet.readFinal` (post-join).
     pub fn final(self: *Dashboard, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+        if (self.tui) try self.writer().writeAll("\x1b[H\x1b[2J");
+        try self.writeReport(self.writer(), snap, elapsed_s);
+        try self.fw.interface.flush();
+    }
+
+    /// Settle the terminal when the final report went to `--output` instead of
+    /// stdout: clear the live TUI (if any) and leave a pointer to the file.
+    pub fn finalRedirected(self: *Dashboard, path: []const u8) !void {
         const w = self.writer();
         if (self.tui) try w.writeAll("\x1b[H\x1b[2J");
+        try w.print("Report written to {s}\n", .{path});
+        try self.fw.interface.flush();
+    }
 
+    /// Render the wrk2-style final report to any writer (stdout, or the
+    /// `--output` file in text mode). Does not flush.
+    pub fn writeReport(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, elapsed_s: f64) !void {
         const c = snap.counters;
         const rps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
         const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
@@ -178,8 +192,6 @@ pub const Dashboard = struct {
         try w.writeAll("Transfer/sec: ");
         try writeBytes(w, bps);
         try w.writeAll("\n");
-
-        try self.fw.interface.flush();
     }
 
     /// The `--latency` detailed percentile spectrum.
@@ -230,4 +242,36 @@ fn writeBytes(w: *Io.Writer, bytes: f64) !void {
     } else {
         try w.print("{d:.2}{s}", .{ v, units[i] });
     }
+}
+
+// --- tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "writeReport renders the wrk2-style summary to any writer" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1:8080/") };
+    var dash_buf: [1024]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, &dash_buf);
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 100;
+    snap.counters.bytes = 5000;
+    snap.counters.recordStatus(200);
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try dash.writeReport(&out.writer, &snap, 2.0);
+    const text = out.written();
+
+    try testing.expect(std.mem.indexOf(u8, text, "Latency (corrected for coordinated omission)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "100 requests in 2.00s") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Requests/sec: 50.00") != null);
+    // No terminal control sequences in the redirectable report.
+    try testing.expect(std.mem.indexOf(u8, text, "\x1b") == null);
 }
