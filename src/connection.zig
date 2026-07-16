@@ -93,6 +93,11 @@ pub const Params = struct {
     insecure: bool,
     /// Send schedule for THIS connection (constant spacing or a linear ramp).
     schedule: pace.Schedule,
+    /// Stagger phase ∈ [0, 1): this connection's sends solve the schedule at
+    /// k + phase, offsetting it against the rest of the fleet so aggregate
+    /// sends spread uniformly instead of firing in N-connection lockstep
+    /// waves (which quantize per-interval throughput to multiples of N).
+    phase: f64 = 0,
     /// Per-request response timeout (0 = no timeout).
     timeout_ns: u64,
     /// Record a coordinated-omission-corrected latency sample when a request
@@ -198,7 +203,7 @@ pub fn run(p: *Params) void {
             // Anchor the schedule on the first request; each send's intended
             // time is a closed-form function of its index (constant or ramp).
             if (anchor == null) anchor = t;
-            const offset = p.schedule.offsetNs(send_index);
+            const offset = p.schedule.offsetNs(send_index, p.phase);
             const scheduled = anchor.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
 
             // Pace: if we're ahead of schedule, wait; if behind, fire immediately.

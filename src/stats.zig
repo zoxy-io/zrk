@@ -89,16 +89,20 @@ pub const Fleet = struct {
 
     /// Fill in the per-connection `Params`. All connections share the same
     /// target address/request/schedule; `interval_ns` is the per-connection
-    /// send spacing (total-rate / connections).
+    /// send spacing (total-rate / connections). Each connection gets a stagger
+    /// phase of i/n so the fleet's sends interleave uniformly instead of
+    /// firing in lockstep waves (see pace.Schedule.offsetNs).
     pub fn buildParams(
         self: *Fleet,
         template: connection.Params,
     ) []connection.Params {
+        const n: f64 = @floatFromInt(self.params.len);
         for (self.params, 0..) |*p, i| {
             p.* = template;
             p.histogram = &self.live_hist[i];
             p.counters = &self.live_counters[i];
             p.publish = &self.publish[i];
+            p.phase = @as(f64, @floatFromInt(i)) / n;
             if (self.tls_state) |ts| p.tls_state = &ts[i];
         }
         return self.params;
