@@ -297,9 +297,17 @@ const Watchdog = struct {
             const deadline = w.deadline_ns.load(.acquire);
             const t = std.math.lossyCast(i64, now(io).nanoseconds);
             if (deadline != 0 and t >= deadline) {
-                w.fired.store(true, .release);
-                w.stream.shutdown(io, .both) catch {};
-                return;
+                // Fire only if this exact deadline is still armed: the request
+                // may have completed (disarm, possibly followed by the next
+                // arm) since the load above, and shutting the socket down then
+                // would misclassify the *next* request as a timeout. Deadlines
+                // strictly increase, so there is no ABA to worry about.
+                if (w.deadline_ns.cmpxchgStrong(deadline, 0, .acq_rel, .acquire) == null) {
+                    w.fired.store(true, .release);
+                    w.stream.shutdown(io, .both) catch {};
+                    return;
+                }
+                continue; // Deadline moved: re-evaluate against the new one.
             }
             const sleep_ns: i64 = if (deadline != 0)
                 deadline - t

@@ -26,25 +26,41 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
         try w.print("Host: {s}:{d}\r\n", .{ cfg.url.host, cfg.url.port });
     }
 
-    // Sensible defaults; a user -H of the same name is additionally sent, which
-    // mirrors wrk's behavior of not de-duplicating headers.
+    // Sensible defaults, each skipped when the user supplies the same header
+    // via -H (other duplicate -H headers pass through, mirroring wrk).
     var has_ua = false;
     var has_conn = false;
+    var has_cl = false;
     for (cfg.headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
         if (std.ascii.eqlIgnoreCase(h.name, "connection")) has_conn = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
         try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
     if (!has_ua) try w.writeAll("User-Agent: zrk\r\n");
     if (!has_conn) try w.writeAll("Connection: keep-alive\r\n");
 
-    if (cfg.body.len > 0) {
-        try w.print("Content-Length: {d}\r\n", .{cfg.body.len});
+    if (!has_cl) {
+        if (cfg.body.len > 0) {
+            try w.print("Content-Length: {d}\r\n", .{cfg.body.len});
+        } else if (methodAnticipatesBody(cfg.method)) {
+            // An empty body on a body-bearing method still needs an explicit
+            // length: many servers answer 411 otherwise.
+            try w.writeAll("Content-Length: 0\r\n");
+        }
     }
     try w.writeAll("\r\n");
     try w.writeAll(cfg.body);
 
     return alloc_writer.toOwnedSlice();
+}
+
+/// Methods whose semantics anticipate request content (RFC 9110 §9.3), for
+/// which an empty body still gets an explicit `Content-Length: 0`.
+fn methodAnticipatesBody(method: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(method, "POST") or
+        std.ascii.eqlIgnoreCase(method, "PUT") or
+        std.ascii.eqlIgnoreCase(method, "PATCH");
 }
 
 pub const StatusClass = enum {
@@ -174,7 +190,11 @@ fn parseStatus(status_line: []const u8) !u16 {
     const first_space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return error.MalformedStatusLine;
     const after = status_line[first_space + 1 ..];
     const code_end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
-    return std.fmt.parseInt(u16, after[0..code_end], 10) catch error.MalformedStatusLine;
+    const code = std.fmt.parseInt(u16, after[0..code_end], 10) catch return error.MalformedStatusLine;
+    // Status codes are exactly three digits (RFC 9112 §4). Enforcing that here
+    // keeps every counted status inside the 1xx..5xx+ class buckets.
+    if (code < 100 or code > 999) return error.MalformedStatusLine;
+    return code;
 }
 
 fn consumeChunkedBody(r: *Io.Reader, bytes: *u64) ParseError!void {
@@ -288,6 +308,37 @@ test "parseResponse http/1.0 defaults to no keep-alive" {
     var r = Io.Reader.fixed(raw);
     const resp = try parseResponse(&r, .other);
     try testing.expect(!resp.keep_alive);
+}
+
+test "buildRequest Content-Length: bodyless methods, empty POST, user override" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // GET with no body: no Content-Length at all.
+    const get = try buildRequest(a, &.{ .url = try cli.parseUrl("http://x/") });
+    try testing.expect(std.mem.indexOf(u8, get, "Content-Length") == null);
+
+    // POST with an empty body still declares an explicit zero length.
+    const post = try buildRequest(a, &.{ .method = "POST", .url = try cli.parseUrl("http://x/") });
+    try testing.expect(std.mem.indexOf(u8, post, "Content-Length: 0\r\n") != null);
+
+    // A user-supplied Content-Length suppresses the automatic one.
+    const headers = [_]cli.Header{.{ .name = "Content-Length", .value = "5" }};
+    const custom = try buildRequest(a, &.{
+        .method = "POST",
+        .body = "hello",
+        .headers = &headers,
+        .url = try cli.parseUrl("http://x/"),
+    });
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, custom, "Content-Length"));
+}
+
+test "parseResponse rejects non-3-digit status codes" {
+    var short = Io.Reader.fixed("HTTP/1.1 42 Weird\r\n\r\n");
+    try testing.expectError(error.MalformedStatusLine, parseResponse(&short, .other));
+    var long = Io.Reader.fixed("HTTP/1.1 12345 Weird\r\n\r\n");
+    try testing.expectError(error.MalformedStatusLine, parseResponse(&long, .other));
 }
 
 test "RequestMethod.of classifies HEAD case-insensitively" {
