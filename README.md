@@ -1,5 +1,7 @@
 # zrk
 
+[![CI](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml)
+
 A constant-throughput HTTP load generator — a Zig 0.16 rewrite of
 [wrk2](https://github.com/giltene/wrk2), with a **live in-terminal dashboard**
 of test progress.
