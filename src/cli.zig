@@ -8,7 +8,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// zrk version string, surfaced by `--version` and embedded in JSON reports.
-pub const version = "0.1.0";
+/// Single-sourced from build.zig.zon via the build's options module.
+pub const version: []const u8 = @import("build_info").version;
 
 pub const Scheme = enum { http, https };
 

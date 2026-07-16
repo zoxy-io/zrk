@@ -1,13 +1,25 @@
 const std = @import("std");
 
+const manifest = @import("build.zig.zon");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Single-source the version from build.zig.zon: cli.zig imports it via
+    // this options module, so --version and JSON reports can't drift from the
+    // package version (v0.2.0 shipped binaries that still said 0.1.0).
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", manifest.version);
+    const build_info_mod = build_info.createModule();
 
     // The reusable library module: embedders `@import("zrk")` this.
     const mod = b.addModule("zrk", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "build_info", .module = build_info_mod },
+        },
     });
 
     // The CLI executable.
@@ -19,6 +31,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zrk", .module = mod },
+                .{ .name = "build_info", .module = build_info_mod },
             },
         }),
     });
