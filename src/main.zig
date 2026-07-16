@@ -237,6 +237,7 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.InvalidFormat => "zrk: invalid --format (expected 'text' or 'json')\n\n",
         error.ZeroConnections => "zrk: connections (-c) must be greater than 0\n\n",
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
+        error.ZeroInterval => "zrk: --interval must be greater than 0\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);

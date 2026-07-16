@@ -101,6 +101,7 @@ pub const ParseError = error{
     InvalidFormat,
     ZeroConnections,
     ZeroRate,
+    ZeroInterval,
     OutOfMemory,
 };
 
@@ -251,6 +252,9 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     if (cfg.rate == 0) return error.ZeroRate;
     // A ramp toward 0 req/s has no well-defined schedule; require a positive end.
     if (cfg.rate_end) |e| if (e == 0) return error.ZeroRate;
+    // A zero interval would busy-loop the snapshot thread and take the publish
+    // lock on every request.
+    if (cfg.interval_ns == 0) return error.ZeroInterval;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
@@ -350,7 +354,11 @@ pub fn parseDuration(s: []const u8) ParseError!u64 {
     else
         return error.InvalidDuration;
 
-    return @intFromFloat(value * multiplier);
+    // Reject durations the i64-nanosecond timestamp math downstream cannot
+    // represent (~292 years) instead of tripping checked-@intFromFloat UB.
+    const scaled = value * multiplier;
+    if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return error.InvalidDuration;
+    return @intFromFloat(scaled);
 }
 
 /// Parse an absolute http(s) URL into scheme/host/port/target.
@@ -418,6 +426,23 @@ test "parseDuration units" {
     try testing.expectError(error.InvalidDuration, parseDuration(""));
     try testing.expectError(error.InvalidDuration, parseDuration("abc"));
     try testing.expectError(error.InvalidDuration, parseDuration("10x"));
+}
+
+test "durations beyond the timestamp range are rejected, not UB" {
+    try testing.expectError(error.InvalidDuration, parseDuration("99999999999999999999"));
+    try testing.expectError(error.InvalidDuration, parseDuration("9999999999999h"));
+    // Large-but-representable spans still parse.
+    try testing.expect(try parseDuration("100000h") > 0);
+}
+
+test "zero interval is rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectError(error.ZeroInterval, parse(a, &[_][]const u8{ "--interval", "0", "http://x/" }));
+    // Zero timeout stays valid: it means "no response timeout".
+    const cfg = (try parse(a, &[_][]const u8{ "--timeout", "0", "http://x/" })).config;
+    try testing.expectEqual(@as(u64, 0), cfg.timeout_ns);
 }
 
 test "parseUrl http default port and path" {
