@@ -51,12 +51,16 @@ pub const Dashboard = struct {
     pub fn frame(self: *Dashboard, snap: *const stats.Snapshot, now_ns: i128, elapsed_s: f64, total_s: f64) !void {
         const w = self.writer();
 
-        // Interval request rate from the delta since the previous frame.
+        // Interval request rate from the delta since the previous frame; the
+        // first frame's "interval" is the whole run so far (otherwise a run
+        // with a single frame reports 0 req/s despite completed requests).
         var rate: f64 = 0;
         if (self.have_prev and now_ns > self.prev_ns) {
             const d_req: f64 = @floatFromInt(snap.counters.completed -| self.prev_completed);
             const d_s: f64 = @as(f64, @floatFromInt(now_ns - self.prev_ns)) / std.time.ns_per_s;
             if (d_s > 0) rate = d_req / d_s;
+        } else if (!self.have_prev and elapsed_s > 0) {
+            rate = @as(f64, @floatFromInt(snap.counters.completed)) / elapsed_s;
         }
         self.have_prev = true;
         self.prev_completed = snap.counters.completed;

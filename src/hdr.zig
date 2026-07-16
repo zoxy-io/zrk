@@ -294,14 +294,14 @@ pub const Histogram = struct {
     pub fn stdDev(self: *const Histogram) f64 {
         if (self.total_count == 0) return 0;
         const m = self.mean();
-        var geometric_sum: f64 = 0;
+        var sum_sq_dev: f64 = 0;
         for (self.counts, 0..) |c, i| {
             if (c == 0) continue;
             const v: f64 = @floatFromInt(self.medianEquivalentValue(self.valueFromIndex(@intCast(i))));
             const dev = v - m;
-            geometric_sum += (dev * dev) * @as(f64, @floatFromInt(c));
+            sum_sq_dev += (dev * dev) * @as(f64, @floatFromInt(c));
         }
-        return @sqrt(geometric_sum / @as(f64, @floatFromInt(self.total_count)));
+        return @sqrt(sum_sq_dev / @as(f64, @floatFromInt(self.total_count)));
     }
 
     /// Value at the given percentile (0..100). Returns the midpoint of the
