@@ -46,14 +46,30 @@ pub const Fleet = struct {
 
     pub fn init(allocator: Allocator, n: u32, publish_interval_ns: u64, enable_tls: bool) !Fleet {
         const live_hist = try allocator.alloc(hdr.Histogram, n);
+        errdefer allocator.free(live_hist);
         const live_counters = try allocator.alloc(connection.Counters, n);
+        errdefer allocator.free(live_counters);
         const snap_hist = try allocator.alloc(hdr.Histogram, n);
+        errdefer allocator.free(snap_hist);
         const publish = try allocator.alloc(connection.Publish, n);
+        errdefer allocator.free(publish);
         const params = try allocator.alloc(connection.Params, n);
+        errdefer allocator.free(params);
         const tls_state: ?[]tlsmod.State = if (enable_tls) try allocator.alloc(tlsmod.State, n) else null;
+        errdefer if (tls_state) |ts| allocator.free(ts);
 
-        for (live_hist) |*h| h.* = try newHistogram(allocator);
-        for (snap_hist) |*h| h.* = try newHistogram(allocator);
+        var live_inited: usize = 0;
+        errdefer for (live_hist[0..live_inited]) |*h| h.deinit();
+        for (live_hist) |*h| {
+            h.* = try newHistogram(allocator);
+            live_inited += 1;
+        }
+        var snap_inited: usize = 0;
+        errdefer for (snap_hist[0..snap_inited]) |*h| h.deinit();
+        for (snap_hist) |*h| {
+            h.* = try newHistogram(allocator);
+            snap_inited += 1;
+        }
         @memset(live_counters, .{});
         for (publish, snap_hist) |*p, *sh| {
             p.* = .{ .hist = sh, .interval_ns = publish_interval_ns };
@@ -144,6 +160,15 @@ test "fleet aggregates live counters and histograms" {
     try testing.expectEqual(@as(u64, 30), snap.counters.completed);
     try testing.expectEqual(@as(u64, 300), snap.counters.bytes);
     try testing.expectEqual(@as(u64, 3), snap.hist.count());
+}
+
+test "Fleet.init leaks nothing when any allocation fails" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn initAndDeinit(allocator: Allocator) !void {
+            var fleet = try Fleet.init(allocator, 3, std.time.ns_per_s, true);
+            fleet.deinit();
+        }
+    }.initAndDeinit, .{});
 }
 
 test "readSnapshot reflects published state" {
