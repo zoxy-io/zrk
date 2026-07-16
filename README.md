@@ -156,11 +156,12 @@ distribution (values in milliseconds), directly loadable by the
 and format-compatible with wrk2's `--latency` output.
 
 `--timeseries <file>` streams one NDJSON object per `--interval`, each carrying
-that window's offered `target_rate`, `achieved_rate`, request/error counts, and
-a delta-histogram latency percentile set:
+that window's offered `target_rate`, `achieved_rate`, request/error counts,
+transfer (`bytes`, `bytes_per_sec`), and a delta-histogram latency percentile
+set:
 
 ```
-{"t":1.006,"target_rate":480.0,"achieved_rate":476.2,"requests":476,"errors":0,"latency_us":{"p50":245,"p90":669,"p99":1745,"p99_9":2401,"max":2401}}
+{"t":1.006,"target_rate":480.0,"achieved_rate":476.2,"requests":476,"errors":0,"bytes":58852,"bytes_per_sec":58501.0,"latency_us":{"p50":245,"p90":669,"p99":1745,"p99_9":2401,"max":2401}}
 ```
 
 This is the artifact a **ramp** (`-R A:B`) exists to produce: a curve of latency

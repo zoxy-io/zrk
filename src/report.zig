@@ -143,6 +143,7 @@ pub const TimeSeries = struct {
     /// `--timeseries-histogram` is on. Backed by the page allocator.
     scratch: std.heap.ArenaAllocator,
     prev_completed: u64 = 0,
+    prev_bytes: u64 = 0,
     prev_errors: u64 = 0,
     prev_elapsed_s: f64 = 0,
 
@@ -180,17 +181,21 @@ pub const TimeSeries = struct {
 
         const interval_s = elapsed_s - self.prev_elapsed_s;
         const d_completed = snap.counters.completed -| self.prev_completed;
+        const d_bytes = snap.counters.bytes -| self.prev_bytes;
         const cur_errors = snap.counters.status_errors + snap.counters.socketErrors();
         const d_errors = cur_errors -| self.prev_errors;
         const achieved: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_completed)) / interval_s else 0;
+        const bps: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_bytes)) / interval_s else 0;
 
         try self.w.print(
             "{{\"t\":{d:.3},\"target_rate\":{d:.1},\"achieved_rate\":{d:.1},\"requests\":{d},\"errors\":{d}," ++
+                "\"bytes\":{d},\"bytes_per_sec\":{d:.1}," ++
                 "\"latency_us\":{{\"p50\":{d},\"p90\":{d},\"p99\":{d},\"p99_9\":{d},\"max\":{d}}}",
             .{
                 elapsed_s,                 self.targetRate(elapsed_s),
                 achieved,                  d_completed,
-                d_errors,                  h.valueAtPercentile(50),
+                d_errors,                  d_bytes,
+                bps,                       h.valueAtPercentile(50),
                 h.valueAtPercentile(90),   h.valueAtPercentile(99),
                 h.valueAtPercentile(99.9), h.max(),
             },
@@ -212,6 +217,7 @@ pub const TimeSeries = struct {
 
         snap.hist.copyInto(&self.prev_cum);
         self.prev_completed = snap.counters.completed;
+        self.prev_bytes = snap.counters.bytes;
         self.prev_errors = cur_errors;
         self.prev_elapsed_s = elapsed_s;
     }
@@ -311,11 +317,14 @@ test "time series row carries the interval HDR blob when enabled" {
     var i: u64 = 0;
     while (i < 50) : (i += 1) snap.hist.record(1000 + i);
     snap.counters.completed = 50;
+    snap.counters.bytes = 4200;
 
     try ts.record(&snap, 1.0);
     const out = alloc.written();
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_us\":{") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_histogram\":\"HIST") != null);
+    // The interval's transfer: byte delta and rate over the 1s window.
+    try testing.expect(std.mem.indexOf(u8, out, "\"bytes\":4200,\"bytes_per_sec\":4200.0") != null);
     try testing.expect(std.mem.endsWith(u8, out, "}\n"));
 
     // The blob decodes back to this interval's 50 samples.

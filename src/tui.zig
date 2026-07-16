@@ -25,6 +25,7 @@ pub const Dashboard = struct {
     // Rate tracking between frames.
     have_prev: bool = false,
     prev_completed: u64 = 0,
+    prev_bytes: u64 = 0,
     prev_ns: i128 = 0,
 
     // p99 history (microseconds) for the sparkline.
@@ -51,19 +52,26 @@ pub const Dashboard = struct {
     pub fn frame(self: *Dashboard, snap: *const stats.Snapshot, now_ns: i128, elapsed_s: f64, total_s: f64) !void {
         const w = self.writer();
 
-        // Interval request rate from the delta since the previous frame; the
-        // first frame's "interval" is the whole run so far (otherwise a run
-        // with a single frame reports 0 req/s despite completed requests).
+        // Interval request/transfer rates from the delta since the previous
+        // frame; the first frame's "interval" is the whole run so far
+        // (otherwise a run with a single frame reports 0 despite traffic).
         var rate: f64 = 0;
+        var bps: f64 = 0;
         if (self.have_prev and now_ns > self.prev_ns) {
             const d_req: f64 = @floatFromInt(snap.counters.completed -| self.prev_completed);
+            const d_bytes: f64 = @floatFromInt(snap.counters.bytes -| self.prev_bytes);
             const d_s: f64 = @as(f64, @floatFromInt(now_ns - self.prev_ns)) / std.time.ns_per_s;
-            if (d_s > 0) rate = d_req / d_s;
+            if (d_s > 0) {
+                rate = d_req / d_s;
+                bps = d_bytes / d_s;
+            }
         } else if (!self.have_prev and elapsed_s > 0) {
             rate = @as(f64, @floatFromInt(snap.counters.completed)) / elapsed_s;
+            bps = @as(f64, @floatFromInt(snap.counters.bytes)) / elapsed_s;
         }
         self.have_prev = true;
         self.prev_completed = snap.counters.completed;
+        self.prev_bytes = snap.counters.bytes;
         self.prev_ns = now_ns;
 
         const p99 = snap.hist.valueAtPercentile(99);
@@ -72,10 +80,11 @@ pub const Dashboard = struct {
 
         if (self.tui) {
             try w.writeAll("\x1b[H\x1b[2J"); // home + clear
-            try self.drawPanel(w, snap, rate, elapsed_s, total_s, p99);
+            try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, p99);
         } else {
-            try w.print("[{d:6.1}s] {d:8.0} req/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
+            try w.print("[{d:6.1}s] {d:8.0} req/s {f}/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
                 elapsed_s,             rate,
+                Bytes.of(bps),
                 Dur.of(snap.hist.valueAtPercentile(50)), Dur.of(p99),
                 Dur.of(snap.hist.valueAtPercentile(99.9)), Dur.of(snap.hist.max()),
                 snap.counters.socketErrors() + snap.counters.status_errors,
@@ -84,7 +93,7 @@ pub const Dashboard = struct {
         try self.fw.interface.flush();
     }
 
-    fn drawPanel(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, elapsed_s: f64, total_s: f64, p99: u64) !void {
+    fn drawPanel(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, bps: f64, elapsed_s: f64, total_s: f64, p99: u64) !void {
         const c = snap.counters;
         try w.print("  zrk  →  {s}://{s}:{d}{s}\n", .{
             @tagName(self.cfg.url.scheme), self.cfg.url.host, self.cfg.url.port, self.cfg.url.target,
@@ -93,9 +102,9 @@ pub const Dashboard = struct {
             elapsed_s, total_s, self.cfg.connections, self.cfg.rate,
         });
 
-        try w.print("  requests {d}      rate {d:.0} req/s      transfer ", .{ c.completed, rate });
-        try writeBytes(w, @floatFromInt(c.bytes));
-        try w.writeAll("\n");
+        try w.print("  requests {d}      rate {d:.0} req/s      transfer {f} ({f}/s)\n", .{
+            c.completed, rate, Bytes.of(@floatFromInt(c.bytes)), Bytes.of(bps),
+        });
 
         const errs = c.socketErrors();
         if (errs > 0 or c.status_errors > 0) {
@@ -233,6 +242,19 @@ const Dur = struct {
 
     pub fn format(self: Dur, w: *Io.Writer) Io.Writer.Error!void {
         try write(w, @floatFromInt(self.micros));
+    }
+};
+
+/// Byte-quantity formatting helper (binary units), usable via `{f}`.
+const Bytes = struct {
+    v: f64,
+
+    fn of(v: f64) Bytes {
+        return .{ .v = v };
+    }
+
+    pub fn format(self: Bytes, w: *Io.Writer) Io.Writer.Error!void {
+        try writeBytes(w, self.v);
     }
 };
 
