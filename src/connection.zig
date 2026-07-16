@@ -86,6 +86,9 @@ pub const Params = struct {
     address: net.IpAddress,
     host: []const u8,
     request: []const u8,
+    /// Framing classification of the request method (HEAD responses have no
+    /// body); see `http.RequestMethod`.
+    method: httpmod.RequestMethod = .other,
     is_tls: bool,
     insecure: bool,
     /// Send schedule for THIS connection (constant spacing or a linear ramp).
@@ -315,7 +318,7 @@ fn performWork(p: *Params, app_reader: *Io.Reader, app_writer: *Io.Writer) WorkR
     // For TLS the app writer only encrypts into the socket writer's buffer; the
     // underlying stream writer must be flushed to actually send the ciphertext.
     if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch return .write_failed;
-    const resp = httpmod.parseResponse(app_reader) catch return .read_failed;
+    const resp = httpmod.parseResponse(app_reader, p.method) catch return .read_failed;
     return .{ .ok = resp };
 }
 
@@ -383,19 +386,24 @@ fn testServe(io: Io, server: *net.Server) void {
     stream.close(io);
 }
 
+/// Consume one request's header lines through the terminating blank line (the
+/// test client sends no bodies). Errors when the peer closes the connection.
+fn discardRequestHead(r: *Io.Reader) !void {
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (line.len <= 2) return; // "\r\n" or "\n": end of headers
+    }
+}
+
 fn serveConn(io: Io, stream: *net.Stream) void {
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var r = stream.reader(io, &rbuf);
     var w = stream.writer(io, &wbuf);
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    // One response per request until the client closes the connection.
     while (true) {
-        // Consume one request (headers up to the blank line); the client sends
-        // no body.
-        while (true) {
-            const line = r.interface.takeDelimiterInclusive('\n') catch return;
-            if (line.len <= 2) break; // "\r\n" or "\n": end of headers
-        }
+        discardRequestHead(&r.interface) catch return;
         w.interface.writeAll(response) catch return;
         w.interface.flush() catch return;
     }
@@ -454,6 +462,75 @@ test "run drives keep-alive requests against a local server" {
     try testing.expectEqual(counters.completed * response_len, counters.bytes);
 }
 
+/// Serves HEAD-style responses: headers advertising a Content-Length that has
+/// no body following it, as RFC 9112 §6.3 prescribes for HEAD.
+fn headServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+    // One response per request until the client closes the connection.
+    while (true) {
+        discardRequestHead(&r.interface) catch return;
+        w.interface.writeAll(response) catch return;
+        w.interface.flush() catch return;
+    }
+}
+
+test "run keeps HEAD responses framed despite Content-Length" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, headServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .method = .head,
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
+        // Short response timeout so a framing regression fails fast (as
+        // timeouts) instead of hanging the test on a body that never comes.
+        .timeout_ns = 100 * std.time.ns_per_ms,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // Without HEAD awareness the parser would wait for 1234 body bytes that
+    // never arrive: zero completions, all timeouts. With it, the keep-alive
+    // connection serves many requests.
+    try testing.expect(counters.completed > 1);
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+}
+
 /// Accepts one connection, reads the request, then holds the connection open
 /// without ever responding (interrupted by cancellation at test end).
 fn stallServe(io: Io, server: *net.Server) void {
@@ -461,10 +538,7 @@ fn stallServe(io: Io, server: *net.Server) void {
     defer stream.close(io);
     var rbuf: [4096]u8 = undefined;
     var r = stream.reader(io, &rbuf);
-    while (true) {
-        const line = r.interface.takeDelimiterInclusive('\n') catch return;
-        if (line.len <= 2) break;
-    }
+    discardRequestHead(&r.interface) catch return;
     io.sleep(Io.Duration.fromSeconds(30), .awake) catch {};
 }
 

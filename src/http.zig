@@ -82,10 +82,26 @@ pub const ParseError = error{
     ReadFailed,
 };
 
+/// The one method distinction response parsing needs: responses to HEAD carry
+/// framing headers describing the body a GET would have returned, but never
+/// the body itself (RFC 9112 §6.3). Every other method — including arbitrary
+/// `-m` strings zrk passes through verbatim — frames normally.
+pub const RequestMethod = enum {
+    other,
+    head,
+
+    /// Classify a raw method string (methods are case-sensitive per RFC 9110,
+    /// but we accept any casing of HEAD rather than misframe the response).
+    pub fn of(method: []const u8) RequestMethod {
+        return if (std.ascii.eqlIgnoreCase(method, "HEAD")) .head else .other;
+    }
+};
+
 /// Parse one HTTP/1.1 response from `r`, consuming its full body so the reader
-/// is positioned at the start of the next response. `r`'s buffer capacity must
-/// be large enough to hold the longest single header line.
-pub fn parseResponse(r: *Io.Reader) ParseError!Response {
+/// is positioned at the start of the next response. `method` is the request's
+/// framing classification (see `RequestMethod`). `r`'s buffer capacity must be
+/// large enough to hold the longest single header line.
+pub fn parseResponse(r: *Io.Reader, method: RequestMethod) ParseError!Response {
     var bytes: u64 = 0;
 
     // Status line: "HTTP/1.1 200 OK\r\n"
@@ -119,17 +135,20 @@ pub fn parseResponse(r: *Io.Reader) ParseError!Response {
         }
     }
 
-    // Body.
-    if (chunked) {
+    // Body. HEAD responses and 1xx/204/304 statuses never carry one, whatever
+    // Content-Length or Transfer-Encoding claim (RFC 9112 §6.3) — consuming a
+    // body there would eat into the next response and break framing.
+    const bodyless = method == .head or status == 204 or status == 304 or status / 100 == 1;
+    if (bodyless) {
+        // Nothing to consume.
+    } else if (chunked) {
         try consumeChunkedBody(r, &bytes);
     } else if (content_length) |len| {
         discard(r, len, &bytes) catch return error.UnexpectedEof;
     } else {
-        // No framing info. For 1xx/204/304 there is no body; otherwise the body
-        // runs to connection close, which precludes keep-alive.
-        if (status != 204 and status != 304 and status / 100 != 1) {
-            keep_alive = false;
-        }
+        // No framing info: the body runs to connection close, which precludes
+        // keep-alive.
+        keep_alive = false;
     }
 
     return .{ .status = status, .bytes = bytes, .keep_alive = keep_alive };
@@ -229,7 +248,7 @@ test "buildRequest with non-default port, method, body, headers" {
 test "parseResponse content-length" {
     const raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello";
     var r = Io.Reader.fixed(raw);
-    const resp = try parseResponse(&r);
+    const resp = try parseResponse(&r, .other);
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(resp.keep_alive);
     try testing.expectEqual(@as(u64, raw.len), resp.bytes);
@@ -240,9 +259,9 @@ test "parseResponse two pipelined responses stay framed" {
     const raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi" ++
         "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno!";
     var r = Io.Reader.fixed(raw);
-    const first = try parseResponse(&r);
+    const first = try parseResponse(&r, .other);
     try testing.expectEqual(@as(u16, 200), first.status);
-    const second = try parseResponse(&r);
+    const second = try parseResponse(&r, .other);
     try testing.expectEqual(@as(u16, 404), second.status);
     try testing.expectEqual(StatusClass.client_error, StatusClass.of(second.status));
 }
@@ -251,7 +270,7 @@ test "parseResponse chunked" {
     const raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
     var r = Io.Reader.fixed(raw);
-    const resp = try parseResponse(&r);
+    const resp = try parseResponse(&r, .other);
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(resp.keep_alive);
     try testing.expectEqual(@as(u64, raw.len), resp.bytes);
@@ -260,21 +279,64 @@ test "parseResponse chunked" {
 test "parseResponse connection close disables keep-alive" {
     const raw = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     var r = Io.Reader.fixed(raw);
-    const resp = try parseResponse(&r);
+    const resp = try parseResponse(&r, .other);
     try testing.expect(!resp.keep_alive);
 }
 
 test "parseResponse http/1.0 defaults to no keep-alive" {
     const raw = "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
     var r = Io.Reader.fixed(raw);
-    const resp = try parseResponse(&r);
+    const resp = try parseResponse(&r, .other);
     try testing.expect(!resp.keep_alive);
+}
+
+test "RequestMethod.of classifies HEAD case-insensitively" {
+    try testing.expectEqual(RequestMethod.head, RequestMethod.of("HEAD"));
+    try testing.expectEqual(RequestMethod.head, RequestMethod.of("head"));
+    try testing.expectEqual(RequestMethod.other, RequestMethod.of("GET"));
+    try testing.expectEqual(RequestMethod.other, RequestMethod.of("PROPPATCH"));
+}
+
+test "parseResponse HEAD ignores Content-Length and stays framed" {
+    // HEAD responses advertise the entity's Content-Length but carry no body;
+    // two back-to-back responses must parse cleanly without consuming "body"
+    // bytes that don't exist.
+    const one = "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+    const raw = one ++ "HTTP/1.1 404 Not Found\r\nContent-Length: 99\r\n\r\n";
+    var r = Io.Reader.fixed(raw);
+    const first = try parseResponse(&r, .head);
+    try testing.expectEqual(@as(u16, 200), first.status);
+    try testing.expect(first.keep_alive);
+    try testing.expectEqual(@as(u64, one.len), first.bytes);
+    const second = try parseResponse(&r, .head);
+    try testing.expectEqual(@as(u16, 404), second.status);
+}
+
+test "parseResponse HEAD ignores chunked transfer-encoding" {
+    const raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var r = Io.Reader.fixed(raw);
+    const resp = try parseResponse(&r, .head);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expect(resp.keep_alive);
+    try testing.expectEqual(@as(u64, raw.len), resp.bytes);
+}
+
+test "parseResponse 304 with Content-Length has no body" {
+    const one = "HTTP/1.1 304 Not Modified\r\nContent-Length: 5678\r\n\r\n";
+    const raw = one ++ "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    var r = Io.Reader.fixed(raw);
+    const first = try parseResponse(&r, .other);
+    try testing.expectEqual(@as(u16, 304), first.status);
+    try testing.expect(first.keep_alive);
+    try testing.expectEqual(@as(u64, one.len), first.bytes);
+    const second = try parseResponse(&r, .other);
+    try testing.expectEqual(@as(u16, 200), second.status);
 }
 
 test "parseResponse 204 no body" {
     const raw = "HTTP/1.1 204 No Content\r\n\r\n";
     var r = Io.Reader.fixed(raw);
-    const resp = try parseResponse(&r);
+    const resp = try parseResponse(&r, .other);
     try testing.expectEqual(@as(u16, 204), resp.status);
     try testing.expect(resp.keep_alive);
 }

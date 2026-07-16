@@ -75,6 +75,7 @@ pub fn run(
         .address = address,
         .host = cfg.url.host,
         .request = request,
+        .method = .of(cfg.method),
         .is_tls = cfg.url.isTls(),
         .insecure = cfg.insecure,
         .schedule = schedule,
