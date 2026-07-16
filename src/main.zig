@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     // dashboard renders the runner's periodic snapshots via the progress
     // callback; in JSON mode the run is silent and only the summary is emitted.
     var dash_buf: [8192]u8 = undefined;
-    var dash = tui.Dashboard.init(io, &cfg, &dash_buf);
+    var dash = tui.Dashboard.init(io, &cfg, init.minimal.environ, &dash_buf);
 
     // Optional per-interval NDJSON time series. The File.Writer is a pinned
     // local (TimeSeries only borrows a *Io.Writer) so nothing dangles on a move.
@@ -71,7 +71,11 @@ pub fn main(init: std.process.Init) !void {
     const ctx: ?*anyopaque = if (active) @ptrCast(&progress) else null;
     const cb: ?runner.ProgressFn = if (active) onProgress else null;
 
-    const result = runner.run(arena, io, &cfg, ctx, cb) catch |err| {
+    // The fast redraw cadence only makes sense for a live TUI; plain lines
+    // and headless runs stay on the --interval stats window.
+    const frame_ns: u64 = if (progress.dash != null and dash.tui) cfg.refresh_ns else 0;
+
+    const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb) catch |err| {
         try printRunError(io, err);
         std.process.exit(1);
     };
@@ -194,10 +198,11 @@ fn onProgress(
     now_ns: i128,
     elapsed_s: f64,
     total_s: f64,
+    tick: runner.Tick,
 ) void {
     const p: *Progress = @ptrCast(@alignCast(context.?));
-    if (p.dash) |d| d.frame(snapshot, now_ns, elapsed_s, total_s) catch {};
-    if (p.ts) |t| t.record(snapshot, elapsed_s) catch {};
+    if (tick.frame) if (p.dash) |d| d.frame(snapshot, now_ns, elapsed_s, total_s) catch {};
+    if (tick.row) if (p.ts) |t| t.record(snapshot, elapsed_s) catch {};
 }
 
 fn printRunError(io: Io, err: anyerror) !void {
@@ -238,6 +243,7 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.ZeroConnections => "zrk: connections (-c) must be greater than 0\n\n",
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
         error.ZeroInterval => "zrk: --interval must be greater than 0\n\n",
+        error.ZeroRefresh => "zrk: --refresh must be greater than 0\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);

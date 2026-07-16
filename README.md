@@ -45,7 +45,9 @@ zrk [options] <url>
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
                             (@- = stdin, @@x = a literal "@x")
       --timeout     <T>     Per-request timeout            (default 2s)
-      --interval    <T>     Dashboard refresh interval     (default 1s)
+      --interval    <T>     Stats window: --timeseries rows and --plain
+                            lines                          (default 1s)
+      --refresh     <T>     Live dashboard redraw rate     (default 250ms)
       --latency             Print full latency spectrum in the final report
   -k, --insecure            Skip TLS certificate verification
       --plain               Append-only output instead of a live dashboard

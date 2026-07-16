@@ -46,8 +46,13 @@ pub const Config = struct {
     rate_end: ?u64 = null,
     /// Per-request timeout.
     timeout_ns: u64 = 2 * std.time.ns_per_s,
-    /// Dashboard refresh / snapshot period.
+    /// Stats window: per-connection publish period, `--timeseries` row cadence,
+    /// and the line rate of `--plain` output.
     interval_ns: u64 = 1 * std.time.ns_per_s,
+    /// Live dashboard redraw period (TTY only). Independent of the stats
+    /// window so the TUI can feel realtime without changing measurement or
+    /// timeseries semantics.
+    refresh_ns: u64 = 250 * std.time.ns_per_ms,
 
     method: []const u8 = "GET",
     body: []const u8 = "",
@@ -103,6 +108,7 @@ pub const ParseError = error{
     ZeroConnections,
     ZeroRate,
     ZeroInterval,
+    ZeroRefresh,
     OutOfMemory,
 };
 
@@ -128,7 +134,9 @@ pub const usage =
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
     \\                            (@- = stdin, @@x = a literal "@x")
     \\      --timeout     <T>     Per-request timeout            (default 2s)
-    \\      --interval    <T>     Dashboard refresh interval     (default 1s)
+    \\      --interval    <T>     Stats window: --timeseries rows and --plain
+    \\                            lines                          (default 1s)
+    \\      --refresh     <T>     Live dashboard redraw rate     (default 250ms)
     \\      --latency             Print full latency spectrum in the final report
     \\  -k, --insecure            Skip TLS certificate verification
     \\      --plain               Append-only output instead of a live dashboard
@@ -223,6 +231,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.timeout_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--interval")) {
             cfg.interval_ns = try parseDuration(try nextValue(tokens, &i));
+        } else if (eq(arg, "--refresh")) {
+            cfg.refresh_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "-m") or eq(arg, "--method")) {
             cfg.method = try nextValue(tokens, &i);
         } else if (eq(arg, "-b") or eq(arg, "--body")) {
@@ -256,6 +266,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     // A zero interval would busy-loop the snapshot thread and take the publish
     // lock on every request.
     if (cfg.interval_ns == 0) return error.ZeroInterval;
+    // Same busy-loop hazard for the dashboard redraw cadence.
+    if (cfg.refresh_ns == 0) return error.ZeroRefresh;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
@@ -444,6 +456,15 @@ test "zero interval is rejected" {
     // Zero timeout stays valid: it means "no response timeout".
     const cfg = (try parse(a, &[_][]const u8{ "--timeout", "0", "http://x/" })).config;
     try testing.expectEqual(@as(u64, 0), cfg.timeout_ns);
+}
+
+test "refresh flag parses and zero is rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = (try parse(a, &[_][]const u8{ "--refresh", "100ms", "http://x/" })).config;
+    try testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), cfg.refresh_ns);
+    try testing.expectError(error.ZeroRefresh, parse(a, &[_][]const u8{ "--refresh", "0", "http://x/" }));
 }
 
 test "parseUrl http default port and path" {

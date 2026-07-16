@@ -24,22 +24,37 @@ pub const Report = struct {
     launched: u32,
 };
 
-/// Called once per dashboard interval with the merged fleet snapshot.
+/// Which consumers a progress callback is for. The dashboard redraws on the
+/// (faster) `--refresh` cadence; `--timeseries` rows and `--plain` lines keep
+/// the `--interval` stats window. A single wake can serve both.
+pub const Tick = struct {
+    frame: bool,
+    row: bool,
+};
+
+/// Called on each progress wake with the merged fleet snapshot.
 pub const ProgressFn = *const fn (
     context: ?*anyopaque,
     snapshot: *const stats.Snapshot,
     now_ns: i128,
     elapsed_s: f64,
     total_s: f64,
+    tick: Tick,
 ) void;
 
 /// Run one constant-throughput load test to completion. Blocks the
 /// calling thread (worker connections run on their own threads); returns
 /// after the configured duration with the final merged report.
+///
+/// `frame_interval_ns` is the dashboard redraw cadence (0 = follow
+/// `cfg.interval_ns`); the caller passes `cfg.refresh_ns` only when a live
+/// TUI is attached, so plain/JSON runs never wake faster than the stats
+/// window.
 pub fn run(
     arena: std.mem.Allocator,
     io: Io,
     cfg: *const cli.Config,
+    frame_interval_ns: u64,
     progress_context: ?*anyopaque,
     progress: ?ProgressFn,
 ) !Report {
@@ -113,24 +128,45 @@ pub fn run(
     var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(arena), .counters = .{} };
     const total_s: f64 = @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s;
 
-    // Snapshot cadence: wake every interval, but never sleep past `end` — the
-    // final (possibly partial) interval still gets a progress callback, and
-    // the measured elapsed time tracks the configured duration instead of
-    // rounding up to the next interval boundary (which deflated Requests/sec
-    // whenever the duration wasn't a multiple of --interval).
+    // Progress cadence: two independent deadlines share one loop — dashboard
+    // frames every `frame_ns` and stats rows every `--interval` — sleeping to
+    // whichever comes first, but never past `end`. The final (possibly
+    // partial) window still gets a `row` callback, and the measured elapsed
+    // time tracks the configured duration instead of rounding up to the next
+    // boundary (which deflated Requests/sec whenever the duration wasn't a
+    // multiple of --interval).
+    const row_ns: i128 = @intCast(cfg.interval_ns);
+    const frame_ns: i128 = if (frame_interval_ns > 0) @intCast(frame_interval_ns) else row_ns;
+    var next_row: i128 = start.nanoseconds + row_ns;
+    var next_frame: i128 = start.nanoseconds + frame_ns;
     while (true) {
         const before = Io.Timestamp.now(io, .awake);
         if (before.nanoseconds >= end.nanoseconds) break;
-        const interval_ns: @TypeOf(end.nanoseconds) = @intCast(cfg.interval_ns);
-        const sleep_ns = @min(end.nanoseconds - before.nanoseconds, interval_ns);
-        io.sleep(Io.Duration.fromNanoseconds(sleep_ns), .awake) catch break;
+        const next_wake = @min(@min(next_frame, next_row), end.nanoseconds);
+        if (next_wake > before.nanoseconds) {
+            io.sleep(Io.Duration.fromNanoseconds(@intCast(next_wake - before.nanoseconds)), .awake) catch break;
+        }
 
         const t = Io.Timestamp.now(io, .awake);
+        // The wake at `end` flushes both consumers so the last partial window
+        // is never dropped.
+        const at_end = t.nanoseconds >= end.nanoseconds;
+        const tick: Tick = .{
+            .frame = at_end or t.nanoseconds >= next_frame,
+            .row = at_end or t.nanoseconds >= next_row,
+        };
+        // A hair-early sleep return crosses no deadline: sleep again rather
+        // than merging a snapshot nobody consumes.
+        if (!tick.frame and !tick.row) continue;
+        while (next_frame <= t.nanoseconds) next_frame += frame_ns;
+        while (next_row <= t.nanoseconds) next_row += row_ns;
+
         fleet.readSnapshot(io, &snap);
         const elapsed_s: f64 = @as(f64, @floatFromInt(start.durationTo(t).nanoseconds)) / std.time.ns_per_s;
         if (progress) |callback| {
-            callback(progress_context, &snap, t.nanoseconds, elapsed_s, total_s);
+            callback(progress_context, &snap, t.nanoseconds, elapsed_s, total_s, tick);
         }
+        if (at_end) break;
     }
 
     // Signal stop, then cancel: connections idling between paced sends
@@ -227,7 +263,7 @@ test "run's elapsed time tracks the duration, not the interval grid" {
         .interval_ns = 1 * std.time.ns_per_s,
         .url = try cli.parseUrl(url),
     };
-    const result = try run(arena_state.allocator(), io, &cfg, null, null);
+    const result = try run(arena_state.allocator(), io, &cfg, 0, null, null);
 
     group.await(io) catch {};
     server.deinit(io);
