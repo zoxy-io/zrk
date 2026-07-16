@@ -70,6 +70,9 @@ pub const Histogram = struct {
     ) InitError!Histogram {
         if (lowest_discernible < 1) return error.InvalidArguments;
         if (sig_figs < 1 or sig_figs > 5) return error.InvalidArguments;
+        // The doubling below must not overflow (decoded headers can carry
+        // arbitrary values here).
+        if (lowest_discernible > std.math.maxInt(u64) / 2) return error.InvalidArguments;
         if (highest_trackable < 2 * lowest_discernible) return error.InvalidArguments;
 
         // largest_value_with_single_unit_resolution = 2 * 10^sig_figs
@@ -467,7 +470,9 @@ pub fn decodeBase64(gpa: Allocator, str: []const u8) !Histogram {
     const enc_cookie = std.mem.readInt(u32, encoded[0..][0..4], .big);
     if ((enc_cookie & cookie_base_mask) != v2_encoding_base) return error.InvalidCookie;
     const payload_len = std.mem.readInt(u32, encoded[4..][0..4], .big);
-    const sig_figs: u8 = @intCast(std.mem.readInt(u32, encoded[12..][0..4], .big));
+    const sig_figs_raw = std.mem.readInt(u32, encoded[12..][0..4], .big);
+    if (sig_figs_raw < 1 or sig_figs_raw > 5) return error.InvalidHistogram;
+    const sig_figs: u8 = @intCast(sig_figs_raw);
     const lowest = std.mem.readInt(u64, encoded[16..][0..8], .big);
     const highest = std.mem.readInt(u64, encoded[24..][0..8], .big);
     if (40 + @as(usize, payload_len) > encoded.len) return error.InvalidHistogram;
@@ -475,16 +480,18 @@ pub fn decodeBase64(gpa: Allocator, str: []const u8) !Histogram {
     var hist = try Histogram.init(gpa, lowest, highest, sig_figs);
     errdefer hist.deinit();
 
-    // Expand the ZigZag/RLE payload back into the counts array.
+    // Expand the ZigZag/RLE payload back into the counts array. The payload is
+    // untrusted: truncated varints error, and a hostile zero-run length only
+    // saturates the (u64) index, ending the loop, rather than overflowing.
     const payload = encoded[40 .. 40 + payload_len];
-    var idx: u32 = 0;
+    var idx: u64 = 0;
     var pos: usize = 0;
     while (pos < payload.len and idx < hist.counts_len) {
-        const v = readZigZag(payload, &pos);
+        const v = readZigZag(payload, &pos) catch return error.InvalidHistogram;
         if (v < 0) {
-            idx += @intCast(-v); // run of zeros
+            idx +|= @intCast(-@as(i128, v)); // run of zeros
         } else {
-            hist.counts[idx] = @intCast(v);
+            hist.counts[@intCast(idx)] = @intCast(v);
             idx += 1;
         }
     }
@@ -520,12 +527,14 @@ fn appendZigZag(list: *std.ArrayList(u8), gpa: Allocator, v: i64) !void {
     try list.append(gpa, @intCast(value & 0xff)); // 9th byte: full 8 bits
 }
 
-/// Inverse of `appendZigZag`, advancing `pos` past the consumed bytes.
-fn readZigZag(bytes: []const u8, pos: *usize) i64 {
+/// Inverse of `appendZigZag`, advancing `pos` past the consumed bytes. Errors
+/// instead of reading past the end of a truncated buffer.
+fn readZigZag(bytes: []const u8, pos: *usize) error{Truncated}!i64 {
     var value: u64 = 0;
     var shift: u6 = 0;
     var i: usize = 0;
     while (true) : (i += 1) {
+        if (pos.* >= bytes.len) return error.Truncated;
         const b = bytes[pos.*];
         pos.* += 1;
         if (i == 8) {
@@ -708,8 +717,12 @@ test "zigzag varint: explicit encodings and round-trip" {
     defer enc.deinit(testing.allocator);
     for (vals) |v| try appendZigZag(&enc, testing.allocator, v);
     var pos: usize = 0;
-    for (vals) |v| try testing.expectEqual(v, readZigZag(enc.items, &pos));
+    for (vals) |v| try testing.expectEqual(v, try readZigZag(enc.items, &pos));
     try testing.expectEqual(enc.items.len, pos);
+
+    // A truncated buffer (continuation bit on the final byte) errors.
+    pos = 0;
+    try testing.expectError(error.Truncated, readZigZag(&.{0x80}, &pos));
 }
 
 test "encodeBase64/decodeBase64 round-trip preserves the distribution" {
@@ -750,6 +763,79 @@ test "empty histogram encodes and decodes" {
 test "decodeBase64 rejects a bad cookie" {
     // Valid base64 (12 zero bytes), but the leading cookie is wrong.
     try testing.expectError(error.InvalidCookie, decodeBase64(testing.allocator, "AAAAAAAAAAAAAAAA"));
+}
+
+/// Build a structurally valid compressed V2 base64 blob from raw header
+/// fields and payload bytes, for exercising the decoder against inputs the
+/// encoder would never produce. Caller owns the result.
+fn buildTestBlob(
+    gpa: Allocator,
+    sig_figs: u32,
+    lowest: u64,
+    highest: u64,
+    payload: []const u8,
+) ![]u8 {
+    const encoded = try gpa.alloc(u8, 40 + payload.len);
+    defer gpa.free(encoded);
+    std.mem.writeInt(u32, encoded[0..][0..4], encoding_cookie, .big);
+    std.mem.writeInt(u32, encoded[4..][0..4], @intCast(payload.len), .big);
+    std.mem.writeInt(u32, encoded[8..][0..4], 0, .big);
+    std.mem.writeInt(u32, encoded[12..][0..4], sig_figs, .big);
+    std.mem.writeInt(u64, encoded[16..][0..8], lowest, .big);
+    std.mem.writeInt(u64, encoded[24..][0..8], highest, .big);
+    std.mem.writeInt(u64, encoded[32..][0..8], @bitCast(@as(f64, 1.0)), .big);
+    @memcpy(encoded[40..], payload);
+
+    const zbytes = try zlibCompress(gpa, encoded);
+    defer gpa.free(zbytes);
+    const framed = try gpa.alloc(u8, 8 + zbytes.len);
+    defer gpa.free(framed);
+    std.mem.writeInt(u32, framed[0..][0..4], compressed_cookie, .big);
+    std.mem.writeInt(u32, framed[4..][0..4], @intCast(zbytes.len), .big);
+    @memcpy(framed[8..], zbytes);
+
+    const enc = std.base64.standard.Encoder;
+    const out = try gpa.alloc(u8, enc.calcSize(framed.len));
+    _ = enc.encode(out, framed);
+    return out;
+}
+
+test "decodeBase64 errors (never panics) on malformed blobs" {
+    const gpa = testing.allocator;
+
+    // Truncated varint payload: continuation bit set on the final byte.
+    {
+        const b64 = try buildTestBlob(gpa, 3, 1, 1000, &.{0x80});
+        defer gpa.free(b64);
+        try testing.expectError(error.InvalidHistogram, decodeBase64(gpa, b64));
+    }
+    // Out-of-range significant figures in the header.
+    {
+        const b64 = try buildTestBlob(gpa, 9, 1, 1000, &.{});
+        defer gpa.free(b64);
+        try testing.expectError(error.InvalidHistogram, decodeBase64(gpa, b64));
+    }
+    // A lowest/highest pair whose validation math would overflow.
+    {
+        const b64 = try buildTestBlob(gpa, 3, std.math.maxInt(u64), std.math.maxInt(u64), &.{});
+        defer gpa.free(b64);
+        try testing.expectError(error.InvalidArguments, decodeBase64(gpa, b64));
+    }
+}
+
+test "decodeBase64 tolerates an absurd zero-run length" {
+    const gpa = testing.allocator;
+    // Encode a zero-run of 2^62 — vastly beyond counts_len. The index
+    // saturates and the loop ends; the result is simply an empty histogram.
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try appendZigZag(&payload, gpa, -(@as(i64, 1) << 62));
+    const b64 = try buildTestBlob(gpa, 3, 1, 3_600_000_000, payload.items);
+    defer gpa.free(b64);
+
+    var d = try decodeBase64(gpa, b64);
+    defer d.deinit();
+    try testing.expectEqual(@as(u64, 0), d.count());
 }
 
 test "copyInto snapshot" {
