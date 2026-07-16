@@ -201,7 +201,7 @@ coordinated-omission-corrected sample) so the tail isn't silently truncated;
 | `src/tui.zig` | Live dashboard and final report. |
 | `src/main.zig` | Orchestration: resolve, launch connections, drive the dashboard. |
 
-## Limitations (v1)
+## Limitations (v0)
 
 - HTTP/1.1 only; a single fixed request per run (no scripting).
 - Concurrency is thread-per-connection on the `std.Io.Threaded` backend, since
