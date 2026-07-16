@@ -64,15 +64,21 @@ pub const Dashboard = struct {
     /// Lines the previous frame drew — how far to move up before repainting.
     prev_lines: usize = 0,
 
-    // Rate tracking between frames.
-    have_prev: bool = false,
-    prev_completed: u64 = 0,
-    prev_bytes: u64 = 0,
-    prev_ns: i128 = 0,
+    // Counter samples per frame, so displayed rates are measured over the
+    // --interval stats window regardless of how fast --refresh redraws. A
+    // per-frame delta at a 10ms refresh holds ~a handful of requests and
+    // oscillates between zero and bursts; the window keeps it steady.
+    samples: [rate_ring_len]Sample = undefined,
+    sample_count: usize = 0,
 
-    // p99 history (microseconds) for the sparkline.
+    // p99 history (microseconds) for the sparkline — one point per
+    // --interval, not per frame, so the scroll speed doesn't follow --refresh.
     p99_hist: [history_len]u64 = [_]u64{0} ** history_len,
     p99_count: usize = 0,
+    last_spark_ns: i128 = 0,
+
+    const Sample = struct { ns: i128, completed: u64, bytes: u64 };
+    const rate_ring_len = 128;
 
     pub fn init(io: Io, cfg: *const cli.Config, environ: std.process.Environ, buffer: []u8) Dashboard {
         const file = Io.File.stdout();
@@ -92,35 +98,56 @@ pub const Dashboard = struct {
         return &self.fw.interface;
     }
 
+    /// Newest ring sample at least one --interval older than `now` — the base
+    /// for the displayed rates. While the ring is younger than the window
+    /// (warm-up, or an --interval longer than the ring covers) the oldest
+    /// sample serves; null only before the first sample lands.
+    fn windowSample(self: *const Dashboard, now_ns: i128) ?Sample {
+        if (self.sample_count == 0) return null;
+        const first = self.sample_count -| rate_ring_len;
+        var best: Sample = self.samples[first % rate_ring_len];
+        var i: usize = first;
+        while (i < self.sample_count) : (i += 1) {
+            const s = self.samples[i % rate_ring_len];
+            if (now_ns - s.ns >= self.cfg.interval_ns) best = s else break;
+        }
+        return best;
+    }
+
     /// Render one live frame from an aggregated snapshot.
     pub fn frame(self: *Dashboard, snap: *const stats.Snapshot, now_ns: i128, elapsed_s: f64, total_s: f64) !void {
         const w = self.writer();
 
-        // Interval request/transfer rates from the delta since the previous
-        // frame; the first frame's "interval" is the whole run so far
-        // (otherwise a run with a single frame reports 0 despite traffic).
+        // Request/transfer rates measured over (at least) one --interval, by
+        // diffing against the newest ring sample that old. The measurement
+        // window is thus independent of the redraw cadence; the first frames
+        // fall back to the whole run so far (otherwise a run with a single
+        // frame reports 0 despite traffic).
         var rate: f64 = 0;
         var bps: f64 = 0;
-        if (self.have_prev and now_ns > self.prev_ns) {
-            const d_req: f64 = @floatFromInt(snap.counters.completed -| self.prev_completed);
-            const d_bytes: f64 = @floatFromInt(snap.counters.bytes -| self.prev_bytes);
-            const d_s: f64 = @as(f64, @floatFromInt(now_ns - self.prev_ns)) / std.time.ns_per_s;
+        if (self.windowSample(now_ns)) |base| {
+            const d_s: f64 = @as(f64, @floatFromInt(now_ns - base.ns)) / std.time.ns_per_s;
             if (d_s > 0) {
-                rate = d_req / d_s;
-                bps = d_bytes / d_s;
+                rate = @as(f64, @floatFromInt(snap.counters.completed -| base.completed)) / d_s;
+                bps = @as(f64, @floatFromInt(snap.counters.bytes -| base.bytes)) / d_s;
             }
-        } else if (!self.have_prev and elapsed_s > 0) {
+        } else if (elapsed_s > 0) {
             rate = @as(f64, @floatFromInt(snap.counters.completed)) / elapsed_s;
             bps = @as(f64, @floatFromInt(snap.counters.bytes)) / elapsed_s;
         }
-        self.have_prev = true;
-        self.prev_completed = snap.counters.completed;
-        self.prev_bytes = snap.counters.bytes;
-        self.prev_ns = now_ns;
+        self.samples[self.sample_count % rate_ring_len] = .{
+            .ns = now_ns,
+            .completed = snap.counters.completed,
+            .bytes = snap.counters.bytes,
+        };
+        self.sample_count += 1;
 
         const p99 = snap.hist.valueAtPercentile(99);
-        self.p99_hist[self.p99_count % history_len] = p99;
-        self.p99_count += 1;
+        if (self.p99_count == 0 or now_ns - self.last_spark_ns >= self.cfg.interval_ns) {
+            self.p99_hist[self.p99_count % history_len] = p99;
+            self.p99_count += 1;
+            self.last_spark_ns = now_ns;
+        }
 
         if (self.tui) {
             // Repaint in place: move to the first panel line and erase below.

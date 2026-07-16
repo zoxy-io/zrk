@@ -52,7 +52,7 @@ pub const Config = struct {
     /// Live dashboard redraw period (TTY only). Independent of the stats
     /// window so the TUI can feel realtime without changing measurement or
     /// timeseries semantics.
-    refresh_ns: u64 = 250 * std.time.ns_per_ms,
+    refresh_ns: u64 = 80 * std.time.ns_per_ms,
 
     method: []const u8 = "GET",
     body: []const u8 = "",
@@ -136,7 +136,7 @@ pub const usage =
     \\      --timeout     <T>     Per-request timeout            (default 2s)
     \\      --interval    <T>     Stats window: --timeseries rows and --plain
     \\                            lines                          (default 1s)
-    \\      --refresh     <T>     Live dashboard redraw rate     (default 250ms)
+    \\      --refresh     <T>     Live dashboard redraw rate     (default 80ms)
     \\      --latency             Print full latency spectrum in the final report
     \\  -k, --insecure            Skip TLS certificate verification
     \\      --plain               Append-only output instead of a live dashboard
