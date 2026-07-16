@@ -328,6 +328,8 @@ fn now(io: Io) Io.Timestamp {
 
 /// Record a socket error, unless we are shutting down — errors caused by
 /// cancelling in-flight I/O at end-of-test are artifacts, not real failures.
+/// Publishes so the live dashboard sees error-only periods (a total outage
+/// produces no successful responses to publish through).
 fn noteError(p: *Params, kind: enum { connect, write, read }) void {
     if (p.stop.load(.monotonic)) return;
     switch (kind) {
@@ -335,6 +337,7 @@ fn noteError(p: *Params, kind: enum { connect, write, read }) void {
         .write => p.counters.write_errors += 1,
         .read => p.counters.read_errors += 1,
     }
+    maybePublish(p, now(p.io).nanoseconds);
 }
 
 /// A timed-out request (the watchdog shut the socket down): count it and, unless
@@ -345,12 +348,14 @@ fn noteError(p: *Params, kind: enum { connect, write, read }) void {
 fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
     if (p.stop.load(.monotonic)) return;
     p.counters.timeouts += 1;
+    const done = now(io);
     if (p.record_timeouts) {
-        const done = now(io);
         const latency_ns = done.nanoseconds - scheduled.nanoseconds;
         const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
         p.histogram.record(latency_us);
     }
+    // Publish so a fully stalled target still surfaces on the dashboard.
+    maybePublish(p, done.nanoseconds);
 }
 
 /// Publish a snapshot of this connection's live state for the dashboard, but at
@@ -557,6 +562,9 @@ test "run reports timeouts against a non-responsive server" {
 
     var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
     defer histogram.deinit();
+    var snap_hist = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer snap_hist.deinit();
+    var publish: Publish = .{ .hist = &snap_hist, .interval_ns = 10 * std.time.ns_per_ms };
     var counters: Counters = .{};
     var stop = std.atomic.Value(bool).init(false);
 
@@ -576,6 +584,7 @@ test "run reports timeouts against a non-responsive server" {
         .stop = &stop,
         .histogram = &histogram,
         .counters = &counters,
+        .publish = &publish,
     };
     run(&params);
 
@@ -590,6 +599,56 @@ test "run reports timeouts against a non-responsive server" {
     // With record_timeouts on (the default), each timeout contributes exactly one
     // coordinated-omission-corrected latency sample so the tail isn't truncated.
     try testing.expectEqual(counters.timeouts, histogram.count());
+    // The timeouts (and their latency samples) must reach the dashboard's
+    // publish slot even though no request ever succeeds.
+    try testing.expect(publish.counters.timeouts > 0);
+    try testing.expect(publish.hist.count() > 0);
+}
+
+test "connect errors surface in the published snapshot during total outage" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Bind an ephemeral port, then close the listener so connects are refused.
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    server.deinit(io);
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var snap_hist = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer snap_hist.deinit();
+    var publish: Publish = .{ .hist = &snap_hist, .interval_ns = 10 * std.time.ns_per_ms };
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(100));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
+        .timeout_ns = 0,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+        .publish = &publish,
+    };
+    run(&params);
+
+    try testing.expect(counters.connect_errors > 0);
+    // The refused connects must be visible to the dashboard: previously only
+    // successful responses published, so an unreachable target showed nothing.
+    try testing.expect(publish.counters.connect_errors > 0);
 }
 
 test "run with record_timeouts disabled drops timed-out samples" {
