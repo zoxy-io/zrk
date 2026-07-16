@@ -385,19 +385,24 @@ fn testServe(io: Io, server: *net.Server) void {
     stream.close(io);
 }
 
+/// Consume one request's header lines through the terminating blank line (the
+/// test client sends no bodies). Errors when the peer closes the connection.
+fn discardRequestHead(r: *Io.Reader) !void {
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (line.len <= 2) return; // "\r\n" or "\n": end of headers
+    }
+}
+
 fn serveConn(io: Io, stream: *net.Stream) void {
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var r = stream.reader(io, &rbuf);
     var w = stream.writer(io, &wbuf);
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    // One response per request until the client closes the connection.
     while (true) {
-        // Consume one request (headers up to the blank line); the client sends
-        // no body.
-        while (true) {
-            const line = r.interface.takeDelimiterInclusive('\n') catch return;
-            if (line.len <= 2) break; // "\r\n" or "\n": end of headers
-        }
+        discardRequestHead(&r.interface) catch return;
         w.interface.writeAll(response) catch return;
         w.interface.flush() catch return;
     }
@@ -466,11 +471,9 @@ fn headServe(io: Io, server: *net.Server) void {
     var r = stream.reader(io, &rbuf);
     var w = stream.writer(io, &wbuf);
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+    // One response per request until the client closes the connection.
     while (true) {
-        while (true) {
-            const line = r.interface.takeDelimiterInclusive('\n') catch return;
-            if (line.len <= 2) break;
-        }
+        discardRequestHead(&r.interface) catch return;
         w.interface.writeAll(response) catch return;
         w.interface.flush() catch return;
     }
@@ -534,10 +537,7 @@ fn stallServe(io: Io, server: *net.Server) void {
     defer stream.close(io);
     var rbuf: [4096]u8 = undefined;
     var r = stream.reader(io, &rbuf);
-    while (true) {
-        const line = r.interface.takeDelimiterInclusive('\n') catch return;
-        if (line.len <= 2) break;
-    }
+    discardRequestHead(&r.interface) catch return;
     io.sleep(Io.Duration.fromSeconds(30), .awake) catch {};
 }
 
