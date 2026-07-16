@@ -211,7 +211,6 @@ test "run's elapsed time tracks the duration, not the interval grid" {
 
     var cfg: cli.Config = .{
         .connections = 1,
-        .threads = 1,
         .rate = 200,
         // 300ms run with a 1s snapshot interval: the old loop always slept a
         // full interval before checking `end`, reporting ~1s elapsed for a

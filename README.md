@@ -34,7 +34,6 @@ zig build test            # run the unit + integration tests
 ```
 zrk [options] <url>
 
-  -t, --threads     <N>     Number of worker threads       (default 2)
   -c, --connections <N>     Total connections to keep open (default 10)
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
@@ -70,13 +69,16 @@ zrk [options] <url>
 ```
 
 Durations accept `us`, `ms`, `s`, `m`, `h` (a bare number is seconds).
-Short options may be attached (`-t4`, `-c100`) or separated (`-t 4`).
+Short options may be attached (`-c100`) or separated (`-c 100`).
+
+Unlike wrk2 there is no `-t/--threads`: each connection runs on its own
+worker, so `-c` alone controls concurrency.
 
 ### Examples
 
 ```sh
 # 2000 req/s for 30s over 100 connections
-zrk -t2 -c100 -d30s -R2000 http://127.0.0.1:8080/
+zrk -c100 -d30s -R2000 http://127.0.0.1:8080/
 
 # Ramp linearly from 100 to 5000 req/s over 60s, capturing the latency-vs-load
 # curve as a per-interval NDJSON time series (find the knee where latency breaks)
@@ -117,7 +119,7 @@ summary object (the live dashboard is suppressed) to stdout or `--output <file>`
 {
   "zrk_version": "0.1.0",
   "target": { "url": "http://127.0.0.1:8080/", "method": "GET" },
-  "config": { "connections": 50, "threads": 2, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "record_timeouts": true },
+  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "record_timeouts": true },
   "duration_s": 20.002,
   "requests": 19998,
   "bytes": 1239876,

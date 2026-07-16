@@ -236,7 +236,6 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.InvalidHeader => "zrk: invalid header (expected 'Name: Value')\n\n",
         error.InvalidFormat => "zrk: invalid --format (expected 'text' or 'json')\n\n",
         error.ZeroConnections => "zrk: connections (-c) must be greater than 0\n\n",
-        error.ZeroThreads => "zrk: threads (-t) must be greater than 0\n\n",
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
