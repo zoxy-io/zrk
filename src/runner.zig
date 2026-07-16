@@ -75,7 +75,7 @@ pub fn run(
         .address = address,
         .host = cfg.url.host,
         .request = request,
-        .is_head = std.ascii.eqlIgnoreCase(cfg.method, "HEAD"),
+        .method = .of(cfg.method),
         .is_tls = cfg.url.isTls(),
         .insecure = cfg.insecure,
         .schedule = schedule,

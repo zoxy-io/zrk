@@ -86,8 +86,9 @@ pub const Params = struct {
     address: net.IpAddress,
     host: []const u8,
     request: []const u8,
-    /// True when the request method is HEAD, whose responses have no body.
-    is_head: bool = false,
+    /// Framing classification of the request method (HEAD responses have no
+    /// body); see `http.RequestMethod`.
+    method: httpmod.RequestMethod = .other,
     is_tls: bool,
     insecure: bool,
     /// Send schedule for THIS connection (constant spacing or a linear ramp).
@@ -317,7 +318,7 @@ fn performWork(p: *Params, app_reader: *Io.Reader, app_writer: *Io.Writer) WorkR
     // For TLS the app writer only encrypts into the socket writer's buffer; the
     // underlying stream writer must be flushed to actually send the ciphertext.
     if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch return .write_failed;
-    const resp = httpmod.parseResponse(app_reader, p.is_head) catch return .read_failed;
+    const resp = httpmod.parseResponse(app_reader, p.method) catch return .read_failed;
     return .{ .ok = resp };
 }
 
@@ -505,7 +506,7 @@ test "run keeps HEAD responses framed despite Content-Length" {
         .address = server_addr,
         .host = "127.0.0.1",
         .request = "HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        .is_head = true,
+        .method = .head,
         .is_tls = false,
         .insecure = false,
         .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
