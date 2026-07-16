@@ -371,16 +371,23 @@ fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
     maybePublish(p, done.nanoseconds);
 }
 
-/// Publish a snapshot of this connection's live state for the dashboard, but at
-/// most once per publish interval so the hot path stays essentially lock-free.
+/// Publish this connection's live state for the dashboard. Counters are
+/// refreshed on EVERY call: they are a few words copied under this
+/// connection's own mutex (contended only by the ~once-a-second snapshot
+/// reader), and batching them to the publish interval quantized the fleet's
+/// per-window request deltas to whole per-connection batches — the reader saw
+/// counts advance in conns-sized steps, a staircase in the throughput
+/// timeseries. The histogram copy — the expensive part — still happens at
+/// most once per publish interval.
 fn maybePublish(p: *Params, now_ns: i128) void {
     const pub_ptr = p.publish orelse return;
-    if (now_ns < pub_ptr.next_ns) return;
     pub_ptr.mutex.lockUncancelable(p.io);
     defer pub_ptr.mutex.unlock(p.io);
-    p.histogram.copyInto(pub_ptr.hist);
     pub_ptr.counters = p.counters.*;
-    pub_ptr.next_ns = now_ns + @as(i128, @intCast(pub_ptr.interval_ns));
+    if (now_ns >= pub_ptr.next_ns) {
+        p.histogram.copyInto(pub_ptr.hist);
+        pub_ptr.next_ns = now_ns + @as(i128, @intCast(pub_ptr.interval_ns));
+    }
 }
 
 fn connect(io: Io, address: net.IpAddress) !net.Stream {
