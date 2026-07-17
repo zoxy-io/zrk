@@ -20,7 +20,7 @@ jobs:
     name: build binaries & publish release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Zig cross-compiles every target from this one Linux runner, using the
       # exact Zig 0.16 the flake pins.
@@ -72,7 +72,7 @@ jobs:
           ls -la dist
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: dist/*

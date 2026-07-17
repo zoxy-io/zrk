@@ -19,7 +19,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Use the same Zig 0.16 the flake pins, so CI matches local dev exactly.
       - uses: cachix/install-nix-action@v30
