@@ -18,7 +18,6 @@ const connection = @import("connection.zig");
 const stats = @import("stats.zig");
 
 const spark = [_][]const u8{ "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
-const eighths = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
 const history_len = 60;
 
 /// SGR fragments interpolated into every panel print. The disabled value is
@@ -159,11 +158,10 @@ pub const Dashboard = struct {
             self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, p99);
         } else {
             try w.print("[{d:6.1}s] {d:8.0} req/s {f}/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
-                elapsed_s,             rate,
-                Bytes.of(bps),
-                Dur.of(snap.hist.valueAtPercentile(50)), Dur.of(p99),
-                Dur.of(snap.hist.valueAtPercentile(99.9)), Dur.of(snap.hist.max()),
-                snap.counters.socketErrors() + snap.counters.status_errors,
+                elapsed_s,               rate,
+                Bytes.of(bps),           Dur.of(snap.hist.valueAtPercentile(50)),
+                Dur.of(p99),             Dur.of(snap.hist.valueAtPercentile(99.9)),
+                Dur.of(snap.hist.max()), snap.counters.socketErrors() + snap.counters.status_errors,
             });
         }
         try self.fw.interface.flush();
@@ -307,16 +305,16 @@ pub const Dashboard = struct {
         for (segs, 0..) |s, i| {
             if (i > 0) try w.writeAll("   ");
             try w.print("{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
-                k.dim,  s.label, k.reset,
-                s.color, s.text, k.reset,
-                k.dim,  s.suffix, k.reset,
+                k.dim,   s.label,  k.reset,
+                s.color, s.text,   k.reset,
+                k.dim,   s.suffix, k.reset,
             });
         }
         try w.writeAll("\n");
     }
 
-    /// `p99      8.91ms  ████████▍·····` — flush left, value right-aligned,
-    /// bar on a log scale between lo..hi, eighth-block precision, dim dots
+    /// `p99      8.91ms  ━━━━━━━━╾·····` — flush left, value right-aligned,
+    /// bar on a log scale between lo..hi, half-cell precision, dim dots
     /// for the rest.
     fn barLine(self: *Dashboard, w: *Io.Writer, label: []const u8, micros: u64, lo: f64, hi: f64, bar_w: usize, alarm: bool) !void {
         const k = self.colors;
@@ -331,18 +329,18 @@ pub const Dashboard = struct {
             @min(@log(v / lo) / @log(hi / lo), 1.0)
         else
             0;
-        const cells8: usize = @intFromFloat(@round(frac * @as(f64, @floatFromInt(bar_w)) * 8));
-        const whole = cells8 / 8;
-        const part = cells8 % 8;
+        const cells2: usize = @intFromFloat(@round(frac * @as(f64, @floatFromInt(bar_w)) * 2));
+        const whole = cells2 / 2;
+        const half = cells2 % 2 == 1;
 
         try w.writeAll(if (alarm) k.red else k.amber);
         var i: usize = 0;
-        while (i < whole) : (i += 1) try w.writeAll("█");
-        if (part > 0) try w.writeAll(eighths[part]);
+        while (i < whole) : (i += 1) try w.writeAll("━");
+        if (half) try w.writeAll("╾");
         try w.writeAll(k.reset);
 
         try w.writeAll(k.dim);
-        var rest = bar_w - whole - @intFromBool(part > 0);
+        var rest = bar_w - whole - @intFromBool(half);
         while (rest > 0) : (rest -= 1) try w.writeAll("·");
         try w.print("{s}\n", .{k.reset});
     }
