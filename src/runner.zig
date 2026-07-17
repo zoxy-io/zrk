@@ -69,7 +69,14 @@ pub fn run(
     }
     const ca_ptr: ?*tlsmod.CaStore = if (ca_store) |*c| c else null;
 
-    var fleet = try stats.Fleet.init(arena, cfg.connections, cfg.interval_ns, cfg.url.isTls());
+    // Publish the (expensive) live-histogram copy as often as the fastest
+    // consumer wakes: the dashboard's `--refresh` when a live TUI is attached,
+    // else the `--interval` stats window. This is what lets the latency bars
+    // step with each redraw instead of only once per stats window — the panel
+    // repaints every frame but the numbers behind it are only as fresh as the
+    // last publish.
+    const publish_ns = if (frame_interval_ns > 0) @min(frame_interval_ns, cfg.interval_ns) else cfg.interval_ns;
+    var fleet = try stats.Fleet.init(arena, cfg.connections, publish_ns, cfg.url.isTls());
     defer fleet.deinit();
 
     var stop = std.atomic.Value(bool).init(false);

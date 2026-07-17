@@ -67,7 +67,9 @@ pub const Counters = struct {
 /// A double-buffer for exposing a connection's live latency/counters to the
 /// dashboard thread without racing the hot path. The connection thread copies
 /// its live state here at most once per publish interval, under `mutex`; the
-/// dashboard reads it under the same lock. Cheap because it happens ~once/sec.
+/// dashboard reads it under the same lock. The publish interval follows the
+/// fastest consumer — the dashboard's `--refresh` when a live TUI is attached,
+/// else the `--interval` stats window.
 pub const Publish = struct {
     mutex: Io.Mutex = .init,
     /// Snapshot histogram (must share the live histogram's layout).
