@@ -302,10 +302,17 @@ pub const Dashboard = struct {
 
         try w.writeAll("\n");
         lines += 1;
-        try w.print("{s}p99{s} {s}", .{ k.dim, k.reset, k.amber_hi });
-        try self.drawSparkline(w, self.term_cols -| 16);
+        // p99-over-time trend: the sparkline starts right after the `p99 ` label
+        // (4 columns) and runs to the bars' right edge (`stat_col + bar_w`), so
+        // it ends where the spectrum above ends; the current-p99 readout then
+        // follows just past it. The width is capped so a wide readout can't push
+        // the line off the terminal edge (which would wrap and desync the
+        // repaint line count).
         var pbuf: [16]u8 = undefined;
         const pval = std.fmt.bufPrint(&pbuf, "{f}", .{Dur.of(p99)}) catch "?";
+        const spark_w = @min(stat_col + bar_w - 4, self.term_cols -| (pval.len + 5));
+        try w.print("{s}p99{s} {s}", .{ k.dim, k.reset, k.amber_hi });
+        try self.drawSparkline(w, spark_w);
         try w.print("{s} {s}{s}{s}\n", .{ k.reset, k.dim, pval, k.reset });
         lines += 1;
 
