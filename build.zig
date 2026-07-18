@@ -46,6 +46,23 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // `zig build bench`: the histogram publish/aggregate microbenchmark.
+    // Always ReleaseFast so the numbers mean something.
+    const bench_exe = b.addExecutable(.{
+        .name = "zrk-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zrk", .module = mod },
+            },
+        }),
+    });
+    const bench_step = b.step("bench", "Run the histogram publish/aggregate benchmark");
+    const run_bench = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&run_bench.step);
+
     // `zig build test`: a test binary per module (a test executable covers
     // exactly one module, hence two of them).
     const mod_tests = b.addTest(.{

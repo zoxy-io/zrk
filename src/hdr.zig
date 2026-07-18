@@ -224,21 +224,49 @@ pub const Histogram = struct {
 
     // --- merging / snapshotting ---------------------------------------------
 
+    /// Inclusive counts-index span covering every nonzero bucket, or null when
+    /// empty. Counts indices increase monotonically with value, so every value
+    /// ever recorded — and thus every nonzero bucket — lies within
+    /// [index(min_value), index(max_value)]. Lets `add`/`copyInto` touch only
+    /// the occupied region instead of the whole (mostly-zero) array, which for
+    /// a clustered latency distribution is a fraction of `counts_len`.
+    const IndexSpan = struct { lo: u32, hi: u32 };
+    fn touchedSpan(self: *const Histogram) ?IndexSpan {
+        if (self.total_count == 0) return null;
+        return .{ .lo = self.countsIndexFor(self.min_value), .hi = self.countsIndexFor(self.max_value) };
+    }
+
     /// Add every count from `other` into `self`. Both histograms must have been
-    /// created with identical parameters (same counts layout).
+    /// created with identical parameters (same counts layout). Only `other`'s
+    /// occupied span is walked — adding its zero region is a no-op, so this is
+    /// exact regardless of `self`'s contents.
     pub fn add(self: *Histogram, other: *const Histogram) void {
         assert(self.counts_len == other.counts_len);
-        for (self.counts, other.counts) |*dst, src| dst.* += src;
+        const s = other.touchedSpan() orelse return;
+        for (self.counts[s.lo .. s.hi + 1], other.counts[s.lo .. s.hi + 1]) |*dst, src| dst.* += src;
         self.total_count += other.total_count;
         if (other.min_value < self.min_value) self.min_value = other.min_value;
         if (other.max_value > self.max_value) self.max_value = other.max_value;
     }
 
     /// Copy this histogram's contents into `dst` (which must share the layout).
-    /// Used to publish a snapshot without allocating.
+    /// Used to publish a snapshot without allocating. Copies only the occupied
+    /// span; any region `dst` still holds outside it is zeroed first, so the
+    /// result equals `self` even when `dst` was previously wider. (For the
+    /// monotonic cumulative snapshots this serves, the range only grows and the
+    /// zeroing is a no-op.)
     pub fn copyInto(self: *const Histogram, dst: *Histogram) void {
         assert(self.counts_len == dst.counts_len);
-        @memcpy(dst.counts, self.counts);
+        const src = self.touchedSpan();
+        if (dst.touchedSpan()) |d| {
+            if (src) |s| {
+                if (d.lo < s.lo) @memset(dst.counts[d.lo..s.lo], 0);
+                if (d.hi > s.hi) @memset(dst.counts[s.hi + 1 .. d.hi + 1], 0);
+            } else {
+                @memset(dst.counts[d.lo .. d.hi + 1], 0);
+            }
+        }
+        if (src) |s| @memcpy(dst.counts[s.lo .. s.hi + 1], self.counts[s.lo .. s.hi + 1]);
         dst.total_count = self.total_count;
         dst.min_value = self.min_value;
         dst.max_value = self.max_value;
@@ -699,6 +727,42 @@ test "setToDifference yields the interval between two cumulative snapshots" {
     // The interval contains only the new (9ms) samples.
     try testing.expect(delta.valuesAreEquivalent(delta.valueAtPercentile(50), 9000));
     try testing.expect(delta.valuesAreEquivalent(delta.min(), 9000));
+}
+
+test "copyInto onto a previously-wider dst drops the stale tail" {
+    // Guards the range-limited copyInto: when dst already holds a wider
+    // distribution than the source, the region the source doesn't cover must
+    // be zeroed, or a stale tail would survive and corrupt percentiles.
+    var wide = try newDefault();
+    defer wide.deinit();
+    var narrow = try newDefault();
+    defer narrow.deinit();
+    var dst = try newDefault();
+    defer dst.deinit();
+
+    wide.record(1000);
+    wide.record(500_000); // far tail → high counts index
+    wide.copyInto(&dst);
+    try testing.expectEqual(@as(u64, 2), dst.count());
+
+    narrow.record(1000); // narrower: never reaches the old tail
+    narrow.copyInto(&dst);
+
+    try testing.expectEqual(@as(u64, 1), dst.count());
+    try testing.expect(dst.valuesAreEquivalent(dst.max(), 1000));
+    try testing.expect(dst.valueAtPercentile(100) < 2000); // old 500ms tail is gone
+}
+
+test "copyInto from an empty source clears dst" {
+    var empty = try newDefault();
+    defer empty.deinit();
+    var dst = try newDefault();
+    defer dst.deinit();
+
+    dst.record(1234);
+    empty.copyInto(&dst);
+    try testing.expectEqual(@as(u64, 0), dst.count());
+    try testing.expectEqual(@as(u64, 0), dst.max());
 }
 
 test "zigzag varint: explicit encodings and round-trip" {
