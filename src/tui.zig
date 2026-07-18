@@ -20,6 +20,12 @@ const stats = @import("stats.zig");
 const spark = [_][]const u8{ "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 const history_len = 60;
 
+/// Column at which the latency bars begin — a 6-wide label, a 9-wide right-
+/// aligned value, and a 2-space gap (see `barLine`). The live stats block is
+/// indented to this same column so the elapsed timer, which sits in the left
+/// gutter and widens as it counts up, never shifts the stats to the right.
+const stat_col: usize = 6 + 9 + 2;
+
 /// SGR fragments interpolated into every panel print. The disabled value is
 /// all empty strings, so color never costs a branch at the call sites — and
 /// never reaches a pipe, a --plain run, or the final report.
@@ -167,13 +173,11 @@ pub const Dashboard = struct {
         try self.fw.interface.flush();
     }
 
-    /// One status segment: a dim label, a (possibly colored) value, and an
-    /// optional dim suffix (`12s` + ` / 60s`).
+    /// One status segment: a dim label and a (possibly colored) value.
     const Seg = struct {
         label: []const u8,
         text: []const u8,
         color: []const u8 = "",
-        suffix: []const u8 = "",
     };
 
     /// Draw one live frame; returns the number of terminal lines written so
@@ -191,8 +195,8 @@ pub const Dashboard = struct {
 
         // --- status segments -------------------------------------------------
         var vbuf: [10][48]u8 = undefined;
-        const v_time = std.fmt.bufPrint(&vbuf[0], "{d:.0}s", .{elapsed_s}) catch "?";
-        const v_total = std.fmt.bufPrint(&vbuf[1], " / {d:.0}s", .{total_s}) catch "?";
+        const v_time = clock(&vbuf[0], elapsed_s);
+        const v_total = clock(&vbuf[1], total_s);
 
         // Offered load right now — for a ramp, the interpolated schedule.
         const r0: f64 = @floatFromInt(self.cfg.rate);
@@ -212,18 +216,26 @@ pub const Dashboard = struct {
         // first seconds while the fleet is still connecting.
         const behind = elapsed_s >= 2 and rate < 0.95 * offered_now;
 
-        // A fixed three-line status — no width-dependent wrapping. Rates on
-        // the first line; transfer alone on the second (its width wiggles as
-        // units climb); status-class counters on the third. Lines two and
-        // three indent to sit under "offered".
-        const indent = v_time.len + v_total.len + 3;
-
+        // A fixed three-line status, all indented to `stat_col`: the clock
+        // lives alone in the left gutter (above the pXX labels) so its widening
+        // never shifts the stats. Rates on the first line; transfer alone on
+        // the second (its width wiggles as units climb); status-class counters
+        // on the third.
+        //
+        // A blinking red "recording" dot leads the clock. It toggles on a ~1s
+        // wall-clock phase (rather than the SGR blink attribute, which most
+        // terminals ignore); the cell stays one column wide — a space while
+        // dark — so the clock never jitters.
+        const blink_on = (@as(u64, @intFromFloat(@max(elapsed_s, 0) * 2)) & 1) == 0;
+        if (blink_on) try w.print("{s}●{s} ", .{ k.red, k.reset }) else try w.writeAll("  ");
+        try w.print("{s}{s} / {s}{s}", .{ v_time, k.dim, v_total, k.reset });
+        const timer_w = 2 + v_time.len + 3 + v_total.len; // "● " + clock + " / "
+        try padTo(w, @max(stat_col -| timer_w, 1));
         try self.segLine(w, &.{
-            .{ .label = "", .text = v_time, .suffix = v_total },
             .{ .label = "offered ", .text = v_offered },
             .{ .label = "achieved ", .text = v_achieved, .color = if (behind) k.red else "" },
         });
-        try padTo(w, indent);
+        try padTo(w, stat_col);
         try self.segLine(w, &.{.{ .label = "transfer ", .text = v_transfer }});
         lines += 2;
 
@@ -251,7 +263,7 @@ pub const Dashboard = struct {
             };
             ncls += 1;
         }
-        try padTo(w, indent);
+        try padTo(w, stat_col);
         try self.segLine(w, cls_buf[0..ncls]);
         lines += 1;
 
@@ -304,10 +316,9 @@ pub const Dashboard = struct {
         const k = self.colors;
         for (segs, 0..) |s, i| {
             if (i > 0) try w.writeAll("   ");
-            try w.print("{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
-                k.dim,   s.label,  k.reset,
-                s.color, s.text,   k.reset,
-                k.dim,   s.suffix, k.reset,
+            try w.print("{s}{s}{s}{s}{s}{s}", .{
+                k.dim,   s.label, k.reset,
+                s.color, s.text,  k.reset,
             });
         }
         try w.writeAll("\n");
@@ -320,6 +331,8 @@ pub const Dashboard = struct {
         const k = self.colors;
         var dbuf: [16]u8 = undefined;
         const val = std.fmt.bufPrint(&dbuf, "{f}", .{Dur.of(micros)}) catch "?";
+        // label(6) + value(9) + gap(2) — their sum is `stat_col`, which the
+        // live stats block indents to so it aligns with where the bars begin.
         try w.print("{s}{s:<6}{s}{s}{s:>9}{s}  ", .{
             k.dim, label, k.reset, if (alarm) k.red else "", val, k.reset,
         });
@@ -461,6 +474,13 @@ pub const Dashboard = struct {
 fn padTo(w: *Io.Writer, n: usize) !void {
     var i: usize = 0;
     while (i < n) : (i += 1) try w.writeAll(" ");
+}
+
+/// Format a duration in seconds as `M:SS` — minutes uncapped, seconds
+/// zero-padded (e.g. 75s → "1:15", 3600s → "60:00").
+fn clock(buf: []u8, secs: f64) []const u8 {
+    const total: u64 = @intFromFloat(@max(secs, 0));
+    return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ total / 60, total % 60 }) catch "?";
 }
 
 /// Terminal column count for the panel layout; 80 when it can't be queried.
