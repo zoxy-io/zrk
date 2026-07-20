@@ -77,3 +77,47 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: dist/*
           generate_release_notes: true
+
+      - name: Update homebrew-tap formula
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+
+          sha_aarch64_macos=$(grep "zrk-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_macos=$(grep  "zrk-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_aarch64_linux=$(grep "zrk-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_linux=$(grep  "zrk-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
+
+          eval "$(ssh-agent -s)"
+          echo "$DEPLOY_KEY" | ssh-add -
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          git clone git@github.com:zoxy-io/homebrew-tap.git homebrew-tap
+          cd homebrew-tap
+
+          ruby_file="Formula/zrk.rb"
+          old_version=$(grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' "$ruby_file" | head -1)
+
+          sed -i "s|zrk-$old_version-aarch64-macos|zrk-$version-aarch64-macos|g" "$ruby_file"
+          sed -i "s|zrk-$old_version-x86_64-macos|zrk-$version-x86_64-macos|g"   "$ruby_file"
+          sed -i "s|zrk-$old_version-aarch64-linux|zrk-$version-aarch64-linux|g" "$ruby_file"
+          sed -i "s|zrk-$old_version-x86_64-linux|zrk-$version-x86_64-linux|g"   "$ruby_file"
+
+          # Replace sha256 values in order: aarch64-macos, x86_64-macos, aarch64-linux, x86_64-linux
+          python3 - "$ruby_file" "$sha_aarch64_macos" "$sha_x86_64_macos" "$sha_aarch64_linux" "$sha_x86_64_linux" <<'EOF'
+          import sys, re
+          path, *shas = sys.argv[1:]
+          text = open(path).read()
+          it = iter(shas)
+          result = re.sub(r'sha256 "[0-9a-f]+"', lambda m: f'sha256 "{next(it)}"', text)
+          open(path, 'w').write(result)
+          EOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add "$ruby_file"
+          git commit -m "zrk: update to v$version"
+          git push
