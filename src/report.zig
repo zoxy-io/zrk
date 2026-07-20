@@ -82,7 +82,7 @@ pub fn writeJson(
 
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
         .{
             cfg.connections,
             launched,
@@ -90,6 +90,7 @@ pub fn writeJson(
             cfg.rate,
             cfg.timeout_ns / std.time.ns_per_ms,
             cfg.deadline_ns / std.time.ns_per_ms,
+            cfg.deadline_abort,
             cfg.record_timeouts,
         },
     );
@@ -310,6 +311,7 @@ test "writeJson emits parseable, well-formed summary" {
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_us\"") != null);
     // Deadline mode surfaces in config, the errors object, and the backlog gauge.
     try testing.expect(std.mem.indexOf(u8, out, "\"deadline_ms\": 250") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"deadline_abort\": false") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"deadline\": 7") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"max_schedule_lag_us\": 12") != null);
     // The embedded HdrHistogram blob is present and decodes back to 100 samples.

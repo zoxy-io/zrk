@@ -103,6 +103,7 @@ pub fn run(
         .schedule = schedule,
         .timeout_ns = cfg.timeout_ns,
         .deadline_ns = cfg.deadline_ns,
+        .deadline_abort = cfg.deadline_abort,
         .record_timeouts = cfg.record_timeouts,
         .end = end,
         .stop = &stop,

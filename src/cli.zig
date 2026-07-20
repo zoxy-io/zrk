@@ -51,8 +51,14 @@ pub const Config = struct {
     /// Coordinated-omission deadline (0 = off): a request whose CO-corrected
     /// latency (measured from its *scheduled* send time) would exceed this is
     /// failed as a `deadline` error rather than recorded, bounding the latency
-    /// tail and surfacing sustained overload through the error path.
+    /// tail and surfacing sustained overload through the error path. Enforced by
+    /// shedding before sending; in-flight requests are aborted only under
+    /// `deadline_abort`.
     deadline_ns: u64 = 0,
+    /// Opt in to also aborting an in-flight request once `scheduled + deadline`
+    /// passes (`--deadline-abort`). This resets the connection on every miss, so
+    /// it churns under saturation; off by default (shed-before-send suffices).
+    deadline_abort: bool = false,
     /// Stats window: per-connection publish period, `--timeseries` row cadence,
     /// and the line rate of `--plain` output.
     interval_ns: u64 = 1 * std.time.ns_per_s,
@@ -143,8 +149,12 @@ pub const usage =
     \\      --timeout     <T>     Wire timeout per attempt, from the actual
     \\                            send (default 2s); does not bound CO latency
     \\      --deadline    <T>     Max coordinated-omission latency, from the
-    \\                            scheduled send: a request past T is failed as
-    \\                            a `deadline` error, not recorded (0 = off)
+    \\                            scheduled send: a too-stale request is shed
+    \\                            (failed as a `deadline` error, not sent or
+    \\                            recorded) before sending (0 = off)
+    \\      --deadline-abort      Also abort in-flight requests past the
+    \\                            deadline. Resets the connection per miss and
+    \\                            churns under saturation; off by default
     \\      --interval    <T>     Stats window: --timeseries rows and --plain
     \\                            lines                          (default 1s)
     \\      --refresh     <T>     Live dashboard redraw rate     (default 80ms)
@@ -243,6 +253,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.timeout_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--deadline")) {
             cfg.deadline_ns = try parseDuration(try nextValue(tokens, &i));
+        } else if (eq(arg, "--deadline-abort")) {
+            cfg.deadline_abort = true;
         } else if (eq(arg, "--interval")) {
             cfg.interval_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--refresh")) {
@@ -481,6 +493,10 @@ test "deadline flag parses; defaults off" {
     try testing.expectEqual(@as(u64, 0), default.deadline_ns);
     const cfg = (try parse(a, &[_][]const u8{ "--deadline", "250ms", "http://x/" })).config;
     try testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), cfg.deadline_ns);
+    // In-flight abort is opt-in and off unless the flag is present.
+    try testing.expect(!cfg.deadline_abort);
+    const aborting = (try parse(a, &[_][]const u8{ "--deadline", "250ms", "--deadline-abort", "http://x/" })).config;
+    try testing.expect(aborting.deadline_abort);
 }
 
 test "refresh flag parses and zero is rejected" {

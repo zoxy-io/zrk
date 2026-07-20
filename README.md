@@ -47,8 +47,12 @@ zrk [options] <url>
       --timeout     <T>     Wire timeout per attempt, from the actual
                             send (default 2s); does not bound CO latency
       --deadline    <T>     Max coordinated-omission latency, from the
-                            scheduled send: a request past T is failed as
-                            a `deadline` error, not recorded (0 = off)
+                            scheduled send: a too-stale request is shed
+                            (failed as a `deadline` error, not sent or
+                            recorded) before sending (0 = off)
+      --deadline-abort      Also abort in-flight requests past the deadline.
+                            Resets the connection per miss and churns under
+                            saturation; off by default
       --interval    <T>     Stats window: --timeseries rows and --plain
                             lines                          (default 1s)
       --refresh     <T>     Live dashboard redraw rate     (default 80ms)
@@ -128,7 +132,7 @@ summary object (the live dashboard is suppressed) to stdout or `--output <file>`
 {
   "zrk_version": "0.1.0",
   "target": { "url": "http://127.0.0.1:8080/", "method": "GET" },
-  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "deadline_ms": 0, "record_timeouts": true },
+  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
   "duration_s": 20.002,
   "requests": 19998,
   "bytes": 1239876,
@@ -201,20 +205,31 @@ difference only shows up under overload:
   latency (measured from the request's **scheduled** time) balloons into the
   tens of seconds. A tight `--timeout 1s` will happily sit next to a 30 s `p50`.
 - **`--deadline`** is what actually bounds that tail. It is measured from each
-  request's **scheduled** send time and bounds `done − scheduled`. A request
-  whose CO latency would exceed the deadline is **failed as a `deadline`
-  error** rather than recorded — shed before it is even sent if it is already
-  too stale, or shut down in flight at `scheduled + deadline`. This is the
-  usual benchmark intent ("past X ms it's a failed request, per our SLA").
+  request's **scheduled** send time and targets `done − scheduled`. It is
+  enforced by **shedding before sending**: a request already staler than the
+  deadline is **failed as a `deadline` error** without ever touching the wire,
+  which drains the backlog and keeps the client probing near-live latency. This
+  is the usual benchmark intent ("past X ms it's a failed request, per our SLA").
 
 With `--deadline` set, the latency histogram becomes the distribution of
-requests **served within the deadline** (so its tail is bounded by the
-deadline), and sustained overload shows up as a rising `deadline` error count
-instead of an unbounded latency tail. That makes both CI gates meaningful at
-once under overload: `--slo-p99` stays a p99 of *met* latency, while
-`--max-error-rate` catches the deadline-miss rate. Deadline misses are **never**
-recorded into the histogram (unlike wire timeouts), so `--no-record-timeouts`
-does not affect them.
+requests that were **sent within the deadline** of their schedule, and sustained
+overload shows up as a rising `deadline` error count instead of an unbounded
+latency tail. That makes both CI gates meaningful at once under overload:
+`--slo-p99` stays a p99 of *met* latency, while `--max-error-rate` catches the
+deadline-miss rate. Deadline misses are **never** recorded into the histogram
+(unlike wire timeouts), so `--no-record-timeouts` does not affect them.
+
+Shedding bounds the send time, not the completion, so a request that *is* sent
+still runs to completion on the wire: its recorded CO latency is bounded by
+**deadline + wire time** (and wire time by `--timeout`), not by the deadline
+exactly. zrk deliberately does **not** cut an in-flight request off by default,
+because on HTTP/1.1 keep-alive that means resetting the connection — and under
+saturation, where most in-flight requests exceed the deadline, resetting every
+one storms the target with reconnects and can balloon its memory (an OOM risk
+for the system under test). `--deadline-abort` opts into that in-flight cut-off
+(recorded latency then capped at the deadline exactly), at the cost of a
+connection reset per miss; use it only against a target you know tolerates the
+churn.
 
 `max_schedule_lag_us` (JSON) / "Peak schedule lag" (text report) is the backlog
 gauge: the peak `now − scheduled` the fleet ever reached. It is populated even
