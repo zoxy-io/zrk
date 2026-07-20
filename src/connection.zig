@@ -125,12 +125,20 @@ pub const Params = struct {
     /// `deadline_ns` for that.
     timeout_ns: u64,
     /// Coordinated-omission deadline, measured from each request's *scheduled*
-    /// send time (0 = none). Bounds `done − scheduled`: a request whose CO
-    /// latency would exceed this is failed as a `deadline` error — shed before
-    /// sending if already too stale, or shut down in flight at `scheduled +
-    /// deadline` — instead of being recorded, which bounds the latency tail and
-    /// makes sustained overload surface through the error path.
+    /// send time (0 = none). A request already staler than this is shed before
+    /// sending (failed as a `deadline` error without touching the wire), which
+    /// drains the backlog and keeps the recorded tail to roughly deadline + wire
+    /// time while surfacing overload through the error path. In-flight requests
+    /// that pass this age at send time are *not* aborted unless `deadline_abort`
+    /// is set; see it for why.
     deadline_ns: u64 = 0,
+    /// Also abort a request already on the wire once `scheduled + deadline`
+    /// passes, by shutting the connection down (the only way to abandon an
+    /// in-flight HTTP/1.1 request). Off by default: under saturation this resets
+    /// a connection per miss, storming the target with reconnects and inflating
+    /// its memory — while shed-before-send already bounds the tail. Opt in only
+    /// when you need the recorded latency capped at exactly the deadline.
+    deadline_abort: bool = false,
     /// Record a coordinated-omission-corrected latency sample when a request
     /// times out on the wire, instead of dropping it (which would truncate the
     /// tail). Does not apply to `deadline` misses, which are never recorded.
@@ -208,18 +216,28 @@ pub fn run(p: *Params) void {
         // backend that per-request spawn/cancel pair costs milliseconds
         // (macOS especially), capping every connection near 500 req/s no
         // matter how fast the target answers.
+        // The CO deadline is enforced by shedding *before* sending (see the
+        // request loop); the watchdog only arms on it — killing an in-flight
+        // request, which on HTTP/1.1 keep-alive means resetting the whole
+        // connection — when `--deadline-abort` is set. Left off by default: past
+        // a saturated target's knee most in-flight requests would trip the
+        // deadline, and resetting every one storms the target with reconnects
+        // (blowing its working set) while shed-before-send already bounds the
+        // recorded tail to deadline + wire time. So the watchdog's CO bound is
+        // the deadline only under `--deadline-abort`, else disabled (0).
+        const wd_deadline_ns: u64 = if (p.deadline_abort) p.deadline_ns else 0;
         var watchdog: Watchdog = .{
             .io = io,
             .stream = &stream,
             .timeout_ns = p.timeout_ns,
-            .deadline_ns = p.deadline_ns,
-            // Idle tick cadence: the tighter of the two bounds, so an
+            .deadline_ns = wd_deadline_ns,
+            // Idle tick cadence: the tighter of the two active bounds, so an
             // armed request is caught at most ~1.5x that bound late.
-            .tick_ns = tighter(p.timeout_ns, p.deadline_ns),
+            .tick_ns = tighter(p.timeout_ns, wd_deadline_ns),
         };
         var watchdog_group: Io.Group = .init;
         var watchdog_active = false;
-        if (p.timeout_ns != 0 or p.deadline_ns != 0) {
+        if (p.timeout_ns != 0 or wd_deadline_ns != 0) {
             if (watchdog_group.concurrent(io, Watchdog.watch, .{&watchdog})) |_| {
                 watchdog_active = true;
             } else |_| {
@@ -679,6 +697,25 @@ fn stallServe(io: Io, server: *net.Server) void {
     io.sleep(Io.Duration.fromSeconds(30), .awake) catch {};
 }
 
+/// Accepts one keep-alive connection and answers every request with a fixed 200,
+/// but only after a fixed per-response delay — a server slower than the client's
+/// deadline, used to prove the default deadline lets slow requests finish on the
+/// reused connection instead of resetting it.
+fn delayServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    while (true) {
+        discardRequestHead(&r.interface) catch return;
+        io.sleep(Io.Duration.fromMilliseconds(60), .awake) catch return;
+        w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") catch return;
+        w.interface.flush() catch return;
+    }
+}
+
 test "run reports timeouts against a non-responsive server" {
     var threaded = Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -828,7 +865,7 @@ test "run with record_timeouts disabled drops timed-out samples" {
     try testing.expectEqual(@as(u64, 0), histogram.count());
 }
 
-test "deadline mode fails stale requests without recording them" {
+test "deadline-abort fails stale in-flight requests without recording them" {
     var threaded = Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -857,10 +894,13 @@ test "deadline mode fails stale requests without recording them" {
         .is_tls = false,
         .insecure = false,
         .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } }, // ~500 req/s
-        // No wire timeout: the deadline alone must catch the stall in flight,
-        // shutting each blocked request down at `scheduled + deadline`.
+        // No wire timeout: with --deadline-abort the deadline alone must catch
+        // the stall in flight, shutting each blocked request down at
+        // `scheduled + deadline`. (Without abort a stalled read is not
+        // interrupted at all — that is the separate wire timeout's job.)
         .timeout_ns = 0,
         .deadline_ns = 50 * std.time.ns_per_ms,
+        .deadline_abort = true,
         .end = end,
         .stop = &stop,
         .histogram = &histogram,
@@ -883,6 +923,72 @@ test "deadline mode fails stale requests without recording them" {
     // the backlog gauge registers substantial lag (equilibrium sits near the
     // 50ms deadline; assert well above jitter).
     try testing.expect(counters.max_behind_ns > 20 * std.time.ns_per_ms);
+}
+
+test "default deadline sheds but never resets the connection in flight" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    // A single keep-alive connection served by a server that takes 60ms per
+    // response — far longer than the 20ms deadline. With the in-flight abort
+    // OFF (the default), those slow responses must still *complete* on the same
+    // reused connection, never being killed mid-flight.
+    var group: Io.Group = .init;
+    group.async(io, delayServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(400));
+    const deadline_ns = 20 * std.time.ns_per_ms;
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        // Offer far faster than the server can serve so the backlog outruns the
+        // deadline and the shed path engages.
+        .schedule = .{ .constant = .{ .interval_ns = 1 * std.time.ns_per_ms } }, // ~1000 req/s
+        // No wire timeout and no abort: nothing may interrupt an in-flight
+        // request, so a reset could only come from the deadline — and must not.
+        .timeout_ns = 0,
+        .deadline_ns = deadline_ns,
+        .deadline_abort = false,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    stop.store(true, .monotonic);
+    group.cancel(io);
+    server.deinit(io);
+
+    // Slow requests complete instead of being aborted, so the connection is
+    // reused (the server accepts exactly one) — no read errors, no reconnect
+    // storm — while the backlog is still drained as shed `deadline` errors.
+    try testing.expect(counters.completed > 0);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    try testing.expect(counters.deadline_errors > 0);
+    try testing.expectEqual(counters.completed, histogram.count());
+    // The tradeoff the default accepts: a completed request's recorded CO
+    // latency can exceed the deadline (it is bounded by deadline + wire time,
+    // not the deadline itself), because we never cut it off.
+    try testing.expect(histogram.max() > deadline_ns / std.time.ns_per_us);
 }
 
 test "deadline mode sheds backlog under overload and bounds the recorded tail" {
