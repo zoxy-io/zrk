@@ -31,8 +31,19 @@ pub const Counters = struct {
     write_errors: u64 = 0,
     /// Failures while reading/parsing a response.
     read_errors: u64 = 0,
-    /// Requests abandoned because the response exceeded `--timeout`.
+    /// Requests abandoned because the response exceeded the wire `--timeout`.
     timeouts: u64 = 0,
+    /// Requests that missed their coordinated-omission `--deadline`: either shed
+    /// before sending (already staler than the deadline) or shut down in flight
+    /// once `scheduled + deadline` passed. Distinct from wire `timeouts`, and —
+    /// unlike a timeout — never recorded as a latency sample, so the histogram
+    /// stays the distribution of requests served *within* the deadline.
+    deadline_errors: u64 = 0,
+    /// Peak observed schedule lag (`now − scheduled`) in nanoseconds: how far
+    /// behind its intended send time this connection ever fell. A backlog gauge
+    /// — nonzero means the client could not keep up with the offered schedule
+    /// (see `--deadline`). Aggregated as a max, not a sum.
+    max_behind_ns: u64 = 0,
     /// Completed responses bucketed by status class, indexed by status/100
     /// (so [1]=1xx .. [5]=5xx; index 0 is unused). Sums to `completed`.
     status_class: [6]u64 = [_]u64{0} ** 6,
@@ -45,7 +56,14 @@ pub const Counters = struct {
         self.write_errors += other.write_errors;
         self.read_errors += other.read_errors;
         self.timeouts += other.timeouts;
+        self.deadline_errors += other.deadline_errors;
+        self.max_behind_ns = @max(self.max_behind_ns, other.max_behind_ns);
         for (&self.status_class, other.status_class) |*d, s| d.* += s;
+    }
+
+    /// Update the peak schedule-lag gauge with one send's observed lag (ns).
+    pub fn noteBehind(self: *Counters, behind_ns: u64) void {
+        if (behind_ns > self.max_behind_ns) self.max_behind_ns = behind_ns;
     }
 
     /// Record a completed response's status: bump its class bucket and, for
@@ -100,10 +118,22 @@ pub const Params = struct {
     /// sends spread uniformly instead of firing in N-connection lockstep
     /// waves (which quantize per-interval throughput to multiples of N).
     phase: f64 = 0,
-    /// Per-request response timeout (0 = no timeout).
+    /// Per-request wire timeout, measured from the actual send (0 = none).
+    /// Bounds `done − actual_send` — the attempt on the wire — so it catches a
+    /// hung socket or a dead server, but does *not* bound the coordinated-
+    /// omission latency (which also includes time spent behind schedule). See
+    /// `deadline_ns` for that.
     timeout_ns: u64,
+    /// Coordinated-omission deadline, measured from each request's *scheduled*
+    /// send time (0 = none). Bounds `done − scheduled`: a request whose CO
+    /// latency would exceed this is failed as a `deadline` error — shed before
+    /// sending if already too stale, or shut down in flight at `scheduled +
+    /// deadline` — instead of being recorded, which bounds the latency tail and
+    /// makes sustained overload surface through the error path.
+    deadline_ns: u64 = 0,
     /// Record a coordinated-omission-corrected latency sample when a request
-    /// times out, instead of dropping it (which would truncate the tail).
+    /// times out on the wire, instead of dropping it (which would truncate the
+    /// tail). Does not apply to `deadline` misses, which are never recorded.
     record_timeouts: bool = true,
     /// Monotonic timestamp at which the connection should stop sending.
     end: Io.Timestamp,
@@ -178,10 +208,18 @@ pub fn run(p: *Params) void {
         // backend that per-request spawn/cancel pair costs milliseconds
         // (macOS especially), capping every connection near 500 req/s no
         // matter how fast the target answers.
-        var watchdog: Watchdog = .{ .io = io, .stream = &stream, .timeout_ns = p.timeout_ns };
+        var watchdog: Watchdog = .{
+            .io = io,
+            .stream = &stream,
+            .timeout_ns = p.timeout_ns,
+            .deadline_ns = p.deadline_ns,
+            // Idle tick cadence: the tighter of the two bounds, so an
+            // armed request is caught at most ~1.5x that bound late.
+            .tick_ns = tighter(p.timeout_ns, p.deadline_ns),
+        };
         var watchdog_group: Io.Group = .init;
         var watchdog_active = false;
-        if (p.timeout_ns != 0) {
+        if (p.timeout_ns != 0 or p.deadline_ns != 0) {
             if (watchdog_group.concurrent(io, Watchdog.watch, .{&watchdog})) |_| {
                 watchdog_active = true;
             } else |_| {
@@ -208,6 +246,23 @@ pub fn run(p: *Params) void {
             const offset = p.schedule.offsetNs(send_index, p.phase);
             const scheduled = anchor.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
 
+            // Schedule lag: how late this send already is. Positive only under
+            // load (when ahead we pace below); feeds the backlog gauge and the
+            // deadline check. Both clocks are monotonic, so `behind` fits u64.
+            const behind_ns: i128 = t.nanoseconds - scheduled.nanoseconds;
+            if (behind_ns > 0) p.counters.noteBehind(@intCast(behind_ns));
+
+            // Deadline shedding: a request already staler than the deadline can
+            // never meet it, so fail it now — without touching the wire — and
+            // move on. This lets the connection shed accumulated backlog and
+            // keep measuring near-live latency instead of serializing through an
+            // ever-staler queue; the misses surface as `deadline` errors.
+            if (p.deadline_ns != 0 and behind_ns > p.deadline_ns) {
+                noteDeadline(p);
+                send_index += 1;
+                continue;
+            }
+
             // Pace: if we're ahead of schedule, wait; if behind, fire immediately.
             if (scheduled.nanoseconds > t.nanoseconds) {
                 const wait = Io.Duration.fromNanoseconds(scheduled.nanoseconds - t.nanoseconds);
@@ -215,21 +270,27 @@ pub fn run(p: *Params) void {
             }
             send_index += 1;
 
-            // Send the request and read its response inline on this thread;
-            // the watchdog turns a stalled read into a socket shutdown, which
-            // surfaces here as a read failure that `fired` reclassifies.
-            if (watchdog_active) watchdog.arm(now(io));
+            // Send the request and read its response inline on this thread; the
+            // watchdog turns a stalled read into a socket shutdown, which
+            // surfaces here as a read failure that `fired` reclassifies. Arm
+            // against both bounds: the wire timeout from the actual send, and
+            // the CO deadline from the scheduled time (whichever is earlier).
+            if (watchdog_active) watchdog.arm(scheduled, now(io));
             const work = performWork(p, app_reader, app_writer);
             if (watchdog_active) watchdog.disarm();
             const timed_out = watchdog_active and watchdog.fired.load(.acquire);
+            // A fired watchdog is a deadline miss when the CO bound was the one
+            // that expired, else a wire timeout. `fired_reason` is set at arm
+            // time and only ever touched by this (the request) thread.
+            const deadline_hit = timed_out and watchdog.fired_reason == .deadline;
 
             switch (work) {
                 .write_failed => {
-                    if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .write);
+                    if (deadline_hit) noteDeadline(p) else if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .write);
                     conn_open = false;
                 },
                 .read_failed => {
-                    if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .read);
+                    if (deadline_hit) noteDeadline(p) else if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .read);
                     conn_open = false;
                 },
                 .ok => |resp| {
@@ -266,60 +327,96 @@ const WorkResult = union(enum) {
     read_failed,
 };
 
-/// One per connection: watches the in-flight request's deadline and, on
+/// The tighter (smaller nonzero) of two bounds, or 0 if both are 0. Used to
+/// pick the watchdog's idle tick cadence from the wire timeout and deadline.
+fn tighter(a: u64, b: u64) u64 {
+    if (a == 0) return b;
+    if (b == 0) return a;
+    return @min(a, b);
+}
+
+/// One per connection: watches the in-flight request's expiry and, on
 /// expiry, shuts the stream down so the blocked read unblocks with an error
-/// the request loop reclassifies as a timeout (the wrk approach, adapted to
-/// blocking threads). Arming costs one atomic store on the request path —
-/// no per-request task spawns.
+/// the request loop reclassifies as a timeout or deadline miss (the wrk
+/// approach, adapted to blocking threads). Arming costs one atomic store on
+/// the request path — no per-request task spawns.
+///
+/// The expiry is the earlier of two bounds: the wire timeout from the actual
+/// send (`sent + timeout_ns`) and the CO deadline from the scheduled send
+/// (`scheduled + deadline_ns`); either is omitted when its config is 0.
 const Watchdog = struct {
     io: Io,
     stream: *net.Stream,
+    /// Wire timeout (0 = none): bounds the attempt from the actual send.
     timeout_ns: u64,
-    /// Monotonic-ns deadline of the in-flight request; 0 = idle. i64 (not
+    /// CO deadline (0 = none): bounds latency from the scheduled send.
+    deadline_ns: u64,
+    /// Idle tick cadence base: the tighter of the two bounds.
+    tick_ns: u64,
+    /// Monotonic-ns expiry of the in-flight request; 0 = idle. i64 (not
     /// the timestamp's native i128) because 128-bit atomics don't exist on
     /// x86_64; saturating i64 nanoseconds still spans ~292 years of uptime.
-    deadline_ns: std.atomic.Value(i64) = .init(0),
+    expiry_ns: std.atomic.Value(i64) = .init(0),
     /// True once the stream has been shut down; read by the request loop
-    /// to tell a timeout from a genuine transport failure.
+    /// to tell an expiry from a genuine transport failure.
     fired: std.atomic.Value(bool) = .init(false),
+    /// Which bound the current arm expires on, so the request loop can tell a
+    /// deadline miss from a wire timeout. Written by the request thread at arm
+    /// time and read by it after disarm; the watchdog thread never touches it.
+    fired_reason: Reason = .wire,
 
-    fn arm(w: *Watchdog, t: Io.Timestamp) void {
-        const deadline = std.math.lossyCast(i64, t.nanoseconds + @as(i128, w.timeout_ns));
-        w.deadline_ns.store(deadline, .release);
+    const Reason = enum { wire, deadline };
+
+    fn arm(w: *Watchdog, scheduled: Io.Timestamp, sent: Io.Timestamp) void {
+        var expiry: i128 = std.math.maxInt(i64);
+        var reason: Reason = .wire;
+        if (w.timeout_ns != 0) {
+            expiry = sent.nanoseconds + @as(i128, w.timeout_ns);
+            reason = .wire;
+        }
+        if (w.deadline_ns != 0) {
+            const co = scheduled.nanoseconds + @as(i128, w.deadline_ns);
+            if (co < expiry) {
+                expiry = co;
+                reason = .deadline;
+            }
+        }
+        w.fired_reason = reason;
+        w.expiry_ns.store(std.math.lossyCast(i64, expiry), .release);
     }
 
     fn disarm(w: *Watchdog) void {
-        w.deadline_ns.store(0, .release);
+        w.expiry_ns.store(0, .release);
     }
 
     /// Runs until it fires or is canceled at connection teardown. While a
-    /// request is in flight it sleeps exactly to that deadline (successive
-    /// deadlines only move forward, so it can never oversleep a later one);
-    /// while idle it ticks at half the timeout, so a request armed mid-tick
-    /// is caught at most 1.5x the timeout late. Deliberate slack: this
+    /// request is in flight it sleeps exactly to that expiry (successive
+    /// expiries only move forward, so it can never oversleep a later one);
+    /// while idle it ticks at half the tighter bound, so a request armed
+    /// mid-tick is caught at most 1.5x that bound late. Deliberate slack: this
     /// guards against stalls, it is not a precision timer.
     fn watch(w: *Watchdog) void {
         const io = w.io;
         while (true) {
-            const deadline = w.deadline_ns.load(.acquire);
+            const expiry = w.expiry_ns.load(.acquire);
             const t = std.math.lossyCast(i64, now(io).nanoseconds);
-            if (deadline != 0 and t >= deadline) {
-                // Fire only if this exact deadline is still armed: the request
+            if (expiry != 0 and t >= expiry) {
+                // Fire only if this exact expiry is still armed: the request
                 // may have completed (disarm, possibly followed by the next
                 // arm) since the load above, and shutting the socket down then
-                // would misclassify the *next* request as a timeout. Deadlines
-                // strictly increase, so there is no ABA to worry about.
-                if (w.deadline_ns.cmpxchgStrong(deadline, 0, .acq_rel, .acquire) == null) {
+                // would misclassify the *next* request. Expiries strictly
+                // increase, so there is no ABA to worry about.
+                if (w.expiry_ns.cmpxchgStrong(expiry, 0, .acq_rel, .acquire) == null) {
                     w.fired.store(true, .release);
                     w.stream.shutdown(io, .both) catch {};
                     return;
                 }
-                continue; // Deadline moved: re-evaluate against the new one.
+                continue; // Expiry moved: re-evaluate against the new one.
             }
-            const sleep_ns: i64 = if (deadline != 0)
-                deadline - t
+            const sleep_ns: i64 = if (expiry != 0)
+                expiry - t
             else
-                @intCast(@max(w.timeout_ns / 2, std.time.ns_per_ms));
+                @intCast(@max(w.tick_ns / 2, std.time.ns_per_ms));
             io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch return;
         }
     }
@@ -371,6 +468,19 @@ fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
     }
     // Publish so a fully stalled target still surfaces on the dashboard.
     maybePublish(p, done.nanoseconds);
+}
+
+/// A request that missed its coordinated-omission `--deadline`: shed before
+/// sending (already too stale) or shut down in flight at `scheduled + deadline`.
+/// Counted as an error so sustained overload surfaces through `--max-error-rate`
+/// instead of an unbounded latency tail, but deliberately *not* recorded as a
+/// latency sample — the histogram stays the distribution of requests served
+/// within the deadline. Skipped during shutdown, where it would be a teardown
+/// artifact rather than a real miss.
+fn noteDeadline(p: *Params) void {
+    if (p.stop.load(.monotonic)) return;
+    p.counters.deadline_errors += 1;
+    maybePublish(p, now(p.io).nanoseconds);
 }
 
 /// Publish this connection's live state for the dashboard. Counters are
@@ -716,4 +826,169 @@ test "run with record_timeouts disabled drops timed-out samples" {
 
     try testing.expect(counters.timeouts > 0);
     try testing.expectEqual(@as(u64, 0), histogram.count());
+}
+
+test "deadline mode fails stale requests without recording them" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    try group.concurrent(io, stallServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(500));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } }, // ~500 req/s
+        // No wire timeout: the deadline alone must catch the stall in flight,
+        // shutting each blocked request down at `scheduled + deadline`.
+        .timeout_ns = 0,
+        .deadline_ns = 50 * std.time.ns_per_ms,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.cancel(io);
+    server.deinit(io);
+
+    // The server never responds, so nothing completes; every request misses the
+    // deadline and is counted as such — never as a wire timeout.
+    try testing.expectEqual(@as(u64, 0), counters.completed);
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    try testing.expect(counters.deadline_errors > 0);
+    // Deadline misses are failures, not latencies: the histogram stays empty
+    // (contrast the timeout test above, where record_timeouts fills the tail).
+    try testing.expectEqual(@as(u64, 0), histogram.count());
+    // The stall drives the connection a full deadline behind its schedule, so
+    // the backlog gauge registers substantial lag (equilibrium sits near the
+    // 50ms deadline; assert well above jitter).
+    try testing.expect(counters.max_behind_ns > 20 * std.time.ns_per_ms);
+}
+
+test "deadline mode sheds backlog under overload and bounds the recorded tail" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    // A fast keep-alive server: responses are instant, so the *only* thing that
+    // can make the connection fall behind is an unservably high offered rate.
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(300));
+    const deadline_ns = 20 * std.time.ns_per_ms;
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        // 500k req/s on one blocking connection is unachievable on loopback, so
+        // the connection falls behind and — once past the deadline — sheds.
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_us } },
+        .timeout_ns = 0,
+        .deadline_ns = deadline_ns,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // Some requests are served (the connection keeps probing near-live latency)
+    // and some are shed as the backlog outruns the deadline.
+    try testing.expect(counters.completed > 0);
+    try testing.expect(counters.deadline_errors > 0);
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    // Only served requests are recorded; shed ones are not.
+    try testing.expectEqual(counters.completed, histogram.count());
+    // The recorded tail is bounded by the deadline: shedding keeps sends within
+    // one deadline of schedule, so every recorded latency stays near/under it
+    // (vs. the tens-of-seconds tail this mode exists to prevent).
+    try testing.expect(histogram.max() <= 2 * deadline_ns / std.time.ns_per_us);
+}
+
+test "a generous deadline never fires against a healthy server" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } }, // ~500 req/s
+        .timeout_ns = 0,
+        .deadline_ns = 1 * std.time.ns_per_s, // far above loopback latency
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // A connection that keeps up never sheds and never expires in flight: every
+    // request completes and is recorded, and the deadline path stays untouched.
+    try testing.expect(counters.completed > 0);
+    try testing.expectEqual(@as(u64, 0), counters.deadline_errors);
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    try testing.expectEqual(counters.completed, histogram.count());
 }

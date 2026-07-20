@@ -102,6 +102,7 @@ pub fn run(
         .insecure = cfg.insecure,
         .schedule = schedule,
         .timeout_ns = cfg.timeout_ns,
+        .deadline_ns = cfg.deadline_ns,
         .record_timeouts = cfg.record_timeouts,
         .end = end,
         .stop = &stop,

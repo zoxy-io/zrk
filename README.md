@@ -44,7 +44,11 @@ zrk [options] <url>
   -m, --method      <M>     HTTP method                    (default GET)
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
                             (@- = stdin, @@x = a literal "@x")
-      --timeout     <T>     Per-request timeout            (default 2s)
+      --timeout     <T>     Wire timeout per attempt, from the actual
+                            send (default 2s); does not bound CO latency
+      --deadline    <T>     Max coordinated-omission latency, from the
+                            scheduled send: a request past T is failed as
+                            a `deadline` error, not recorded (0 = off)
       --interval    <T>     Stats window: --timeseries rows and --plain
                             lines                          (default 1s)
       --refresh     <T>     Live dashboard redraw rate     (default 80ms)
@@ -61,8 +65,9 @@ zrk [options] <url>
                             latency percentiles) to FILE
       --timeseries-histogram  Add each interval's full latency histogram
                             (HdrHistogram base64) to every --timeseries row
-      --no-record-timeouts  Drop timed-out requests from the latency histogram
-                            (default: record them, so the tail isn't truncated)
+      --no-record-timeouts  Drop wire-timed-out requests from the latency
+                            histogram (default: record them, so the tail isn't
+                            truncated). --deadline misses are never recorded.
 
   CI gates (exit code 3 on breach):
       --slo-p99     <T>     Fail if final p99 latency exceeds T
@@ -123,7 +128,7 @@ summary object (the live dashboard is suppressed) to stdout or `--output <file>`
 {
   "zrk_version": "0.1.0",
   "target": { "url": "http://127.0.0.1:8080/", "method": "GET" },
-  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "record_timeouts": true },
+  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "deadline_ms": 0, "record_timeouts": true },
   "duration_s": 20.002,
   "requests": 19998,
   "bytes": 1239876,
@@ -132,10 +137,11 @@ summary object (the live dashboard is suppressed) to stdout or `--output <file>`
   "rate_ratio": 0.9998,
   "bytes_per_sec": 61987.30,
   "error_rate": 0.000000,
+  "max_schedule_lag_us": 84,
   "latency_us": { "min": 106, "mean": 422.0, "stdev": 1222.9, "max": 13991,
                   "p50": 251, "p75": 337, "p90": 471, "p99": 1913, "p99_9": 13364, "p99_99": 13988 },
   "status_codes": { "1xx": 0, "2xx": 19998, "3xx": 0, "4xx": 0, "5xx": 0 },
-  "errors": { "connect": 0, "read": 0, "write": 0, "timeout": 0, "non_2xx_3xx": 0 },
+  "errors": { "connect": 0, "read": 0, "write": 0, "timeout": 0, "deadline": 0, "non_2xx_3xx": 0 },
   "latency_histogram": "HISTFAAAAUJ4nC1P..."
 }
 ```
@@ -182,6 +188,39 @@ Timed-out requests are recorded into the latency histogram by default (as a
 coordinated-omission-corrected sample) so the tail isn't silently truncated;
 `--no-record-timeouts` restores wrk2's drop-on-timeout behavior.
 
+### `--timeout` vs `--deadline` (bounding the tail under overload)
+
+These knobs sound similar but measure from **different clocks**, and the
+difference only shows up under overload:
+
+- **`--timeout`** is a **wire** timeout, measured from the *actual* send. It
+  bounds one attempt on the wire (`done − actual_send`) and catches a hung
+  socket or a dead server. It does **not** bound coordinated-omission latency:
+  when a connection falls behind its schedule, each attempt still goes out and
+  comes back quickly, so the timeout never trips even though the *recorded* CO
+  latency (measured from the request's **scheduled** time) balloons into the
+  tens of seconds. A tight `--timeout 1s` will happily sit next to a 30 s `p50`.
+- **`--deadline`** is what actually bounds that tail. It is measured from each
+  request's **scheduled** send time and bounds `done − scheduled`. A request
+  whose CO latency would exceed the deadline is **failed as a `deadline`
+  error** rather than recorded — shed before it is even sent if it is already
+  too stale, or shut down in flight at `scheduled + deadline`. This is the
+  usual benchmark intent ("past X ms it's a failed request, per our SLA").
+
+With `--deadline` set, the latency histogram becomes the distribution of
+requests **served within the deadline** (so its tail is bounded by the
+deadline), and sustained overload shows up as a rising `deadline` error count
+instead of an unbounded latency tail. That makes both CI gates meaningful at
+once under overload: `--slo-p99` stays a p99 of *met* latency, while
+`--max-error-rate` catches the deadline-miss rate. Deadline misses are **never**
+recorded into the histogram (unlike wire timeouts), so `--no-record-timeouts`
+does not affect them.
+
+`max_schedule_lag_us` (JSON) / "Peak schedule lag" (text report) is the backlog
+gauge: the peak `now − scheduled` the fleet ever reached. It is populated even
+without `--deadline`, so it is an early warning that the client is falling
+behind the offered schedule — a companion to `rate_ratio` / `achieved_rate`.
+
 ## How it works
 
 - **One request in flight per connection** (like wrk/wrk2). Throughput comes
@@ -220,9 +259,11 @@ coordinated-omission-corrected sample) so the tail isn't silently truncated;
   (e.g. 2000 req/s at 5 ms ⇒ ≥ 10 connections). Below that the client, not the
   server, is the bottleneck; watch `rate_ratio` / `achieved_rate` in the JSON
   report to confirm the offered load was actually delivered.
-- `--timeout` bounds the **response** (a request whose response doesn't arrive
-  in time is abandoned and counted as `Socket errors: ... timeout N`, matching
-  wrk2). The *connect* itself still uses the OS default, since
+- `--timeout` bounds the **wire attempt** from the actual send (a response that
+  doesn't arrive in time is abandoned and counted as `Socket errors: ... timeout
+  N`, matching wrk2). It does **not** bound coordinated-omission latency under
+  overload — use `--deadline` for that (see "`--timeout` vs `--deadline`"
+  above). The *connect* itself still uses the OS default, since
   connect-with-timeout is unimplemented in the std backend and panics.
 - `-k` skips certificate verification; with the std TLS client this also omits
   SNI, so name-based virtual hosts may respond differently under `-k`.

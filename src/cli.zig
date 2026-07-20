@@ -44,8 +44,15 @@ pub const Config = struct {
     /// End rate for a linear ramp (null = constant `rate`). When set, the total
     /// target rate ramps linearly from `rate` to `rate_end` over the duration.
     rate_end: ?u64 = null,
-    /// Per-request timeout.
+    /// Per-request wire timeout: bounds the attempt on the wire, measured from
+    /// the actual send (catches a hung socket / dead server). Does *not* bound
+    /// coordinated-omission latency under overload — see `deadline_ns`.
     timeout_ns: u64 = 2 * std.time.ns_per_s,
+    /// Coordinated-omission deadline (0 = off): a request whose CO-corrected
+    /// latency (measured from its *scheduled* send time) would exceed this is
+    /// failed as a `deadline` error rather than recorded, bounding the latency
+    /// tail and surfacing sustained overload through the error path.
+    deadline_ns: u64 = 0,
     /// Stats window: per-connection publish period, `--timeseries` row cadence,
     /// and the line rate of `--plain` output.
     interval_ns: u64 = 1 * std.time.ns_per_s,
@@ -133,7 +140,11 @@ pub const usage =
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
     \\                            (@- = stdin, @@x = a literal "@x")
-    \\      --timeout     <T>     Per-request timeout            (default 2s)
+    \\      --timeout     <T>     Wire timeout per attempt, from the actual
+    \\                            send (default 2s); does not bound CO latency
+    \\      --deadline    <T>     Max coordinated-omission latency, from the
+    \\                            scheduled send: a request past T is failed as
+    \\                            a `deadline` error, not recorded (0 = off)
     \\      --interval    <T>     Stats window: --timeseries rows and --plain
     \\                            lines                          (default 1s)
     \\      --refresh     <T>     Live dashboard redraw rate     (default 80ms)
@@ -150,8 +161,9 @@ pub const usage =
     \\                            latency percentiles) to FILE
     \\      --timeseries-histogram  Add each interval's full latency histogram
     \\                            (HdrHistogram base64) to every --timeseries row
-    \\      --no-record-timeouts  Drop timed-out requests from the latency
-    \\                            histogram (default: record them)
+    \\      --no-record-timeouts  Drop wire-timed-out requests from the latency
+    \\                            histogram (default: record them). Independent
+    \\                            of --deadline misses, which are never recorded.
     \\
     \\CI gates (exit code 3 on breach):
     \\      --slo-p99     <T>     Fail if final p99 latency exceeds T
@@ -229,6 +241,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.rate_end = spec.end;
         } else if (eq(arg, "--timeout")) {
             cfg.timeout_ns = try parseDuration(try nextValue(tokens, &i));
+        } else if (eq(arg, "--deadline")) {
+            cfg.deadline_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--interval")) {
             cfg.interval_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--refresh")) {
@@ -458,6 +472,17 @@ test "zero interval is rejected" {
     try testing.expectEqual(@as(u64, 0), cfg.timeout_ns);
 }
 
+test "deadline flag parses; defaults off" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Off by default (0 = no deadline), independent of --timeout's own default.
+    const default = (try parse(a, &[_][]const u8{"http://x/"})).config;
+    try testing.expectEqual(@as(u64, 0), default.deadline_ns);
+    const cfg = (try parse(a, &[_][]const u8{ "--deadline", "250ms", "http://x/" })).config;
+    try testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), cfg.deadline_ns);
+}
+
 test "refresh flag parses and zero is rejected" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -516,12 +541,12 @@ test "parse full command line" {
     const arena = arena_state.allocator();
 
     const args = [_][]const u8{
-        "-c",         "100",
-        "-d",         "30s",
-        "-R",         "2000",
-        "-H",         "Accept: application/json",
-        "-H",         "X-Test: 1",
-        "--latency",  "http://127.0.0.1:8080/index.html",
+        "-c",        "100",
+        "-d",        "30s",
+        "-R",        "2000",
+        "-H",        "Accept: application/json",
+        "-H",        "X-Test: 1",
+        "--latency", "http://127.0.0.1:8080/index.html",
     };
     const parsed = try parse(arena, &args);
     const cfg = parsed.config;
@@ -579,13 +604,12 @@ test "parse reporting and CI-gate flags" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const args = [_][]const u8{
-        "--format",         "json",
-        "-o",               "out.json",
-        "--hdr",            "lat.hgrm",
-        "--slo-p99",        "250ms",
-        "--max-error-rate", "1%",
-        "--no-record-timeouts",
-        "http://127.0.0.1:8080/",
+        "--format",             "json",
+        "-o",                   "out.json",
+        "--hdr",                "lat.hgrm",
+        "--slo-p99",            "250ms",
+        "--max-error-rate",     "1%",
+        "--no-record-timeouts", "http://127.0.0.1:8080/",
     };
     const cfg = (try parse(arena_state.allocator(), &args)).config;
     try testing.expectEqual(Format.json, cfg.format);
