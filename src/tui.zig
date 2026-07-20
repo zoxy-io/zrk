@@ -167,7 +167,7 @@ pub const Dashboard = struct {
                 elapsed_s,               rate,
                 Bytes.of(bps),           Dur.of(snap.hist.valueAtPercentile(50)),
                 Dur.of(p99),             Dur.of(snap.hist.valueAtPercentile(99.9)),
-                Dur.of(snap.hist.max()), snap.counters.socketErrors() + snap.counters.status_errors,
+                Dur.of(snap.hist.max()), snap.counters.socketErrors() + snap.counters.status_errors + snap.counters.deadline_errors,
             });
         }
         try self.fw.interface.flush();
@@ -271,6 +271,16 @@ pub const Dashboard = struct {
         if (errs > 0 or c.status_errors > 0) {
             try w.print("{s}socket errors {d}   non-2xx/3xx {d}{s}\n", .{
                 k.red, errs, c.status_errors, k.reset,
+            });
+            lines += 1;
+        }
+        // Deadline misses and peak schedule lag: the overload signal. The lag
+        // gauge shows even when nothing has missed yet (a ramp approaching the
+        // knee), so it's the earliest warning that the client is falling behind.
+        if (c.deadline_errors > 0 or (self.cfg.deadline_ns != 0 and c.max_behind_ns > 0)) {
+            try w.print("{s}deadline misses {d}{s}   {s}peak lag{s} {f}\n", .{
+                k.red, c.deadline_errors, k.reset,
+                k.dim, k.reset,           Dur.of(c.max_behind_ns / std.time.ns_per_us),
             });
             lines += 1;
         }
@@ -458,6 +468,16 @@ pub const Dashboard = struct {
                 c.connect_errors, c.read_errors, c.write_errors, c.timeouts,
             });
         }
+        if (c.deadline_errors > 0) {
+            try w.print("  Deadline misses: {d} (CO latency exceeded --deadline)\n", .{c.deadline_errors});
+        }
+        // Peak schedule lag is the backlog gauge; sub-millisecond lag is normal
+        // jitter, so only report it once it's large enough to signal overload.
+        if (c.max_behind_ns >= std.time.ns_per_ms) {
+            try w.writeAll("  Peak schedule lag: ");
+            try Dur.write(w, @floatFromInt(c.max_behind_ns / std.time.ns_per_us));
+            try w.writeAll("\n");
+        }
         try w.print("Requests/sec: {d:.2}\n", .{rps});
         try w.writeAll("Transfer/sec: ");
         try writeBytes(w, bps);
@@ -579,4 +599,33 @@ test "writeReport renders the wrk2-style summary to any writer" {
     try testing.expect(std.mem.indexOf(u8, text, "Requests/sec: 50.00") != null);
     // No terminal control sequences in the redirectable report.
     try testing.expect(std.mem.indexOf(u8, text, "\x1b") == null);
+    // No deadline mode here, so neither overload line appears.
+    try testing.expect(std.mem.indexOf(u8, text, "Deadline misses") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Peak schedule lag") == null);
+}
+
+test "writeReport surfaces deadline misses and peak schedule lag" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1:8080/"), .deadline_ns = 100 * std.time.ns_per_ms };
+    var dash_buf: [1024]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 100;
+    snap.counters.recordStatus(200);
+    snap.counters.deadline_errors = 42;
+    snap.counters.max_behind_ns = 250 * std.time.ns_per_ms; // 250ms peak lag
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try dash.writeReport(&out.writer, &snap, 2.0);
+    const text = out.written();
+
+    try testing.expect(std.mem.indexOf(u8, text, "Deadline misses: 42") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Peak schedule lag: 250.00ms") != null);
 }

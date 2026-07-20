@@ -11,11 +11,15 @@ const stats = @import("stats.zig");
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 
-/// Fraction of outcomes that were failures: non-2xx/3xx responses plus socket
-/// errors (connect/read/write/timeout), over all attempts. 0 when idle.
+/// Fraction of outcomes that were failures: non-2xx/3xx responses, socket
+/// errors (connect/read/write/timeout), and `--deadline` misses, over all
+/// attempts. Deadline misses count as both a failure and an attempt, so under
+/// overload the rate reflects the fraction of the offered schedule that could
+/// not be served within the deadline. 0 when idle.
 pub fn errorRate(c: connection.Counters) f64 {
-    const errs = c.status_errors + c.socketErrors();
-    const total = c.completed + c.socketErrors();
+    const failures = c.socketErrors() + c.deadline_errors;
+    const errs = c.status_errors + failures;
+    const total = c.completed + failures;
     if (total == 0) return 0;
     return @as(f64, @floatFromInt(errs)) / @as(f64, @floatFromInt(total));
 }
@@ -78,13 +82,14 @@ pub fn writeJson(
 
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"record_timeouts\": {} }},\n",
         .{
             cfg.connections,
             launched,
             @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
             cfg.rate,
             cfg.timeout_ns / std.time.ns_per_ms,
+            cfg.deadline_ns / std.time.ns_per_ms,
             cfg.record_timeouts,
         },
     );
@@ -98,13 +103,17 @@ pub fn writeJson(
     try w.print("  \"rate_ratio\": {d:.4},\n", .{if (avg_target > 0) achieved / avg_target else 0});
     try w.print("  \"bytes_per_sec\": {d:.2},\n", .{bps});
     try w.print("  \"error_rate\": {d:.6},\n", .{errorRate(c)});
+    // Peak schedule lag (µs): how far behind its intended send the fleet ever
+    // fell — the backlog gauge. Large values mean the client couldn't sustain
+    // the offered schedule (see also achieved_rate / rate_ratio).
+    try w.print("  \"max_schedule_lag_us\": {d},\n", .{c.max_behind_ns / std.time.ns_per_us});
 
     try w.writeAll("  \"latency_us\": {\n");
     try w.print("    \"min\": {d}, \"mean\": {d:.1}, \"stdev\": {d:.1}, \"max\": {d},\n", .{
         h.min(), h.mean(), h.stdDev(), h.max(),
     });
     try w.print("    \"p50\": {d}, \"p75\": {d}, \"p90\": {d}, \"p99\": {d}, \"p99_9\": {d}, \"p99_99\": {d}\n", .{
-        h.valueAtPercentile(50), h.valueAtPercentile(75),  h.valueAtPercentile(90),
+        h.valueAtPercentile(50), h.valueAtPercentile(75),   h.valueAtPercentile(90),
         h.valueAtPercentile(99), h.valueAtPercentile(99.9), h.valueAtPercentile(99.99),
     });
     try w.writeAll("  },\n");
@@ -115,8 +124,8 @@ pub fn writeJson(
     });
 
     try w.writeAll("  \"errors\": {");
-    try w.print(" \"connect\": {d}, \"read\": {d}, \"write\": {d}, \"timeout\": {d}, \"non_2xx_3xx\": {d} }},\n", .{
-        c.connect_errors, c.read_errors, c.write_errors, c.timeouts, c.status_errors,
+    try w.print(" \"connect\": {d}, \"read\": {d}, \"write\": {d}, \"timeout\": {d}, \"deadline\": {d}, \"non_2xx_3xx\": {d} }},\n", .{
+        c.connect_errors, c.read_errors, c.write_errors, c.timeouts, c.deadline_errors, c.status_errors,
     });
 
     // Full distribution, losslessly re-decodable by any HdrHistogram library.
@@ -182,7 +191,7 @@ pub const TimeSeries = struct {
         const interval_s = elapsed_s - self.prev_elapsed_s;
         const d_completed = snap.counters.completed -| self.prev_completed;
         const d_bytes = snap.counters.bytes -| self.prev_bytes;
-        const cur_errors = snap.counters.status_errors + snap.counters.socketErrors();
+        const cur_errors = snap.counters.status_errors + snap.counters.socketErrors() + snap.counters.deadline_errors;
         const d_errors = cur_errors -| self.prev_errors;
         const achieved: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_completed)) / interval_s else 0;
         const bps: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_bytes)) / interval_s else 0;
@@ -280,10 +289,13 @@ test "writeJson emits parseable, well-formed summary" {
     snap.counters.bytes = 4200;
     snap.counters.recordStatus(200);
     snap.counters.recordStatus(500);
+    snap.counters.deadline_errors = 7;
+    snap.counters.max_behind_ns = 12_000; // 12ms peak lag
 
     var alloc = Io.Writer.Allocating.init(testing.allocator);
     defer alloc.deinit();
-    const cfg = testConfig();
+    var cfg = testConfig();
+    cfg.deadline_ns = 250 * std.time.ns_per_ms;
     try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, 1.0, 4);
     const out = alloc.written();
 
@@ -296,6 +308,10 @@ test "writeJson emits parseable, well-formed summary" {
     try testing.expect(std.mem.indexOf(u8, out, "\"target_rate\": 1000") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"5xx\": 1") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_us\"") != null);
+    // Deadline mode surfaces in config, the errors object, and the backlog gauge.
+    try testing.expect(std.mem.indexOf(u8, out, "\"deadline_ms\": 250") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"deadline\": 7") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"max_schedule_lag_us\": 12") != null);
     // The embedded HdrHistogram blob is present and decodes back to 100 samples.
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_histogram\": \"HIST") != null);
 }
@@ -362,6 +378,12 @@ test "errorRate and checkSlo gates" {
     c.timeouts = 1; // one socket error
     // errors = status_errors(1) + socketErrors(1) = 2; total = completed(98)+socket(1)=99
     try testing.expectApproxEqAbs(@as(f64, 2.0 / 99.0), errorRate(c), 1e-9);
+
+    // Deadline misses count as both a failure and an attempt: adding one moves
+    // the rate to 3/100, so --max-error-rate can see overload-driven misses.
+    c.deadline_errors = 1;
+    try testing.expectApproxEqAbs(@as(f64, 3.0 / 100.0), errorRate(c), 1e-9);
+    c.deadline_errors = 0;
 
     var snap: stats.Snapshot = .{
         .hist = try stats.newHistogram(testing.allocator),
