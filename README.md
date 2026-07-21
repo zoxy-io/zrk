@@ -1,3 +1,7 @@
+<p align="center">
+    <img alt="zrk console demo" src="./zrk.svg" width="600" />
+</p>
+
 # zrk
 
 [![CI](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml)
