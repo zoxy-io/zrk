@@ -259,8 +259,8 @@ behind the offered schedule — a companion to `rate_ratio` / `achieved_rate`.
   significant figures). Each connection owns its own histogram (lock-free hot
   path) and publishes a snapshot once per `--interval` for the dashboard; the
   final report aggregates all histograms after the run.
-- Connections run concurrently on Zig 0.16's `std.Io` (`Threaded` backend), one
-  connection per worker fiber/thread.
+- Connections run as coroutines on a [zio](https://github.com/lalinsky/zio)
+  io_uring runtime (`std.Io`-compatible), one connection per coroutine.
 
 ## Source layout
 

@@ -114,8 +114,8 @@ pub fn run(
         .counters = undefined,
     });
 
-    // Launch each connection on its own thread. `concurrent` (unlike
-    // `async`) guarantees real parallelism on the Threaded backend.
+    // Launch each connection as a zio coroutine. `concurrent` (unlike
+    // `async`) guarantees real parallelism across executor threads.
     var group: Io.Group = .init;
     // If anything below fails, the workers must be stopped and joined before
     // this frame unwinds: they hold pointers to `stop` (this stack) and to

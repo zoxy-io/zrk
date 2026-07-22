@@ -572,11 +572,12 @@ fn writeBytes(w: *Io.Writer, bytes: f64) !void {
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+const zio = @import("zio");
 
 test "writeReport renders the wrk2-style summary to any writer" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1:8080/") };
     var dash_buf: [1024]u8 = undefined;
@@ -605,9 +606,9 @@ test "writeReport renders the wrk2-style summary to any writer" {
 }
 
 test "writeReport surfaces deadline misses and peak schedule lag" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1:8080/"), .deadline_ns = 100 * std.time.ns_per_ms };
     var dash_buf: [1024]u8 = undefined;
