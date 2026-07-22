@@ -209,49 +209,8 @@ pub fn run(p: *Params) void {
             app_writer = &plain_writer.interface;
         }
 
-        // The response timeout is enforced by one watchdog task per
-        // *connection*, armed/disarmed with an atomic store per request.
-        // The previous design raced every request against a freshly
-        // spawned timer task and canceled the loser; on the Threaded
-        // backend that per-request spawn/cancel pair costs milliseconds
-        // (macOS especially), capping every connection near 500 req/s no
-        // matter how fast the target answers.
-        // The CO deadline is enforced by shedding *before* sending (see the
-        // request loop); the watchdog only arms on it — killing an in-flight
-        // request, which on HTTP/1.1 keep-alive means resetting the whole
-        // connection — when `--deadline-abort` is set. Left off by default: past
-        // a saturated target's knee most in-flight requests would trip the
-        // deadline, and resetting every one storms the target with reconnects
-        // (blowing its working set) while shed-before-send already bounds the
-        // recorded tail to deadline + wire time. So the watchdog's CO bound is
-        // the deadline only under `--deadline-abort`, else disabled (0).
-        const wd_deadline_ns: u64 = if (p.deadline_abort) p.deadline_ns else 0;
-        var watchdog: Watchdog = .{
-            .io = io,
-            .stream = &stream,
-            .timeout_ns = p.timeout_ns,
-            .deadline_ns = wd_deadline_ns,
-            // Idle tick cadence: the tighter of the two active bounds, so an
-            // armed request is caught at most ~1.5x that bound late.
-            .tick_ns = tighter(p.timeout_ns, wd_deadline_ns),
-        };
-        var watchdog_group: Io.Group = .init;
-        var watchdog_active = false;
-        if (p.timeout_ns != 0 or wd_deadline_ns != 0) {
-            if (watchdog_group.concurrent(io, Watchdog.watch, .{&watchdog})) |_| {
-                watchdog_active = true;
-            } else |_| {
-                // No task available: requests run untimed, as before.
-            }
-        }
         var conn_open = true;
-        // Teardown order matters: cancel joins the watchdog before the
-        // stream closes, so the watchdog can never shut down a closed
-        // (and possibly kernel-reused) fd.
-        defer {
-            if (watchdog_active) watchdog_group.cancel(io);
-            stream.close(io);
-        }
+        defer stream.close(io);
 
         // Serve requests on this connection until it must close or the test ends.
         while (conn_open and !p.stop.load(.monotonic)) {
@@ -288,19 +247,28 @@ pub fn run(p: *Params) void {
             }
             send_index += 1;
 
-            // Send the request and read its response inline on this thread; the
-            // watchdog turns a stalled read into a socket shutdown, which
-            // surfaces here as a read failure that `fired` reclassifies. Arm
-            // against both bounds: the wire timeout from the actual send, and
-            // the CO deadline from the scheduled time (whichever is earlier).
-            if (watchdog_active) watchdog.arm(scheduled, now(io));
+            // Per-request timer tasks: one for the wire timeout, one for the
+            // CO deadline abort. Each sleeps to its bound and, if the response
+            // doesn't arrive first, shuts the stream down to unblock the read.
+            // `timer_group.cancel` after performWork cancels un-fired timers and
+            // joins fired ones so the flags and stream are safe to use after.
+            var wire_fired: std.atomic.Value(bool) = .init(false);
+            var deadline_fired: std.atomic.Value(bool) = .init(false);
+            var timer_group: Io.Group = .init;
+            defer timer_group.cancel(io);
+            if (p.timeout_ns != 0)
+                timer_group.concurrent(io, watchTimer, .{ io, &stream, p.timeout_ns, &wire_fired }) catch {};
+            if (p.deadline_abort and p.deadline_ns != 0) {
+                // behind_ns <= deadline_ns here (shed check above), so it fits u64.
+                const behind: u64 = if (behind_ns > 0) @intCast(behind_ns) else 0;
+                const remaining_ns = p.deadline_ns - behind;
+                if (remaining_ns > 0)
+                    timer_group.concurrent(io, watchTimer, .{ io, &stream, remaining_ns, &deadline_fired }) catch {};
+            }
             const work = performWork(p, app_reader, app_writer);
-            if (watchdog_active) watchdog.disarm();
-            const timed_out = watchdog_active and watchdog.fired.load(.acquire);
-            // A fired watchdog is a deadline miss when the CO bound was the one
-            // that expired, else a wire timeout. `fired_reason` is set at arm
-            // time and only ever touched by this (the request) thread.
-            const deadline_hit = timed_out and watchdog.fired_reason == .deadline;
+            timer_group.cancel(io);
+            const timed_out = wire_fired.load(.acquire) or deadline_fired.load(.acquire);
+            const deadline_hit = deadline_fired.load(.acquire);
 
             switch (work) {
                 .write_failed => {
@@ -326,9 +294,9 @@ pub fn run(p: *Params) void {
 
                     maybePublish(p, done.nanoseconds);
 
-                    // A fired watchdog shut the socket down even though the
-                    // response won the race; the response still counts, but
-                    // the connection is dead.
+                    // A timer may have fired in the same event batch as the
+                    // response; the response still counts, but the socket is
+                    // shut down so the connection is dead.
                     if (timed_out or !resp.keep_alive) {
                         conn_open = false;
                     }
@@ -345,100 +313,20 @@ const WorkResult = union(enum) {
     read_failed,
 };
 
-/// The tighter (smaller nonzero) of two bounds, or 0 if both are 0. Used to
-/// pick the watchdog's idle tick cadence from the wire timeout and deadline.
-fn tighter(a: u64, b: u64) u64 {
-    if (a == 0) return b;
-    if (b == 0) return a;
-    return @min(a, b);
-}
-
-/// One per connection: watches the in-flight request's expiry and, on
-/// expiry, shuts the stream down so the blocked read unblocks with an error
-/// the request loop reclassifies as a timeout or deadline miss (the wrk
-/// approach, adapted to blocking threads). Arming costs one atomic store on
-/// the request path — no per-request task spawns.
-///
-/// The expiry is the earlier of two bounds: the wire timeout from the actual
-/// send (`sent + timeout_ns`) and the CO deadline from the scheduled send
-/// (`scheduled + deadline_ns`); either is omitted when its config is 0.
-const Watchdog = struct {
+/// Sleeps for `timeout_ns` then shuts the stream down to unblock the pending
+/// read in `performWork`, signaling a wire timeout or CO deadline miss.
+/// Spawned per active bound per request; canceled (and joined) via its group
+/// when the response arrives first — so the stream is never touched after close.
+fn watchTimer(
     io: Io,
     stream: *net.Stream,
-    /// Wire timeout (0 = none): bounds the attempt from the actual send.
     timeout_ns: u64,
-    /// CO deadline (0 = none): bounds latency from the scheduled send.
-    deadline_ns: u64,
-    /// Idle tick cadence base: the tighter of the two bounds.
-    tick_ns: u64,
-    /// Monotonic-ns expiry of the in-flight request; 0 = idle. i64 (not
-    /// the timestamp's native i128) because 128-bit atomics don't exist on
-    /// x86_64; saturating i64 nanoseconds still spans ~292 years of uptime.
-    expiry_ns: std.atomic.Value(i64) = .init(0),
-    /// True once the stream has been shut down; read by the request loop
-    /// to tell an expiry from a genuine transport failure.
-    fired: std.atomic.Value(bool) = .init(false),
-    /// Which bound the current arm expires on, so the request loop can tell a
-    /// deadline miss from a wire timeout. Written by the request thread at arm
-    /// time and read by it after disarm; the watchdog thread never touches it.
-    fired_reason: Reason = .wire,
-
-    const Reason = enum { wire, deadline };
-
-    fn arm(w: *Watchdog, scheduled: Io.Timestamp, sent: Io.Timestamp) void {
-        var expiry: i128 = std.math.maxInt(i64);
-        var reason: Reason = .wire;
-        if (w.timeout_ns != 0) {
-            expiry = sent.nanoseconds + @as(i128, w.timeout_ns);
-            reason = .wire;
-        }
-        if (w.deadline_ns != 0) {
-            const co = scheduled.nanoseconds + @as(i128, w.deadline_ns);
-            if (co < expiry) {
-                expiry = co;
-                reason = .deadline;
-            }
-        }
-        w.fired_reason = reason;
-        w.expiry_ns.store(std.math.lossyCast(i64, expiry), .release);
-    }
-
-    fn disarm(w: *Watchdog) void {
-        w.expiry_ns.store(0, .release);
-    }
-
-    /// Runs until it fires or is canceled at connection teardown. While a
-    /// request is in flight it sleeps exactly to that expiry (successive
-    /// expiries only move forward, so it can never oversleep a later one);
-    /// while idle it ticks at half the tighter bound, so a request armed
-    /// mid-tick is caught at most 1.5x that bound late. Deliberate slack: this
-    /// guards against stalls, it is not a precision timer.
-    fn watch(w: *Watchdog) void {
-        const io = w.io;
-        while (true) {
-            const expiry = w.expiry_ns.load(.acquire);
-            const t = std.math.lossyCast(i64, now(io).nanoseconds);
-            if (expiry != 0 and t >= expiry) {
-                // Fire only if this exact expiry is still armed: the request
-                // may have completed (disarm, possibly followed by the next
-                // arm) since the load above, and shutting the socket down then
-                // would misclassify the *next* request. Expiries strictly
-                // increase, so there is no ABA to worry about.
-                if (w.expiry_ns.cmpxchgStrong(expiry, 0, .acq_rel, .acquire) == null) {
-                    w.fired.store(true, .release);
-                    w.stream.shutdown(io, .both) catch {};
-                    return;
-                }
-                continue; // Expiry moved: re-evaluate against the new one.
-            }
-            const sleep_ns: i64 = if (expiry != 0)
-                expiry - t
-            else
-                @intCast(@max(w.tick_ns / 2, std.time.ns_per_ms));
-            io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch return;
-        }
-    }
-};
+    fired: *std.atomic.Value(bool),
+) void {
+    io.sleep(Io.Duration.fromNanoseconds(timeout_ns), .awake) catch return;
+    fired.store(true, .release);
+    stream.shutdown(io, .both) catch {};
+}
 
 /// Send the fixed request and parse one response; touches only the
 /// transport, never the shared counters.
@@ -523,7 +411,7 @@ fn maybePublish(p: *Params, now_ns: i128) void {
 fn connect(io: Io, address: net.IpAddress) !net.Stream {
     // NOTE: connect-with-timeout is not implemented by the std Io backend in
     // this Zig version (it panics), so the connect itself uses the OS default.
-    // The response timeout is enforced per-request by the `Watchdog`.
+    // The response timeout is enforced per-request by `watchTimer`.
     return address.connect(io, .{ .mode = .stream });
 }
 
