@@ -78,46 +78,72 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-      - name: Update homebrew-tap formula
+      - name: Update Homebrew formula
         env:
-          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           version="${{ steps.ver.outputs.version }}"
+          tag="${{ steps.ver.outputs.tag }}"
 
           sha_aarch64_macos=$(grep "zrk-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
           sha_x86_64_macos=$(grep  "zrk-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
           sha_aarch64_linux=$(grep "zrk-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
           sha_x86_64_linux=$(grep  "zrk-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
 
-          eval "$(ssh-agent -s)"
-          echo "$DEPLOY_KEY" | ssh-add -
           mkdir -p ~/.ssh
+          echo "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
           ssh-keyscan github.com >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes"
 
-          git clone git@github.com:zoxy-io/homebrew-tap.git homebrew-tap
+          git clone git@github.com:zoxy-io/homebrew-tap.git
           cd homebrew-tap
 
-          ruby_file="Formula/zrk.rb"
-          old_version=$(grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' "$ruby_file" | head -1)
+          cat > Formula/zrk.rb << FORMULA
+          class Zrk < Formula
+            desc "Constant-throughput HTTP load generator in Zig"
+            homepage "https://zoxy.io/zrk"
+            license "MIT"
 
-          sed -i "s|zrk-$old_version-aarch64-macos|zrk-$version-aarch64-macos|g" "$ruby_file"
-          sed -i "s|zrk-$old_version-x86_64-macos|zrk-$version-x86_64-macos|g"   "$ruby_file"
-          sed -i "s|zrk-$old_version-aarch64-linux|zrk-$version-aarch64-linux|g" "$ruby_file"
-          sed -i "s|zrk-$old_version-x86_64-linux|zrk-$version-x86_64-linux|g"   "$ruby_file"
+            livecheck do
+              url "https://github.com/zoxy-io/zrk"
+              strategy :github_latest
+            end
 
-          # Replace sha256 values in order: aarch64-macos, x86_64-macos, aarch64-linux, x86_64-linux
-          python3 - "$ruby_file" "$sha_aarch64_macos" "$sha_x86_64_macos" "$sha_aarch64_linux" "$sha_x86_64_linux" <<'EOF'
-          import sys, re
-          path, *shas = sys.argv[1:]
-          text = open(path).read()
-          it = iter(shas)
-          result = re.sub(r'sha256 "[0-9a-f]+"', lambda m: f'sha256 "{next(it)}"', text)
-          open(path, 'w').write(result)
-          EOF
+            on_macos do
+              on_arm do
+                url "https://github.com/zoxy-io/zrk/releases/download/$tag/zrk-$version-aarch64-macos.tar.gz"
+                sha256 "$sha_aarch64_macos"
+              end
+              on_intel do
+                url "https://github.com/zoxy-io/zrk/releases/download/$tag/zrk-$version-x86_64-macos.tar.gz"
+                sha256 "$sha_x86_64_macos"
+              end
+            end
 
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+            on_linux do
+              on_arm do
+                url "https://github.com/zoxy-io/zrk/releases/download/$tag/zrk-$version-aarch64-linux.tar.gz"
+                sha256 "$sha_aarch64_linux"
+              end
+              on_intel do
+                url "https://github.com/zoxy-io/zrk/releases/download/$tag/zrk-$version-x86_64-linux.tar.gz"
+                sha256 "$sha_x86_64_linux"
+              end
+            end
+
+            def install
+              bin.install "zrk"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/zrk --version")
+            end
+          end
+          FORMULA
+
           git config user.name "github-actions[bot]"
-          git add "$ruby_file"
-          git commit -m "zrk: update to v$version"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "zrk: update to $version"
           git push
