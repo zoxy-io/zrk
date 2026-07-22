@@ -6,6 +6,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zio = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Single-source the version from build.zig.zon: cli.zig imports it via
     // this options module, so --version and JSON reports can't drift from the
     // package version (v0.2.0 shipped binaries that still said 0.1.0).
@@ -32,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zrk", .module = mod },
                 .{ .name = "build_info", .module = build_info_mod },
+                .{ .name = "zio", .module = zio.module("zio") },
             },
         }),
     });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const Io = std.Io;
 
 const cli = @import("cli.zig");
@@ -10,7 +11,9 @@ const tui = @import("tui.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const io = init.io;
+    const rt = try zio.Runtime.init(arena, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const args = try init.minimal.args.toSlice(arena);
     const argv = if (args.len > 1) args[1..] else args[0..0];
