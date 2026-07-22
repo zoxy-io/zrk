@@ -17,7 +17,7 @@ const tlsmod = @import("tls.zig");
 const pace = @import("pace.zig");
 const StatusClass = httpmod.StatusClass;
 
-/// Per-connection counters. Aggregated across connections/threads for reporting.
+/// Per-connection counters. Aggregated across connections for reporting.
 pub const Counters = struct {
     /// Requests that received a complete response.
     completed: u64 = 0,
@@ -83,9 +83,9 @@ pub const Counters = struct {
 };
 
 /// A double-buffer for exposing a connection's live latency/counters to the
-/// dashboard thread without racing the hot path. The connection thread copies
-/// its live state here at most once per publish interval, under `mutex`; the
-/// dashboard reads it under the same lock. The publish interval follows the
+/// dashboard coroutine without racing the hot path. The connection coroutine
+/// copies its live state here at most once per publish interval, under `mutex`;
+/// the dashboard reads it under the same lock. The publish interval follows the
 /// fastest consumer — the dashboard's `--refresh` when a live TUI is attached,
 /// else the `--interval` stats window.
 pub const Publish = struct {
@@ -98,8 +98,8 @@ pub const Publish = struct {
     next_ns: i128 = 0,
 };
 
-/// Everything a connection fiber needs. `histogram` and `counters` are owned by
-/// the connection's thread and must not be shared across threads without
+/// Everything a connection coroutine needs. `histogram` and `counters` are owned
+/// by the connection coroutine and must not be shared across coroutines without
 /// external synchronization (that is what `publish` is for).
 pub const Params = struct {
     io: Io,
