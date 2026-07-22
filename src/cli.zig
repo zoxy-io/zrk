@@ -35,6 +35,7 @@ pub const Header = struct {
 };
 
 pub const Config = struct {
+    threads: u8 = 1,
     connections: u32 = 10,
     /// Total test duration.
     duration_ns: u64 = 10 * std.time.ns_per_s,
@@ -138,6 +139,7 @@ pub const usage =
     \\Usage: zrk [options] <url>
     \\
     \\Options:
+    \\  -t, --threads     <N>     Total number of threads to execute load (default 1)
     \\  -c, --connections <N>     Total connections to keep open (default 10)
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
     \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
@@ -241,6 +243,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.slo_p99_ns = try parseDuration(try nextValue(tokens, &i));
         } else if (eq(arg, "--max-error-rate")) {
             cfg.max_error_rate = try parseErrorRate(try nextValue(tokens, &i));
+        } else if (eq(arg, "-t") or eq(arg, "--threads")) {
+            cfg.threads = try parseU8(try nextValue(tokens, &i));
         } else if (eq(arg, "-c") or eq(arg, "--connections")) {
             cfg.connections = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-d") or eq(arg, "--duration")) {
@@ -309,6 +313,10 @@ fn nextValue(args: []const []const u8, i: *usize) ParseError![]const u8 {
     if (i.* + 1 >= args.len) return error.MissingValue;
     i.* += 1;
     return args[i.*];
+}
+
+fn parseU8(s: []const u8) ParseError!u8 {
+    return std.fmt.parseInt(u8, s, 10) catch error.InvalidNumber;
 }
 
 fn parseU32(s: []const u8) ParseError!u32 {
@@ -677,12 +685,4 @@ test "rate parses scalar and ramp forms" {
     try testing.expectEqual(@as(u64, 100), attached.rate);
     try testing.expectEqual(@as(?u64, 5000), attached.rate_end);
     try testing.expectError(error.ZeroRate, parse(a, &[_][]const u8{ "-R", "100:0", "http://x/" }));
-}
-
-test "removed threads flag is rejected as unknown" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try testing.expectError(error.UnknownFlag, parse(a, &[_][]const u8{ "-t", "8", "http://x.com/" }));
-    try testing.expectError(error.UnknownFlag, parse(a, &[_][]const u8{ "--threads", "8", "http://x.com/" }));
 }

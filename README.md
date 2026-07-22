@@ -52,6 +52,7 @@ zig build test            # run the unit + integration tests
 ```
 zrk [options] <url>
 
+  -t, --threads     <B>     Total number of threads to execute load (default 1)
   -c, --connections <N>     Total connections to keep open (default 10)
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
@@ -99,9 +100,6 @@ zrk [options] <url>
 
 Durations accept `us`, `ms`, `s`, `m`, `h` (a bare number is seconds).
 Short options may be attached (`-c100`) or separated (`-c 100`).
-
-Unlike wrk2 there is no `-t/--threads`: each connection runs on its own
-worker, so `-c` alone controls concurrency.
 
 ### Examples
 
@@ -261,8 +259,8 @@ behind the offered schedule — a companion to `rate_ratio` / `achieved_rate`.
   significant figures). Each connection owns its own histogram (lock-free hot
   path) and publishes a snapshot once per `--interval` for the dashboard; the
   final report aggregates all histograms after the run.
-- Connections run concurrently on Zig 0.16's `std.Io` (`Threaded` backend), one
-  connection per worker fiber/thread.
+- Connections run as coroutines on a [zio](https://github.com/lalinsky/zio)
+  io_uring runtime (`std.Io`-compatible), one connection per coroutine.
 
 ## Source layout
 
@@ -278,18 +276,9 @@ behind the offered schedule — a companion to `rate_ratio` / `achieved_rate`.
 | `src/tui.zig` | Live dashboard and final report. |
 | `src/main.zig` | Orchestration: resolve, launch connections, drive the dashboard. |
 
-## Limitations (v0)
+## Limitations (v1)
 
 - HTTP/1.1 only; a single fixed request per run (no scripting).
-- Concurrency is thread-per-connection on the `std.Io.Threaded` backend, since
-  the io_uring backend does not compile in the current Zig 0.16 toolchain. This
-  is fine for moderate connection counts.
-- **One request is in flight per connection**, so by Little's law a single
-  connection can sustain at most `1 / latency` req/s. To hit a target rate `R`
-  against a service with latency `L`, you need at least `R × L` connections
-  (e.g. 2000 req/s at 5 ms ⇒ ≥ 10 connections). Below that the client, not the
-  server, is the bottleneck; watch `rate_ratio` / `achieved_rate` in the JSON
-  report to confirm the offered load was actually delivered.
 - `--timeout` bounds the **wire attempt** from the actual send (a response that
   doesn't arrive in time is abandoned and counted as `Socket errors: ... timeout
   N`, matching wrk2). It does **not** bound coordinated-omission latency under

@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const Io = std.Io;
 
 const cli = @import("cli.zig");
@@ -10,26 +11,31 @@ const tui = @import("tui.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
     const argv = if (args.len > 1) args[1..] else args[0..0];
 
     const parsed = cli.parse(arena, argv) catch |err| {
-        try printUsageError(io, err);
+        try printUsageError(init.io, err);
         std.process.exit(2);
     };
     var cfg: cli.Config = switch (parsed) {
         .help => {
-            try writeAll(io, .stdout(), cli.usage);
+            try writeAll(init.io, .stdout(), cli.usage);
             return;
         },
         .version => {
-            try writeAll(io, .stdout(), "zrk " ++ cli.version ++ "\n");
+            try writeAll(init.io, .stdout(), "zrk " ++ cli.version ++ "\n");
             return;
         },
         .config => |c| c,
     };
+
+    const rt = try zio.Runtime.init(arena, .{
+        .executors = .exact(cfg.threads),
+    });
+    defer rt.deinit();
+    const io = rt.io();
 
     // Resolve `-b @FILE` / `-b @-` now that we have I/O; the runner only ever
     // sees `cfg.body` as raw bytes.

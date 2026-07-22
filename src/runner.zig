@@ -43,7 +43,7 @@ pub const ProgressFn = *const fn (
 ) void;
 
 /// Run one constant-throughput load test to completion. Blocks the
-/// calling thread (worker connections run on their own threads); returns
+/// calling thread (worker connections run on executor threads); returns
 /// after the configured duration with the final merged report.
 ///
 /// `frame_interval_ns` is the dashboard redraw cadence (0 = follow
@@ -114,8 +114,8 @@ pub fn run(
         .counters = undefined,
     });
 
-    // Launch each connection on its own thread. `concurrent` (unlike
-    // `async`) guarantees real parallelism on the Threaded backend.
+    // Launch each connection as a zio coroutine. `concurrent` (unlike
+    // `async`) guarantees real parallelism across executor threads.
     var group: Io.Group = .init;
     // If anything below fails, the workers must be stopped and joined before
     // this frame unwinds: they hold pointers to `stop` (this stack) and to
@@ -218,6 +218,7 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !net.IpAddress {
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+const zio = @import("zio");
 
 /// Consume one request's header lines through the terminating blank line.
 /// (Mirrors the fixture in connection.zig's tests.)
@@ -245,9 +246,9 @@ fn testServe(io: Io, server: *net.Server) void {
 }
 
 test "run's elapsed time tracks the duration, not the interval grid" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });

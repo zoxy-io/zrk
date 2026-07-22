@@ -145,6 +145,7 @@ pub const Fleet = struct {
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+const zio = @import("zio");
 
 test "fleet aggregates live counters and histograms" {
     var fleet = try Fleet.init(testing.allocator, 3, std.time.ns_per_s, false);
@@ -176,9 +177,9 @@ test "Fleet.init leaks nothing when any allocation fails" {
 }
 
 test "readSnapshot reflects published state" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false);
     defer fleet.deinit();
