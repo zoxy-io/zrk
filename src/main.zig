@@ -11,7 +11,9 @@ const tui = @import("tui.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const rt = try zio.Runtime.init(arena, .{});
+    const rt = try zio.Runtime.init(arena, .{
+        .executors = .exact(1), // TODO: restore threads flag for executors parameter
+    });
     defer rt.deinit();
     const io = rt.io();
 
