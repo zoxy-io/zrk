@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "build_info", .module = build_info_mod },
+            .{ .name = "zio", .module = zio.module("zio") },
         },
     });
 

@@ -218,6 +218,7 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !net.IpAddress {
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+const zio = @import("zio");
 
 /// Consume one request's header lines through the terminating blank line.
 /// (Mirrors the fixture in connection.zig's tests.)
@@ -245,9 +246,9 @@ fn testServe(io: Io, server: *net.Server) void {
 }
 
 test "run's elapsed time tracks the duration, not the interval grid" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });

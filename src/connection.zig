@@ -178,7 +178,7 @@ pub fn run(p: *Params) void {
 
     while (!p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds) {
         // (Re)connect.
-        var stream = connect(io, p.address) catch {
+        var stream = connect(io, p.address, p.timeout_ns) catch {
             noteError(p, .connect);
             // Back off briefly so a refused port doesn't spin the CPU.
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
@@ -408,16 +408,16 @@ fn maybePublish(p: *Params, now_ns: i128) void {
     }
 }
 
-fn connect(io: Io, address: net.IpAddress) !net.Stream {
-    // NOTE: connect-with-timeout is not implemented by the std Io backend in
-    // this Zig version (it panics), so the connect itself uses the OS default.
+fn connect(io: Io, address: net.IpAddress, timeout_ns: u64) !net.Stream {
     // The response timeout is enforced per-request by `watchTimer`.
-    return address.connect(io, .{ .mode = .stream });
+    const timeout: Io.Timeout = if (timeout_ns != 0) .{ .duration = .{ .raw = Io.Duration.fromNanoseconds(timeout_ns), .clock = .awake } } else .none;
+    return address.connect(io, .{ .mode = .stream, .timeout = timeout });
 }
 
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+const zio = @import("zio");
 
 /// A tiny keep-alive HTTP server used to exercise the real client path. Accepts
 /// a single connection (the client holds one keep-alive connection for the whole
@@ -453,9 +453,9 @@ fn serveConn(io: Io, stream: *net.Stream) void {
 }
 
 test "run drives keep-alive requests against a local server" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     // Bind to an ephemeral port on loopback.
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -524,9 +524,9 @@ fn headServe(io: Io, server: *net.Server) void {
 }
 
 test "run keeps HEAD responses framed despite Content-Length" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
@@ -605,9 +605,9 @@ fn delayServe(io: Io, server: *net.Server) void {
 }
 
 test "run reports timeouts against a non-responsive server" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
@@ -663,9 +663,9 @@ test "run reports timeouts against a non-responsive server" {
 }
 
 test "connect errors surface in the published snapshot during total outage" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     // Bind an ephemeral port, then close the listener so connects are refused.
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -709,9 +709,9 @@ test "connect errors surface in the published snapshot during total outage" {
 }
 
 test "run with record_timeouts disabled drops timed-out samples" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
@@ -754,9 +754,9 @@ test "run with record_timeouts disabled drops timed-out samples" {
 }
 
 test "deadline-abort fails stale in-flight requests without recording them" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
@@ -814,9 +814,9 @@ test "deadline-abort fails stale in-flight requests without recording them" {
 }
 
 test "default deadline sheds but never resets the connection in flight" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
@@ -880,9 +880,9 @@ test "default deadline sheds but never resets the connection in flight" {
 }
 
 test "deadline mode sheds backlog under overload and bounds the recorded tail" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
@@ -939,9 +939,9 @@ test "deadline mode sheds backlog under overload and bounds the recorded tail" {
 }
 
 test "a generous deadline never fires against a healthy server" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = try bind_addr.listen(io, .{ .reuse_address = true });
