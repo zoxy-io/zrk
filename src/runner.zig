@@ -43,7 +43,7 @@ pub const ProgressFn = *const fn (
 ) void;
 
 /// Run one constant-throughput load test to completion. Blocks the
-/// calling thread (worker connections run on their own threads); returns
+/// calling thread (worker connections run on executor threads); returns
 /// after the configured duration with the final merged report.
 ///
 /// `frame_interval_ns` is the dashboard redraw cadence (0 = follow

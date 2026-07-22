@@ -101,9 +101,6 @@ zrk [options] <url>
 Durations accept `us`, `ms`, `s`, `m`, `h` (a bare number is seconds).
 Short options may be attached (`-c100`) or separated (`-c 100`).
 
-Unlike wrk2 there is no `-t/--threads`: each connection runs on its own
-worker, so `-c` alone controls concurrency.
-
 ### Examples
 
 ```sh

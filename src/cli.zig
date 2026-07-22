@@ -686,11 +686,3 @@ test "rate parses scalar and ramp forms" {
     try testing.expectEqual(@as(?u64, 5000), attached.rate_end);
     try testing.expectError(error.ZeroRate, parse(a, &[_][]const u8{ "-R", "100:0", "http://x/" }));
 }
-
-test "removed threads flag is rejected as unknown" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try testing.expectError(error.UnknownFlag, parse(a, &[_][]const u8{ "-t", "8", "http://x.com/" }));
-    try testing.expectError(error.UnknownFlag, parse(a, &[_][]const u8{ "--threads", "8", "http://x.com/" }));
-}
