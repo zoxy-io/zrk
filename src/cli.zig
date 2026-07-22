@@ -187,7 +187,7 @@ pub const usage =
 ;
 
 /// Short options that take a value, so `-c100` can be split into `-c 100`.
-const value_short_opts = "cdRHmbo";
+const value_short_opts = "tcdRHmbo";
 
 /// Parse argv (excluding the program name). Header slices and the header array
 /// are allocated from `arena`; string values point into `args` (borrowed).
