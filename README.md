@@ -25,7 +25,19 @@ from the time it *should* have been sent. If the server stalls, backlogged
 requests accrue latency against their intended send time — the stall is
 captured, not smoothed away.
 
-## Build
+## Installation
+
+### Homebrew
+
+```sh
+brew install zoxy-io/tap/zrk
+```
+
+### Pre-built binary
+
+Download the latest release binary from the [Releases page](https://github.com/zoxy-io/zrk/releases).
+
+### Build from source
 
 Requires Zig 0.16.
 
