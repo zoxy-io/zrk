@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml)
 
-A constant-throughput HTTP load generator — a Zig 0.16 rewrite of
+A constant/linear throughput HTTP load generator — a Zig 0.16 rewrite of
 [wrk2](https://github.com/giltene/wrk2), with a **live in-terminal dashboard**
 of test progress.
 
@@ -15,7 +15,7 @@ Like wrk2, zrk generates load at a *fixed* request rate and reports latency
 aren't hidden when the server falls behind. Unlike wrk2, zrk continuously
 renders the latency percentile spectrum and a p99 sparkline while the test runs.
 
-## Why constant throughput + coordinated-omission correction?
+## Why coordinated-omission correction?
 
 An open-loop load tester that simply sends "as fast as the server answers"
 accidentally *coordinates* with the server: when the server stalls, the tester
