@@ -35,7 +35,7 @@ pub const Header = struct {
 };
 
 pub const Config = struct {
-    threads: u8 = 1,
+    threads: u8 = 2,
     connections: u32 = 10,
     /// Total test duration.
     duration_ns: u64 = 10 * std.time.ns_per_s,
@@ -139,7 +139,7 @@ pub const usage =
     \\Usage: zrk [options] <url>
     \\
     \\Options:
-    \\  -t, --threads     <N>     Total number of threads to execute load (default 1)
+    \\  -t, --threads     <N>     Total number of threads to execute load (default 2)
     \\  -c, --connections <N>     Total connections to keep open (default 10)
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
     \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps

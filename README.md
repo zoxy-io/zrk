@@ -52,7 +52,7 @@ zig build test            # run the unit + integration tests
 ```
 zrk [options] <url>
 
-  -t, --threads     <B>     Total number of threads to execute load (default 1)
+  -t, --threads     <B>     Total number of threads to execute load (default 2)
   -c, --connections <N>     Total connections to keep open (default 10)
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
