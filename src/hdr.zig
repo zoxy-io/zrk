@@ -666,6 +666,96 @@ test "percentiles on uniform 1..1000" {
     try testing.expect(h.valuesAreEquivalent(p100, 1000));
 }
 
+/// Independent percentile oracle over a *sorted* multiset of raw samples, using
+/// HdrHistogram's rank convention: rank = round(p/100 · N), floored to at least
+/// 1; the value at that percentile is the rank-th smallest sample. No bucketing
+/// is involved — this is the ground truth the histogram is checked against.
+fn referenceValueAtPercentile(sorted: []const u64, percentile: f64) u64 {
+    std.debug.assert(sorted.len > 0);
+    const n: f64 = @floatFromInt(sorted.len);
+    var rank: u64 = @intFromFloat(@round((std.math.clamp(percentile, 0.0, 100.0) / 100.0) * n));
+    if (rank == 0) rank = 1;
+    return sorted[@intCast(rank - 1)];
+}
+
+test "valueAtPercentile matches an independent oracle across the full range" {
+    // Cross-check the bucketed percentile query against a naive rank-in-a-sorted-
+    // array oracle. This must match *exactly* (bucket-equivalent) for any
+    // distribution: the rank-th smallest sample lies in some bucket B; every
+    // sample before it maps to a bucket <= B (so cumulative(B) >= rank) and every
+    // sample strictly below B's floor precedes it in sorted order (so
+    // cumulative(B-1) < rank), which is precisely the bucket valueAtPercentile
+    // selects. So this is deterministic, not a tolerance/statistical check.
+    var h = try newDefault();
+    defer h.deinit();
+
+    const n = 100_000;
+    const samples = try testing.allocator.alloc(u64, n);
+    defer testing.allocator.free(samples);
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+    const max_exp = std.math.log2(@as(f64, @floatFromInt(h.highest_trackable)));
+    for (samples) |*s| {
+        // Log-uniform over 1µs..1h so coarse high buckets and fine low buckets
+        // are both exercised, then clamp exactly as recordCount would.
+        const raw: u64 = @intFromFloat(std.math.pow(f64, 2, rand.float(f64) * max_exp));
+        const v = std.math.clamp(raw, h.lowest_discernible, h.highest_trackable);
+        s.* = v;
+        h.record(v);
+    }
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+
+    for ([_]f64{ 0, 0.001, 1, 10, 25, 50, 75, 90, 99, 99.9, 99.99, 100 }) |p| {
+        const got = h.valueAtPercentile(p);
+        const want = referenceValueAtPercentile(samples, p);
+        try testing.expect(h.valuesAreEquivalent(got, want));
+    }
+}
+
+test "valueAtPercentile: exact, precomputed values in the unit-resolution region" {
+    // Values small enough to each occupy their own unit-resolution sub-bucket,
+    // so the reported percentile value is exact — no bucket quantization. This
+    // pins the rank arithmetic (round(p/100 · N), min 1) and the cumulative walk
+    // to hand-verifiable numbers.
+    var h = try newDefault();
+    defer h.deinit();
+    h.recordCount(1, 50);
+    h.recordCount(2, 30);
+    h.recordCount(3, 20); // N=100; cumulative: value 1 -> 50, 2 -> 80, 3 -> 100
+
+    const cases = [_]struct { p: f64, v: u64 }{
+        .{ .p = 0, .v = 1 }, // rank floored to 1
+        .{ .p = 1, .v = 1 }, // rank 1
+        .{ .p = 50, .v = 1 }, // rank 50 == cumulative at value 1
+        .{ .p = 51, .v = 2 }, // rank 51 -> first bucket past 50
+        .{ .p = 80, .v = 2 }, // rank 80 == cumulative at value 2
+        .{ .p = 81, .v = 3 }, // rank 81 -> into value 3
+        .{ .p = 90, .v = 3 }, // rank 90
+        .{ .p = 100, .v = 3 }, // rank 100 == N
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.v, h.valueAtPercentile(c.p));
+    }
+}
+
+test "valueAtPercentile is monotonic non-decreasing in p" {
+    var h = try newDefault();
+    defer h.deinit();
+    var prng = std.Random.DefaultPrng.init(1);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) h.record(rand.intRangeAtMost(u64, 1, 2_000_000));
+
+    var p: f64 = 0;
+    var prev: u64 = 0;
+    while (p <= 100.0) : (p += 0.25) {
+        const v = h.valueAtPercentile(p);
+        try testing.expect(v >= prev);
+        prev = v;
+    }
+}
+
 test "high dynamic range: mix of small and huge values" {
     var h = try newDefault();
     defer h.deinit();
