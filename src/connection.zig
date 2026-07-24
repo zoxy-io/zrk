@@ -177,8 +177,19 @@ pub fn run(p: *Params) void {
     var send_index: u64 = 0;
 
     while (!p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds) {
-        // (Re)connect.
-        var stream = connect(io, p.address, p.timeout_ns) catch {
+        // (Re)connect, bounded by the time left in the run. A peer that accepts
+        // connections but never drains its listen backlog leaves connect()
+        // blocked in the TCP handshake; with no wire timeout that wait is the
+        // OS connect timeout (seconds to minutes), which would drag the run far
+        // past `end`. Cap it at the shorter of the wire timeout and the time
+        // remaining so the loop can always re-evaluate `end`.
+        const connect_remaining_ns = p.end.nanoseconds - now(io).nanoseconds;
+        if (connect_remaining_ns <= 0) return;
+        const connect_timeout_ns = deadlineBoundedTimeout(p.timeout_ns, @intCast(connect_remaining_ns));
+        var stream = connect(io, p.address, connect_timeout_ns) catch {
+            // A connect cut off by the run's own end deadline is a teardown
+            // artifact, not a target failure — don't count it as a connect error.
+            if (now(io).nanoseconds >= p.end.nanoseconds) return;
             noteError(p, .connect);
             // Back off briefly so a refused port doesn't spin the CPU.
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
@@ -406,6 +417,15 @@ fn maybePublish(p: *Params, now_ns: i128) void {
         p.histogram.copyInto(pub_ptr.hist);
         pub_ptr.next_ns = now_ns + @as(i128, @intCast(pub_ptr.interval_ns));
     }
+}
+
+/// The connect timeout to apply: the shorter of the per-request wire timeout
+/// (`0` = none) and the time left until the run's `end`. Always nonzero given a
+/// positive `remaining_ns`, so connect can never outlast the test even when no
+/// wire timeout is configured.
+fn deadlineBoundedTimeout(wire_timeout_ns: u64, remaining_ns: u64) u64 {
+    if (wire_timeout_ns != 0 and wire_timeout_ns < remaining_ns) return wire_timeout_ns;
+    return remaining_ns;
 }
 
 fn connect(io: Io, address: net.IpAddress, timeout_ns: u64) !net.Stream {
