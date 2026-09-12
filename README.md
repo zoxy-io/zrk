@@ -104,9 +104,7 @@ Options:
       --http2               Speak HTTP/2. Cleartext uses prior knowledge
                             (h2c); https negotiates it over ALPN and
                             fails the connection if the server declines
-      --http3               Speak HTTP/3 over QUIC (https only).
-                            Prototype: the QUIC TLS engine does not
-                            verify certificates yet, so it requires -k
+      --http3               Speak HTTP/3 over QUIC (https only)
   -k, --insecure            Skip TLS certificate verification
       --plain               Append-only output instead of a live dashboard
 
@@ -184,18 +182,12 @@ zrk -c50 -R1000 -d5m --timeseries - http://127.0.0.1:8080/ \
 ([#74](https://github.com/zoxy-io/zrk/issues/74)). It works, and the latency it
 reports means what every other transport's does — the coordinated-omission
 correction, `--deadline` shedding and the backlog gauge are the same code
-reading the same clock — but two things are worth knowing before quoting a
-number from it:
+reading the same clock. Certificates are verified the same way too: `tls.Trust`
+builds the chain to a system anchor and matches the name for all three
+transports, so `-k/--insecure` is an opt-out here exactly as it is elsewhere.
 
-- **It does not verify certificates**, so it requires `-k/--insecure` rather
-  than letting a run believe otherwise. QUIC needs a TLS engine that speaks RFC
-  9001's handshake rather than a record layer, and zssl declines QUIC, so this
-  path uses its own small client (`src/quic_tls.zig`) which parses the
-  certificate chain only far enough to keep the transcript honest. Deliberate
-  rather than pending: a load generator is pointed at a target its operator
-  chose. HTTP/1.1 and HTTP/2 still verify by default, and `-k` there is still
-  opt-in, so the case where that is not enough is covered on the transports
-  that can cover it.
+One thing is worth knowing before quoting a number from it:
+
 - **One datagram per syscall on the way out.** Reads are batched — Linux
   generic receive offload collapses a burst into one read, worth about 40%
   against a server that segments — but sends are not. That was measured rather
@@ -203,7 +195,8 @@ number from it:
   around 2% on a send-heavy workload and slightly negative on a receive-heavy
   one, because a QUIC client's egress is 60-to-70-octet packets and send
   syscalls are not what bounds this.
-  [#76](https://github.com/zoxy-io/zrk/issues/76) has the numbers.
+  [#83](https://github.com/zoxy-io/zrk/issues/83) revisits it for a path with
+  real latency, which is the one case that could change the answer.
 
 Everything else carries over: `--closed`, ramps, `--timeseries`, the JSON
 summary and the CI gates all work unchanged.

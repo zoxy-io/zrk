@@ -36,11 +36,6 @@
 //!
 //! ## What a prototype does not have yet
 //!
-//! * **No certificate verification.** `quic_tls.zig` says why, and `cli.zig`
-//!   makes `--http3` require `--insecure` so no run can believe otherwise.
-//!   Accepted rather than outstanding: a load generator is pointed at a target
-//!   its operator chose, and the other two transports keep verification on by
-//!   default for the case where that is not enough.
 //! * **One datagram per syscall on the way out.** `flush` calls `socket.send`
 //!   once per datagram. The way *in* is batched — see `enableOffload` — but
 //!   the two are duals and only one of them is done: segmentation offload on
@@ -86,6 +81,7 @@ const quic = h3.quic;
 const cli = @import("cli.zig");
 const conn = @import("connection.zig");
 const httpmod = @import("http.zig");
+const tlsmod = @import("tls.zig");
 const quic_tls = @import("quic_tls.zig");
 
 /// Request streams this endpoint tracks at once, which is the ceiling on
@@ -305,6 +301,11 @@ pub const State = struct {
 
     datagram: [Connection.datagram_octets]u8 = undefined,
     incoming: [receive_octets]u8 = undefined,
+    /// zrk's trust decision, held here rather than on `begin`'s frame because
+    /// the verifier is reached later — from inside `pumpCrypto`, when the
+    /// peer's chain arrives — and the callback holds a pointer to it.
+    trust: tlsmod.Trust = undefined,
+
     /// Where the kernel writes the control messages that came with a read.
     ///
     /// Aligned rather than merely sized: the first thing done with it is to
@@ -736,6 +737,17 @@ fn begin(p: *conn.Params, state: *State) bool {
         return false;
     };
 
+    // The same trust decision the other two transports make, reached through
+    // the same code: `--insecure` or a missing store is a null bundle, which
+    // `Trust` answers yes to, and anything else builds the chain to a system
+    // anchor and matches the name. Reset per attempt because `failed` is a
+    // record of the last one.
+    state.trust = .{
+        .io = io,
+        .bundle = if (p.insecure) null else if (p.ca_store) |store| &store.bundle else null,
+        .host = p.host,
+    };
+
     state.client = .init(.{
         .server_name = p.host,
         .alpn = "h3",
@@ -743,6 +755,12 @@ fn begin(p: *conn.Params, state: *State) bool {
         .offer = &offered_suites,
         .random = seed[0..32].*,
         .key_seed = seed[32..64].*,
+        // Null only when there is nothing to check against, which is what
+        // `--insecure` means and the one thing that means it.
+        .chain_verifier = if (state.trust.bundle == null) null else .{
+            .context = &state.trust,
+            .verify = tlsmod.Trust.verifyList,
+        },
     });
 
     var hello: [2048]u8 = undefined;

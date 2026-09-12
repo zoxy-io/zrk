@@ -467,18 +467,33 @@ pub const State = struct {
 /// peer's chain while its bytes are still live and takes a yes or no. The
 /// reason for the failure is kept here because the callback can only answer
 /// with a bool, and "which certificate error" is worth reporting.
-const Trust = struct {
+///
+/// Public because it serves **both** of zrk's TLS engines. QUIC needs a
+/// handshake zssl declines to do, so `quic_tls.zig` is a second engine — but
+/// "does zrk trust this chain" is the same question with the same answer, and
+/// a second copy of it is the last thing a trust decision should have.
+/// `verifyList` is the entry point that engine reaches, and it differs from
+/// the one below only in taking the `certificate_list` octets rather than
+/// zssl's view of them.
+pub const Trust = struct {
     io: Io,
     /// null when this connection verifies nothing (`-k`, or no trust store).
     bundle: ?*const Certificate.Bundle,
     host: []const u8,
     failed: bool = false,
 
-    fn verifier(self: *Trust) zssl.ClientHandshake.ChainVerifier {
+    pub fn verifier(self: *Trust) zssl.ClientHandshake.ChainVerifier {
         return .{ .context = self, .verify = Trust.verify };
     }
 
-    fn verify(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
+    /// The same decision, for a caller holding the `certificate_list` field's
+    /// octets rather than a zssl wrapper over them — which is what
+    /// `CertificateList` is, so this is the wrapper and nothing else.
+    pub fn verifyList(context: *anyopaque, list: []const u8) bool {
+        return Trust.verify(context, .init(list));
+    }
+
+    pub fn verify(context: *anyopaque, chain: zssl.certificate_list.CertificateList) bool {
         const self: *Trust = @ptrCast(@alignCast(context));
         const bundle = self.bundle orelse return true;
         verifyChain(bundle, chain, self.host, self.io) catch {

@@ -116,12 +116,11 @@ pub fn run(
     // Load the system trust store once (shared, read-mostly) for HTTPS
     // with verification enabled.
     //
-    // Not for `--http3`: that path terminates TLS through `quic_tls.zig`,
-    // which does not verify certificates at all — which is why `cli.zig`
-    // requires `--insecure` for it, so this branch is unreachable there rather
-    // than merely unused.
+    // `--http3` included: it terminates TLS through `quic_tls.zig` rather than
+    // zssl, but the trust decision is the same one — `tls.Trust` serves both
+    // engines — so the store it reads has to be loaded for both.
     var ca_store: ?tlsmod.CaStore = null;
-    if (cfg.url.isTls() and !cfg.insecure and !cfg.http3) {
+    if (cfg.url.isTls() and !cfg.insecure) {
         ca_store = try tlsmod.CaStore.load(arena, io);
     }
     const ca_ptr: ?*tlsmod.CaStore = if (ca_store) |*c| c else null;
