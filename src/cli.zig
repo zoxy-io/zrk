@@ -130,9 +130,9 @@ pub const Config = struct {
     /// and is bounded by `h3conn.requests_max` rather than by
     /// `connection.streams_max`.
     ///
-    /// A prototype (zoxy-io/zrk#74). It requires `--insecure` because the QUIC
-    /// TLS engine does not verify certificates yet; see `src/quic_tls.zig` for
-    /// what is missing and how much of it there is.
+    /// Certificates are verified exactly as they are on the other two
+    /// transports — `tls.Trust` is one implementation serving both engines —
+    /// so `-k` is an opt-out here and not a requirement.
     http3: bool = false,
     /// How many of a connection's scheduled sends may be on the wire at once
     /// (`-s/--streams`). Requires `--http2` or `--http3`.
@@ -208,7 +208,6 @@ pub const ParseError = error{
     TooManyStreams,
     Http3WithHttp2,
     Http3WithoutTls,
-    Http3WithoutInsecure,
     Http3BodyTooLarge,
     OutOfMemory,
 };
@@ -278,9 +277,7 @@ pub const usage =
     \\      --http2               Speak HTTP/2. Cleartext uses prior knowledge
     \\                            (h2c); https negotiates it over ALPN and
     \\                            fails the connection if the server declines
-    \\      --http3               Speak HTTP/3 over QUIC (https only).
-    \\                            Prototype: the QUIC TLS engine does not
-    \\                            verify certificates yet, so it requires -k
+    \\      --http3               Speak HTTP/3 over QUIC (https only)
     \\  -k, --insecure            Skip TLS certificate verification
     \\      --plain               Append-only output instead of a live dashboard
     \\
@@ -468,10 +465,6 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         // or not at all, so an `http://` target is a request this transport
         // cannot answer rather than one it declines to.
         if (!cfg.url.isTls()) return error.Http3WithoutTls;
-        // The prototype's one hard gate. `quic_tls.zig` proves the peer speaks
-        // QUIC, not who it is, and a load generator that silently skipped
-        // verification would be a worse thing than one that says so.
-        if (!cfg.insecure) return error.Http3WithoutInsecure;
         // The request has to fit one `Connection.write`, because a short write
         // is a failed request rather than one this file resumes. Checked here,
         // against the real bound, so an oversized `--body` is a usage error
@@ -758,7 +751,7 @@ test "streams flag parses; requires --http2 and a sane depth" {
     try testing.expectEqual(@as(u32, 4), with_closed.streams);
 }
 
-test "http3 parses, and its three preconditions are usage errors" {
+test "http3 parses, and its two preconditions are usage errors" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -773,8 +766,15 @@ test "http3 parses, and its three preconditions are usage errors" {
     // QUIC has no cleartext mode, so an http:// target is refused rather than
     // silently downgraded.
     try testing.expectError(error.Http3WithoutTls, parse(a, &[_][]const u8{ "--http3", "-k", "http://x/" }));
-    // The prototype's certificate gap, made impossible to run into unknowingly.
-    try testing.expectError(error.Http3WithoutInsecure, parse(a, &[_][]const u8{ "--http3", "https://x/" }));
+
+    // And certificates are verified by default, as they are on the other two
+    // transports. `--http3` used to *require* `-k`, because its TLS engine
+    // checked nothing; it does now, so `-k` is an opt-out here and asking for
+    // HTTP/3 without it is an ordinary verified run rather than a usage error.
+    const verified = (try parse(a, &[_][]const u8{ "--http3", "https://x/" })).config;
+    try testing.expect(verified.http3);
+    try testing.expect(!verified.insecure);
+
     // One wire format per run.
     try testing.expectError(error.Http3WithHttp2, parse(a, &[_][]const u8{ "--http3", "--http2", "-k", "https://x/" }));
 }

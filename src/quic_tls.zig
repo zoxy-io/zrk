@@ -18,22 +18,27 @@
 //! than in h3 because h3's `paths` ships `src/` only: `interop/` is that
 //! package's test harness, deliberately not part of its library.
 //!
-//! ## What it does not do, and what that costs
+//! ## What it does and does not check
 //!
-//! **It does not verify certificates.** It parses `Certificate` and
-//! `CertificateVerify` far enough to keep the transcript hash correct and then
-//! ignores both. In the interop runner that was the test bed's contract — a
-//! throwaway CA per run, every client configured to trust anything. Here it is
-//! a gap, and `cli.zig` names it: `--http3` requires `--insecure`, so a run
-//! cannot silently believe it authenticated a peer it did not.
+//! **It verifies certificates**, through the same decision the other two
+//! transports make: `tls.Trust` builds the chain to a system anchor and
+//! matches the name, and it is reached from here by the same callback zssl
+//! reaches it by. One implementation of "does zrk trust this chain", two TLS
+//! engines — because a second copy of a trust decision is the last thing a
+//! trust decision should have.
 //!
-//! Closing it is a known, bounded piece of work rather than a research
-//! problem. `Client.read` already walks the `Certificate` message's DER
-//! entries to hash them; `src/tls.zig`'s `verifyChain` already builds a chain
-//! to a system anchor and matches the hostname over `std.crypto.Certificate`.
-//! What is missing is the wiring between them, plus checking the
-//! `CertificateVerify` signature over RFC 8446 §4.4.3's context string. Until
-//! that lands, this engine proves the peer speaks QUIC, not who it is.
+//! What is written here rather than borrowed is RFC 8446 §4.4.3's
+//! `CertificateVerify`: the peer signing the transcript through `Certificate`
+//! under a context string, checked against the leaf's own key. That is the
+//! half a chain cannot give you — without it the chain says only that
+//! *somebody* was issued a certificate for the name, and anyone able to reach
+//! the client could replay one they do not hold the key for. The five schemes
+//! `clientHello` offers are the five it verifies, and a scheme that disagrees
+//! with the key the leaf actually carries is refused before any verifier sees
+//! the bytes.
+//!
+//! `--insecure` is the only thing that turns any of this off, and it does so
+//! by handing this file no verifier at all.
 //!
 //! **It offers only SHA-256 suites** — `TLS_AES_128_GCM_SHA256` and
 //! `TLS_CHACHA20_POLY1305_SHA256` — because the key schedule below is written
@@ -67,6 +72,7 @@ const std = @import("std");
 
 const h3 = @import("h3");
 
+const Certificate = std.crypto.Certificate;
 const Hash = std.crypto.hash.sha2.Sha256;
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -156,7 +162,40 @@ pub const Error = error{
     /// RFC 9001 section 8.2: no `quic_transport_parameters` extension. Likewise
     /// its own alert.
     MissingExtension,
+    /// The peer's certificate chain did not parse, or the embedder's verifier
+    /// refused it: it did not build to a trusted anchor, or the leaf did not
+    /// match the name that was asked for.
+    BadCertificate,
+    /// RFC 8446 section 4.4.3's `CertificateVerify` did not check out against
+    /// the leaf's public key — so whoever is on the other end does not hold the
+    /// key the certificate names, whatever the chain said.
+    BadSignature,
 };
+
+/// The embedder's half of the trust decision, shown the peer's chain while its
+/// octets are still live and asked for a yes or a no.
+///
+/// The same shape `zssl.ClientHandshake.ChainVerifier` has, deliberately, so
+/// that one implementation of "does zrk trust this chain" serves both of zrk's
+/// TLS engines — see `tls.Trust`. It crosses as the `certificate_list` field's
+/// raw octets rather than as a zssl type, because a file that exists because
+/// zssl does not do QUIC should not import zssl to describe its arguments.
+pub const ChainVerifier = struct {
+    context: *anyopaque,
+    /// Every `CertificateEntry`, with the enclosing u24 length already
+    /// stripped. Leaf first, in the order RFC 8446 section 4.4.2 fixes.
+    verify: *const fn (context: *anyopaque, list: []const u8) bool,
+};
+
+/// The largest leaf public key this client will hold, matching the bound
+/// `std.crypto.tls.Client` uses for the same job: the key has to outlive the
+/// chain, because `CertificateVerify` arrives a message after the octets it
+/// came in have gone.
+const leaf_key_octets: usize = 600;
+
+/// RFC 8446 section 4.4.3: what a server's `CertificateVerify` signs, ahead of
+/// the transcript hash.
+const certificate_verify_context = [_]u8{0x20} ** 64 ++ "TLS 1.3, server CertificateVerify" ++ [_]u8{0};
 
 /// A traffic secret to hand to `Connection.installSecret`, held until the
 /// caller drains it. An array rather than an event queue with slices in it:
@@ -192,6 +231,14 @@ pub const Options = struct {
     /// is a handshake nothing can debug.
     random: [32]u8,
     key_seed: [32]u8,
+    /// Who decides whether the peer's chain is trusted, or null to check
+    /// neither the chain nor the leaf's signature.
+    ///
+    /// Null is what `--insecure` means, and it is the *only* thing that means
+    /// it: with a verifier present this client refuses a chain the verifier
+    /// declines and a `CertificateVerify` that does not check out, so a run
+    /// cannot end up unauthenticated by accident.
+    chain_verifier: ?ChainVerifier = null,
 };
 
 pub const Client = struct {
@@ -247,6 +294,17 @@ pub const Client = struct {
     peer_parameters_len: u16 = 0,
     peer_parameters_seen: bool = false,
 
+    /// Who answers for the chain, and the leaf's key kept back from it.
+    ///
+    /// The key is copied rather than borrowed because `CertificateVerify`
+    /// arrives a message after `Certificate`, and by then the octets the chain
+    /// came in have been consumed: `read` is handed a view of the connection's
+    /// crypto buffer, which the caller reclaims as soon as it returns.
+    chain_verifier: ?ChainVerifier = null,
+    leaf_algo: Certificate.AlgorithmCategory = .rsaEncryption,
+    leaf_key: [leaf_key_octets]u8 = @splat(0),
+    leaf_key_len: u16 = 0,
+
     pub fn init(options: Options) Client {
         return .{
             .random = options.random,
@@ -256,6 +314,7 @@ pub const Client = struct {
             .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed) catch unreachable,
             .server_name = options.server_name,
             .alpn = options.alpn,
+            .chain_verifier = options.chain_verifier,
             .transport_parameters = options.transport_parameters,
             .offer = options.offer,
         };
@@ -439,14 +498,18 @@ pub const Client = struct {
             .certificate => {
                 if (level != .handshake) return error.Unsupported;
                 if (self.state != .wait_certificate) return error.Unsupported;
-                // Hashed and not read. See the module comment: the runner's CA
-                // is generated per run and every client in it trusts anything.
+                try self.certificate(whole[4..]);
                 self.transcript.update(whole);
                 self.state = .wait_certificate_verify;
             },
             .certificate_verify => {
                 if (level != .handshake) return error.Unsupported;
                 if (self.state != .wait_certificate_verify) return error.Unsupported;
+                // Before the transcript takes this message, and that ordering
+                // is the whole of it: section 4.4.3 signs the transcript
+                // through `Certificate` and not through this. Updating first
+                // would verify against a hash the server never computed.
+                if (self.chain_verifier != null) try self.certificateVerify(whole[4..]);
                 self.transcript.update(whole);
                 self.state = .wait_finished;
             },
@@ -641,6 +704,82 @@ pub const Client = struct {
     }
 
     /// Secrets produced since the last call, and none of them again.
+    /// RFC 8446 section 4.4.2's `Certificate`: a request context nobody sends
+    /// for a server certificate, then the chain.
+    ///
+    /// Two things come out of it. The chain goes to the embedder's verifier
+    /// while its octets are still live — chain building and name matching are
+    /// not this file's job and are already written once, for the other engine.
+    /// The leaf's public key is copied out, because it is what checks the
+    /// signature that arrives in the next message.
+    fn certificate(self: *Client, body: []const u8) Error!void {
+        if (body.len < 1) return error.Malformed;
+        const context_octets: usize = body[0];
+        if (body.len - 1 < context_octets + 3) return error.Malformed;
+        const at = 1 + context_octets;
+        const list_octets = readInt(u24, body[at..][0..3]);
+        if (body.len - at - 3 < list_octets) return error.Malformed;
+        const list = body[at + 3 ..][0..list_octets];
+
+        // Section 4.4.2: the sender's certificate comes first, and it is the
+        // one the signature below has to belong to.
+        if (list.len < 3) return error.BadCertificate;
+        const leaf_octets = readInt(u24, list[0..3]);
+        if (leaf_octets == 0 or list.len - 3 < leaf_octets) return error.BadCertificate;
+        const leaf: Certificate = .{ .buffer = list[3..][0..leaf_octets], .index = 0 };
+        const parsed = leaf.parse() catch return error.BadCertificate;
+        const key = parsed.pubKey();
+        if (key.len > self.leaf_key.len) return error.BadCertificate;
+        @memcpy(self.leaf_key[0..key.len], key);
+        self.leaf_key_len = @intCast(key.len);
+        self.leaf_algo = parsed.pub_key_algo;
+
+        const verifier = self.chain_verifier orelse return;
+        if (!verifier.verify(verifier.context, list)) return error.BadCertificate;
+    }
+
+    /// RFC 8446 section 4.4.3: the peer proves it holds the key its leaf names,
+    /// by signing the transcript through `Certificate` under a context string.
+    ///
+    /// Without this the chain says only that *somebody* was issued a
+    /// certificate for the name — anyone who can reach the client could replay
+    /// a chain they do not hold the key for.
+    fn certificateVerify(self: *Client, body: []const u8) Error!void {
+        if (body.len < 4) return error.Malformed;
+        const scheme = readInt(u16, body[0..2]);
+        const signature_octets = readInt(u16, body[2..4]);
+        if (body.len - 4 < signature_octets) return error.Malformed;
+        const signature = body[4..][0..signature_octets];
+
+        // The hash through `Certificate`, which is why this runs before the
+        // transcript takes the message carrying it.
+        var digest: [Hash.digest_length]u8 = undefined;
+        var through_certificate = self.transcript;
+        through_certificate.final(&digest);
+        const signed = [_][]const u8{ certificate_verify_context, &digest };
+
+        const key = self.leaf_key[0..self.leaf_key_len];
+        if (key.len == 0) return error.BadCertificate;
+
+        // The scheme has to agree with the key the leaf actually carries, or a
+        // peer could name a scheme whose verifier is happier with its bytes.
+        switch (scheme) {
+            0x0403, 0x0503 => if (self.leaf_algo != .X9_62_id_ecPublicKey) return error.BadSignature,
+            0x0804, 0x0805, 0x0806 => if (self.leaf_algo != .rsaEncryption) return error.BadSignature,
+            else => return error.Unsupported,
+        }
+        switch (scheme) {
+            0x0403 => try verifyEcdsa(std.crypto.sign.ecdsa.EcdsaP256Sha256, key, signature, &signed),
+            0x0503 => try verifyEcdsa(std.crypto.sign.ecdsa.EcdsaP384Sha384, key, signature, &signed),
+            0x0804 => try verifyRsaPss(std.crypto.hash.sha2.Sha256, key, signature, &signed),
+            0x0805 => try verifyRsaPss(std.crypto.hash.sha2.Sha384, key, signature, &signed),
+            0x0806 => try verifyRsaPss(std.crypto.hash.sha2.Sha512, key, signature, &signed),
+            // Unreachable: the switch above already refused anything else, and
+            // `clientHello` offers exactly these five.
+            else => return error.Unsupported,
+        }
+    }
+
     pub fn drainInstalls(self: *Client) []const Install {
         const out = self.installs[0..self.installs_len];
         self.installs_len = 0;
@@ -810,6 +949,145 @@ const Reader = struct {
 
 const testing = std.testing;
 
+const test_leaf_der = @embedFile("testdata/leaf.der");
+
+fn testClient(verifier: ?ChainVerifier) Client {
+    return .init(.{
+        .server_name = "zrk.test",
+        .alpn = "h3",
+        .transport_parameters = &.{},
+        .offer = &.{.aes_128_gcm_sha256},
+        .random = @splat(0),
+        .key_seed = @splat(1),
+        .chain_verifier = verifier,
+    });
+}
+
+/// A `Certificate` message body — the part after the four-octet handshake
+/// header — carrying `leaf` as its only entry.
+fn testCertificateBody(buffer: []u8, leaf: []const u8) []const u8 {
+    var at: usize = 0;
+    buffer[at] = 0; // empty certificate_request_context
+    at += 1;
+    writeInt(u24, buffer[at..][0..3], @intCast(3 + leaf.len + 2));
+    at += 3;
+    writeInt(u24, buffer[at..][0..3], @intCast(leaf.len));
+    at += 3;
+    @memcpy(buffer[at..][0..leaf.len], leaf);
+    at += leaf.len;
+    writeInt(u16, buffer[at..][0..2], 0); // no extensions
+    at += 2;
+    return buffer[0..at];
+}
+
+test "a Certificate message keeps the leaf's key and shows the chain to the verifier" {
+    const Seen = struct {
+        var octets: usize = 0;
+        fn verify(_: *anyopaque, list: []const u8) bool {
+            octets = list.len;
+            return true;
+        }
+    };
+    Seen.octets = 0;
+    var anchor_value: u8 = 0;
+    var client = testClient(.{ .context = &anchor_value, .verify = Seen.verify });
+
+    var buffer: [4096]u8 = undefined;
+    const body = testCertificateBody(&buffer, test_leaf_der);
+    try client.certificate(body);
+
+    // The key outlives the chain, which is the point of copying it.
+    try testing.expect(client.leaf_key_len > 0);
+    try testing.expectEqual(Certificate.AlgorithmCategory.X9_62_id_ecPublicKey, client.leaf_algo);
+    // And the verifier saw the whole `certificate_list`, entry framing
+    // included — which is the shape `Trust.verifyList` hands to zssl's reader.
+    try testing.expectEqual(@as(usize, 3 + test_leaf_der.len + 2), Seen.octets);
+}
+
+test "a verifier that says no is a refused chain" {
+    const Refuse = struct {
+        fn verify(_: *anyopaque, _: []const u8) bool {
+            return false;
+        }
+    };
+    var anchor_value: u8 = 0;
+    var client = testClient(.{ .context = &anchor_value, .verify = Refuse.verify });
+
+    var buffer: [4096]u8 = undefined;
+    const body = testCertificateBody(&buffer, test_leaf_der);
+    try testing.expectError(error.BadCertificate, client.certificate(body));
+}
+
+test "a Certificate message whose lengths do not fit is refused, not read past" {
+    var client = testClient(null);
+    var buffer: [4096]u8 = undefined;
+    const body = testCertificateBody(&buffer, test_leaf_der);
+
+    // Nothing at all, and a context length with no room for the list after it.
+    try testing.expectError(error.Malformed, client.certificate(&.{}));
+    try testing.expectError(error.Malformed, client.certificate(body[0..2]));
+
+    // A `certificate_list` length that runs past the message.
+    var overlong: [4096]u8 = undefined;
+    @memcpy(overlong[0..body.len], body);
+    writeInt(u24, overlong[1..][0..3], @intCast(body.len + 64));
+    try testing.expectError(error.Malformed, client.certificate(overlong[0..body.len]));
+
+    // An entry length that runs past the list.
+    @memcpy(overlong[0..body.len], body);
+    writeInt(u24, overlong[4..][0..3], @intCast(test_leaf_der.len + 64));
+    try testing.expectError(error.BadCertificate, client.certificate(overlong[0..body.len]));
+
+    // An empty leaf, which section 4.4.2 does not permit and `parse` would
+    // otherwise be asked to make sense of.
+    var empty: [16]u8 = @splat(0);
+    writeInt(u24, empty[1..][0..3], 5);
+    writeInt(u24, empty[4..][0..3], 0);
+    try testing.expectError(error.BadCertificate, client.certificate(empty[0..9]));
+}
+
+test "a CertificateVerify is refused unless it matches the key the leaf carried" {
+    var anchor_value: u8 = 0;
+    const Accept = struct {
+        fn verify(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var client = testClient(.{ .context = &anchor_value, .verify = Accept.verify });
+
+    var buffer: [4096]u8 = undefined;
+    try client.certificate(testCertificateBody(&buffer, test_leaf_der));
+    // The fixture is a P-256 leaf, so ECDSA schemes are the ones that agree
+    // with it.
+    try testing.expectEqual(Certificate.AlgorithmCategory.X9_62_id_ecPublicKey, client.leaf_algo);
+
+    var body: [128]u8 = @splat(0);
+
+    // Too short to carry a scheme and a length at all.
+    try testing.expectError(error.Malformed, client.certificateVerify(body[0..3]));
+
+    // A signature length running past the message: refused rather than sliced.
+    writeInt(u16, body[0..2], 0x0403);
+    writeInt(u16, body[2..4], 64);
+    try testing.expectError(error.Malformed, client.certificateVerify(body[0..8]));
+
+    // An RSA scheme against an EC key. Without this check a peer could name
+    // whichever verifier is happiest with the bytes it has.
+    writeInt(u16, body[0..2], 0x0804);
+    writeInt(u16, body[2..4], 8);
+    try testing.expectError(error.BadSignature, client.certificateVerify(body[0..12]));
+
+    // A scheme this client never offered.
+    writeInt(u16, body[0..2], 0x0201); // rsa_pkcs1_sha1
+    writeInt(u16, body[2..4], 8);
+    try testing.expectError(error.Unsupported, client.certificateVerify(body[0..12]));
+
+    // And a well-formed ECDSA signature that is simply not the right one.
+    writeInt(u16, body[0..2], 0x0403);
+    writeInt(u16, body[2..4], 8);
+    try testing.expectError(error.BadSignature, client.certificateVerify(body[0..12]));
+}
+
 test "the ClientHello parses as one handshake message of the length it declares" {
     var buffer: [1024]u8 = undefined;
     var client: Client = .init(.{
@@ -931,6 +1209,49 @@ test "expandLabel reproduces RFC 8448's derived secret" {
         0xeb, 0xea, 0xc3, 0x57, 0x6c, 0x36, 0x11, 0xba,
     };
     try testing.expectEqualSlices(u8, &derived_expected, &derived);
+}
+
+/// One ECDSA signature, over the parts in order.
+fn verifyEcdsa(
+    comptime Scheme: type,
+    key: []const u8,
+    signature: []const u8,
+    parts: []const []const u8,
+) Error!void {
+    const parsed = Scheme.Signature.fromDer(signature) catch return error.BadSignature;
+    const public = Scheme.PublicKey.fromSec1(key) catch return error.BadSignature;
+    var verifier = parsed.verifier(public) catch return error.BadSignature;
+    // Bounded by `parts`, which is two.
+    for (parts) |part| verifier.update(part);
+    verifier.verify() catch return error.BadSignature;
+}
+
+/// One RSA-PSS signature, over the parts in order.
+///
+/// The modulus length is switched over rather than passed, because
+/// `Certificate.rsa` is generic in it: the four cases are 1024 through 4096
+/// bits, and a key outside them is refused rather than verified by some other
+/// size's arithmetic.
+fn verifyRsaPss(
+    comptime H: type,
+    key: []const u8,
+    signature: []const u8,
+    parts: []const []const u8,
+) Error!void {
+    const rsa = Certificate.rsa;
+    const components = rsa.PublicKey.parseDer(key) catch return error.BadSignature;
+    switch (components.modulus.len) {
+        inline 128, 256, 384, 512 => |modulus_octets| {
+            const public: rsa.PublicKey = rsa.PublicKey.fromBytes(
+                components.exponent,
+                components.modulus,
+            ) catch return error.BadSignature;
+            const parsed = rsa.PSSSignature.fromBytes(modulus_octets, signature);
+            rsa.PSSSignature.concatVerify(modulus_octets, parsed, parts, public, H) catch
+                return error.BadSignature;
+        },
+        else => return error.BadSignature,
+    }
 }
 
 /// `Derive-Secret(secret, label, Messages)` over a transcript, shared by both
