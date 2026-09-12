@@ -1,6 +1,6 @@
 .{
     .name = .zrk,
-    .version = "3.0.0-alpha.1",
+    .version = "3.0.0-alpha.2",
     .fingerprint = 0x614e97303b45a75a, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
