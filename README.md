@@ -196,14 +196,14 @@ number from it:
   chose. HTTP/1.1 and HTTP/2 still verify by default, and `-k` there is still
   opt-in, so the case where that is not enough is covered on the transports
   that can cover it.
-- **One datagram per syscall on the way out.** Reads are batched where the
-  kernel and the peer allow it — Linux generic receive offload, which collapses
-  a burst into one read — but sends are not, and that is the half that bounds
-  throughput per core. It is not a plumbing problem: offload only batches
-  datagrams of equal size, a QUIC client's egress is small request packets whose
-  lengths jitter, and making the runs long means padding traffic that zrk is
-  supposed to be measuring rather than generating.
-  [#76](https://github.com/zoxy-io/zrk/issues/76) carries the argument.
+- **One datagram per syscall on the way out.** Reads are batched — Linux
+  generic receive offload collapses a burst into one read, worth about 40%
+  against a server that segments — but sends are not. That was measured rather
+  than assumed, and the measurement said not to bother: batching them is worth
+  around 2% on a send-heavy workload and slightly negative on a receive-heavy
+  one, because a QUIC client's egress is 60-to-70-octet packets and send
+  syscalls are not what bounds this.
+  [#76](https://github.com/zoxy-io/zrk/issues/76) has the numbers.
 
 Everything else carries over: `--closed`, ramps, `--timeseries`, the JSON
 summary and the CI gates all work unchanged.
