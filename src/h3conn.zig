@@ -561,6 +561,14 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
 /// any size — into one syscall instead of four. zrk reads far more than it
 /// writes, so this is the side that pays.
 ///
+/// Worth about 40%: against a server that segments its sends, a read carries
+/// 3.3 datagrams rather than one, and a 4 KiB-body workload goes from 14.9k to
+/// 20.5k requests a second. That figure took two attempts to get, and the
+/// first one said zero — the target was reached through a published container
+/// port, and `docker-proxy` relays every datagram through userspace one at a
+/// time, so the bursts were taken apart before they arrived. A benchmark rig
+/// with a userspace relay in the path cannot see this feature at all.
+///
 /// Best effort, and deliberately silent. It is Linux-only (macOS has no
 /// equivalent), it wants a kernel from 5.0, and a container or a sandbox may
 /// refuse it. Every one of those is a *performance* answer, not a correctness
