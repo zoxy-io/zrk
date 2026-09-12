@@ -201,6 +201,30 @@ fn cmsgAlign(len: usize) usize {
     return (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize)) - 1);
 }
 
+/// `CMSG_SPACE`: what one message occupies, padding included.
+fn cmsgSpace(payload: usize) usize {
+    return cmsgAlign(@sizeOf(std.os.linux.cmsghdr)) + cmsgAlign(payload);
+}
+
+/// `CMSG_LEN`: what one message's header declares, padding excluded.
+fn cmsgLen(payload: usize) usize {
+    return cmsgAlign(@sizeOf(std.os.linux.cmsghdr)) + payload;
+}
+
+/// Segments one send may carry.
+///
+/// `requests_max` rather than the kernel's ceiling of sixty-four. The
+/// measurement in zoxy-io/zrk#76 puts the real figure at 1.0 to 2.8 datagrams
+/// per flush, and the only thing that could exceed that is a flush taken right
+/// after `-s 16` requests came due together — so sixteen covers the workload
+/// and sixty-four would be ninety kilobytes of buffer for a batch nothing
+/// produces.
+const batch_segments_max: usize = requests_max;
+
+/// Datagrams are built straight into the batch buffer at successive offsets,
+/// so it has to hold that many of the largest one.
+const batch_octets: usize = batch_segments_max * Connection.datagram_octets;
+
 /// Eight octets is what most implementations use and is well inside RFC 9000
 /// §17.2's twenty.
 const connection_id_octets: usize = 8;
@@ -303,7 +327,16 @@ pub const State = struct {
     /// Whether this endpoint's control and QPACK streams have gone out.
     http3_started: bool = false,
 
-    datagram: [Connection.datagram_octets]u8 = undefined,
+    /// Where `Connection.send` builds its datagrams, one after another.
+    ///
+    /// A batch is a *range* of this and never a copy: `send` is handed
+    /// `batch[filled..]` rather than a scratch datagram, so a run of segments
+    /// is already contiguous by the time anything decides to send it.
+    batch: [batch_octets]u8 = undefined,
+    /// Whether this connection may ask the kernel to segment a send. Probed
+    /// per connection in `configureOffload`, and cleared if a segmented send
+    /// is ever refused.
+    segmentation: bool = false,
     incoming: [receive_octets]u8 = undefined,
     /// Where the kernel writes the control messages that came with a read.
     ///
@@ -406,7 +439,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         return;
     };
     defer socket.close(io);
-    enableOffload(&socket);
+    configureOffload(state, &socket);
 
     // The clock. `h3` takes `now_ns` as a parameter and reads none, so this is
     // the owner of one; the origin is this attempt's start, which keeps every
@@ -568,9 +601,11 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
 /// datagram, and the loop behaves exactly as it did before this existed. There
 /// is nothing for a caller to do about a refusal, so there is nothing to
 /// report.
-fn enableOffload(socket: *net.Socket) void {
+fn configureOffload(state: *State, socket: *net.Socket) void {
+    state.segmentation = false;
     if (builtin.os.tag != .linux) return;
     const linux = std.os.linux;
+
     const on: c_int = 1;
     std.posix.setsockopt(
         socket.handle,
@@ -578,6 +613,24 @@ fn enableOffload(socket: *net.Socket) void {
         linux.UDP.GRO,
         std.mem.asBytes(&on),
     ) catch {};
+
+    // And the send half, which needs to be *asked* about rather than tried.
+    //
+    // A segmented send carries its size in a control message, and a kernel
+    // that does not know the message answers the `sendmsg` with an error —
+    // after this endpoint has already built a batch it now has to unpick.
+    // Setting the socket option to zero asks the same question and changes
+    // nothing: zero is "no default segmentation", which is what is wanted
+    // anyway because the per-message control message is what governs. A
+    // feature probe that cannot malform a send.
+    const off: c_int = 0;
+    std.posix.setsockopt(
+        socket.handle,
+        linux.IPPROTO.UDP,
+        linux.UDP.SEGMENT,
+        std.mem.asBytes(&off),
+    ) catch return;
+    state.segmentation = true;
 }
 
 /// The segment size a coalesced read was built from, or null when the kernel
@@ -1175,25 +1228,183 @@ fn pollTransport(p: *conn.Params, state: *State) bool {
 
 /// Build and send datagrams until the connection has nothing more.
 fn flush(p: *conn.Params, state: *State, socket: *net.Socket, now_ns: u64) bool {
+    // A batch is the range `start..filled` of the buffer, every segment
+    // `segment` octets except possibly the last. Segmentation offload allows
+    // exactly that shape and no other, which is what the three cases below
+    // are: the size matches and the run extends, the size is smaller and the
+    // run ends with it, or the size is larger and a new run begins.
+    //
+    // Deliberately *not* padding to make more runs match. The measurement in
+    // zoxy-io/zrk#76 put that at ten to forty per cent more batching for up to
+    // twenty-nine per cent more egress, which is a bad trade for a tool whose
+    // pitch is not generating the traffic it is measuring.
+    const cap: usize = if (state.segmentation) batch_segments_max else 1;
+    var start: usize = 0;
+    var filled: usize = 0;
+    var segment: usize = 0;
+    var produced: usize = 0;
+
     for (0..flush_datagrams_max) |_| {
-        const octets = state.connection.send(&state.datagram, now_ns) catch {
+        // A datagram is built in place, so the room for the largest one has to
+        // exist before it is built rather than after.
+        if (produced == cap or state.batch.len - filled < Connection.datagram_octets) {
+            sendBatch(p, state, socket, state.batch[start..filled], segment, produced);
+            start = 0;
+            filled = 0;
+            segment = 0;
+            produced = 0;
+        }
+
+        const octets = state.connection.send(state.batch[filled..], now_ns) catch {
             abandonAll(p, state, .write);
             conn.noteError(p, .write);
             return false;
         };
-        if (octets == 0) return true;
-        socket.send(p.io, &p.address, state.datagram[0..octets]) catch {
-            // A datagram the kernel would not take — a full socket buffer under
-            // load, most often — is a lost packet, which is the one failure
-            // QUIC is built to absorb: `Recovery` will declare it lost and send
-            // it again. Killing the connection over it would turn a moment of
-            // local backpressure into every in-flight request failing, and
-            // counting it as a write error would report the target as failing
-            // when the send never left this machine.
-            return true;
-        };
+        if (octets == 0) break;
+
+        switch (placement(produced, segment, octets)) {
+            .opens => {
+                segment = octets;
+                produced = 1;
+                filled += octets;
+            },
+            .extends => {
+                produced += 1;
+                filled += octets;
+            },
+            .closes => {
+                filled += octets;
+                produced += 1;
+                sendBatch(p, state, socket, state.batch[start..filled], segment, produced);
+                start = filled;
+                segment = 0;
+                produced = 0;
+            },
+            .displaces => {
+                // Already written exactly where the next run begins, so the
+                // run in progress goes out and this datagram opens the next.
+                sendBatch(p, state, socket, state.batch[start..filled], segment, produced);
+                start = filled;
+                filled += octets;
+                segment = octets;
+                produced = 1;
+            },
+        }
     }
+
+    sendBatch(p, state, socket, state.batch[start..filled], segment, produced);
     return true;
+}
+
+/// What a datagram of `octets` does to the run of `produced` segments of
+/// `segment` octets each that is already accumulated.
+///
+/// The whole of the batching rule, in one place and with no I/O in it, because
+/// getting it wrong does not fail locally — it hands the kernel a buffer whose
+/// shape contradicts the segment size it was given, and what goes on the wire
+/// is datagrams nobody wrote.
+const Placement = enum {
+    /// Nothing accumulated: this datagram sets the run's segment size.
+    opens,
+    /// The same size, so the run grows.
+    extends,
+    /// Smaller. Offload allows one short segment and only as the last, so this
+    /// joins the run and ends it.
+    closes,
+    /// Larger, so it cannot be a segment of this run at all: the run goes out
+    /// without it and it opens the next.
+    displaces,
+};
+
+fn placement(produced: usize, segment: usize, octets: usize) Placement {
+    std.debug.assert(octets > 0);
+    if (produced == 0) return .opens;
+    std.debug.assert(segment > 0);
+    if (octets == segment) return .extends;
+    if (octets < segment) return .closes;
+    return .displaces;
+}
+
+/// One datagram onto the wire, and the one error this file forgives.
+fn sendOne(p: *conn.Params, socket: *net.Socket, data: []const u8) void {
+    socket.send(p.io, &p.address, data) catch {
+        // A datagram the kernel would not take — a full socket buffer under
+        // load, most often — is a lost packet, which is the one failure QUIC is
+        // built to absorb: `Recovery` will declare it lost and send it again.
+        // Killing the connection over it would turn a moment of local
+        // backpressure into every in-flight request failing, and counting it as
+        // a write error would report the target as failing when the send never
+        // left this machine.
+    };
+}
+
+/// `count` datagrams laid end to end in `data`, as one send where the kernel
+/// will segment them and as `count` sends where it will not.
+fn sendBatch(
+    p: *conn.Params,
+    state: *State,
+    socket: *net.Socket,
+    data: []const u8,
+    segment: usize,
+    count: usize,
+) void {
+    if (count == 0) return;
+    std.debug.assert(data.len > 0);
+    std.debug.assert(segment > 0);
+    // Every segment but the last is `segment` octets, so this is what `data`
+    // can be and nothing else.
+    std.debug.assert(data.len > (count - 1) * segment);
+    std.debug.assert(data.len <= count * segment);
+
+    // One datagram needs no control message, and most flushes produce exactly
+    // one — 1.0 of them in the body-carrying workloads measured in #76. Paying
+    // for a cmsg there would be paying for batching in the case with nothing
+    // to batch.
+    if (count == 1) {
+        sendOne(p, socket, data);
+        return;
+    }
+
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var control: [cmsgSpace(@sizeOf(u16))]u8 align(@alignOf(usize)) = @splat(0);
+        const header: *align(@alignOf(usize)) linux.cmsghdr = @ptrCast(@alignCast(&control));
+        header.* = .{
+            .len = cmsgLen(@sizeOf(u16)),
+            .level = linux.IPPROTO.UDP,
+            .type = linux.UDP.SEGMENT,
+        };
+        const size: u16 = @intCast(segment);
+        @memcpy(
+            control[cmsgAlign(@sizeOf(linux.cmsghdr))..][0..@sizeOf(u16)],
+            std.mem.asBytes(&size),
+        );
+
+        var messages = [_]net.OutgoingMessage{.{
+            .address = &p.address,
+            .data_ptr = data.ptr,
+            .data_len = data.len,
+            .control = &control,
+        }};
+        if (socket.sendMany(p.io, &messages, .{})) |_| return else |_| {
+            // The probe in `configureOffload` said the kernel knows the option,
+            // so a refusal here is the *path* declining rather than the kernel
+            // — a route or a device that cannot segment. Stop asking for this
+            // connection, and unpick the batch below rather than lose it: a
+            // whole flight dropped on the first attempt is a stall the loss
+            // detector would have to dig out of, for a reason that is ours.
+            state.segmentation = false;
+        }
+    }
+
+    // Unbatched, either because segmentation is off or because it was just
+    // turned off. Bounded by `data`, which every pass shortens.
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const take = @min(segment, data.len - offset);
+        sendOne(p, socket, data[offset..][0..take]);
+        offset += take;
+    }
 }
 
 /// How long the loop may sleep: the earliest of the next scheduled send, the
@@ -1320,6 +1531,113 @@ fn testControl(
         std.mem.asBytes(&payload),
     );
     return buffer[0..cmsgAlign(real)];
+}
+
+test "the batching rule is offload's shape and no other" {
+    // Nothing accumulated: whatever arrives sets the size.
+    try testing.expectEqual(Placement.opens, placement(0, 0, 1200));
+    // The same size grows the run.
+    try testing.expectEqual(Placement.extends, placement(3, 1200, 1200));
+    // Smaller is the one short segment offload allows, and it ends the run.
+    try testing.expectEqual(Placement.closes, placement(3, 1200, 400));
+    // Larger cannot be a segment of this run at all.
+    try testing.expectEqual(Placement.displaces, placement(3, 1200, 1201));
+}
+
+test "every batch the rule produces is all-equal-but-last" {
+    // The invariant that does not fail locally. A batch whose shape
+    // contradicts the segment size handed to the kernel is datagrams on the
+    // wire that nobody wrote, and nothing on this machine would say so — so it
+    // is checked here, over sequences chosen to hit each branch.
+    const cases = [_][]const usize{
+        &.{70},
+        &.{ 70, 70, 70, 70 },
+        &.{ 1200, 1200, 400 },
+        &.{ 400, 1200, 1200 },
+        &.{ 70, 71, 70, 71 },
+        &.{ 1452, 1452, 1452, 40 },
+        &.{ 40, 70, 40, 70, 1452 },
+    };
+    const cap: usize = batch_segments_max;
+
+    for (cases) |sizes| {
+        var batches: usize = 0;
+        var delivered: usize = 0;
+        var segment: usize = 0;
+        var produced: usize = 0;
+        var octets: usize = 0;
+        var largest: usize = 0;
+
+        // The same walk `flush` does, against the same decision function.
+        const close = struct {
+            fn check(count: usize, size: usize, total: usize, top: usize) !void {
+                if (count == 0) return;
+                // Every segment but the last is exactly `size`, so the total
+                // can only land in this one-segment-wide band...
+                try testing.expect(total > (count - 1) * size);
+                try testing.expect(total <= count * size);
+                // ...and no segment may exceed the size the kernel is told.
+                try testing.expect(top <= size);
+            }
+        }.check;
+
+        for (sizes) |size| {
+            if (produced == cap) {
+                try close(produced, segment, octets, largest);
+                batches += 1;
+                delivered += produced;
+                segment = 0;
+                produced = 0;
+                octets = 0;
+                largest = 0;
+            }
+            switch (placement(produced, segment, size)) {
+                .opens => {
+                    segment = size;
+                    produced = 1;
+                    octets = size;
+                    largest = size;
+                },
+                .extends => {
+                    produced += 1;
+                    octets += size;
+                    largest = @max(largest, size);
+                },
+                .closes => {
+                    produced += 1;
+                    octets += size;
+                    largest = @max(largest, size);
+                    try close(produced, segment, octets, largest);
+                    batches += 1;
+                    delivered += produced;
+                    segment = 0;
+                    produced = 0;
+                    octets = 0;
+                    largest = 0;
+                },
+                .displaces => {
+                    try close(produced, segment, octets, largest);
+                    batches += 1;
+                    delivered += produced;
+                    segment = size;
+                    produced = 1;
+                    octets = size;
+                    largest = size;
+                },
+            }
+        }
+        try close(produced, segment, octets, largest);
+        if (produced > 0) {
+            batches += 1;
+            delivered += produced;
+        }
+
+        // Nothing is dropped and nothing is sent twice, which is the other
+        // half of what a batching loop can get wrong.
+        try testing.expectEqual(sizes.len, delivered);
+        try testing.expect(batches >= 1);
+        try testing.expect(batches <= sizes.len);
+    }
 }
 
 test "a coalesced read reports the size its segments were built from" {
