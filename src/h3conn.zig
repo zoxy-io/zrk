@@ -529,17 +529,13 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         progress_ns = elapsed(io, origin);
 
         // What arrived is one datagram, or — where the kernel coalesced a
-        // burst — several laid end to end. `segmentOctets` is the only thing
-        // that can tell the two apart, because a coalesced read looks exactly
-        // like one large datagram from the buffer alone.
-        var rest = incoming[0].data;
-        const segment = segmentOctets(incoming[0].control) orelse rest.len;
-        // Bounded: `segment` is nonzero, so every pass consumes at least one
-        // octet of a buffer that cannot exceed `receive_octets`.
-        while (rest.len > 0) {
-            const take = @min(segment, rest.len);
-            const datagram = rest[0..take];
-            rest = rest[take..];
+        // burst — several laid end to end. `Burst` is the only thing that can
+        // tell the two apart, because from the buffer alone a coalesced read
+        // looks exactly like one large datagram.
+        var burst = burstOf(incoming[0]);
+        // Bounded: every pass consumes at least one octet of a buffer that
+        // cannot exceed `receive_octets`.
+        while (burst.next()) |datagram| {
             state.connection.receive(datagram, elapsed(io, origin)) catch {
                 // A datagram that does not parse or does not authenticate is
                 // discarded inside the connection; what reaches here is a
@@ -588,6 +584,45 @@ fn enableOffload(socket: *net.Socket) void {
     ) catch {};
 }
 
+/// The datagrams one read carries, in order.
+///
+/// A coalesced read is several laid end to end, every one the reported segment
+/// size except the last; an ordinary read is one datagram, which is the same
+/// shape with a segment size of the whole buffer. One shape rather than two is
+/// the point — the receive loop has no branch for "did the kernel coalesce".
+const Burst = struct {
+    rest: []u8,
+    segment: usize,
+
+    fn next(self: *Burst) ?[]u8 {
+        if (self.rest.len == 0) return null;
+        std.debug.assert(self.segment > 0);
+        const take = @min(self.segment, self.rest.len);
+        const datagram = self.rest[0..take];
+        self.rest = self.rest[take..];
+        return datagram;
+    }
+};
+
+fn burstOf(message: net.IncomingMessage) Burst {
+    const coalesced = segmentOctets(message.control);
+    var data = message.data;
+    const segment = coalesced orelse data.len;
+
+    if (message.flags.trunc) {
+        // The buffer was too small for what arrived and the kernel dropped the
+        // tail, so the last piece is half a datagram. `receive_octets` is sized
+        // at the kernel's *default* ceiling on a coalesced read and a device's
+        // `gro_max_size` can be tuned above it, so this is reachable rather
+        // than theoretical. QUIC would discard the fragment anyway — silently,
+        // as a packet that does not authenticate — so it goes here instead,
+        // where the reason for dropping it is known.
+        data = if (coalesced) |size| data[0 .. data.len - data.len % size] else data[0..0];
+    }
+
+    return .{ .rest = data, .segment = @max(segment, 1) };
+}
+
 /// The segment size a coalesced read was built from, or null when the kernel
 /// coalesced nothing and the buffer is one datagram.
 ///
@@ -597,33 +632,47 @@ fn enableOffload(socket: *net.Socket) void {
 fn segmentOctets(control: []const u8) ?usize {
     if (builtin.os.tag != .linux) return null;
     const linux = std.os.linux;
+    const header_octets = cmsgAlign(@sizeOf(linux.cmsghdr));
 
     var offset: usize = 0;
-    // Bounded by the control buffer, and every pass advances by at least the
-    // header: `len` below is checked against it before it is used to step.
-    while (offset + @sizeOf(linux.cmsghdr) <= control.len) {
+    // Bounded by the control buffer: every pass either returns or advances
+    // `offset` by at least a header, and the step is checked against what is
+    // left before it is taken.
+    while (control.len - offset >= @sizeOf(linux.cmsghdr)) {
+        std.debug.assert(offset <= control.len);
         const header: *align(@alignOf(usize)) const linux.cmsghdr =
             @ptrCast(@alignCast(&control[offset]));
-        // A header whose length does not cover itself, or runs past the buffer,
-        // is one this loop cannot step over — and stepping by a length the
-        // kernel did not write is how a cmsg walk reads its way off the end.
-        if (header.len < @sizeOf(linux.cmsghdr)) return null;
-        if (offset + header.len > control.len) return null;
 
-        const payload = offset + cmsgAlign(@sizeOf(linux.cmsghdr));
-        if (header.level == linux.IPPROTO.UDP and
-            header.type == linux.UDP.GRO and
-            payload + @sizeOf(u16) <= control.len)
-        {
-            var octets: u16 = 0;
-            @memcpy(std.mem.asBytes(&octets), control[payload..][0..@sizeOf(u16)]);
-            // A zero segment size would make the split loop above spin on a
-            // buffer it never consumes. The kernel does not send one; this is
-            // what says so rather than trusting it.
+        // Written as a subtraction from what remains rather than an addition
+        // to `offset`, because `len` is the kernel's number and the sum of two
+        // `usize`s wraps in the build that ships — which would turn this guard
+        // into the thing it is guarding against.
+        if (header.len < @sizeOf(linux.cmsghdr)) return null;
+        if (header.len > control.len - offset) return null;
+
+        if (header.level == linux.IPPROTO.UDP and header.type == linux.UDP.GRO) {
+            // `udp_cmsg_recv` puts an `int` here, so the payload is four
+            // octets. Reading two of them yields the right answer on a
+            // little-endian machine and zero on a big-endian one, where the
+            // whole burst would then be handed on as a single datagram, fail
+            // to authenticate, and be discarded without a word.
+            const payload = @sizeOf(u32);
+            // Against *this* message's length, not the buffer's. A header
+            // claiming less than it should, followed by a second message,
+            // would otherwise read that one's `len` field as a segment size.
+            if (header.len - header_octets < payload) return null;
+            var octets: u32 = 0;
+            @memcpy(std.mem.asBytes(&octets), control[offset + header_octets ..][0..payload]);
+            // Zero would make the split consume nothing and spin. The kernel
+            // does not send it; this is what says so rather than trusting it.
             if (octets == 0) return null;
             return octets;
         }
-        offset += cmsgAlign(header.len);
+
+        const step = cmsgAlign(header.len);
+        // Rounding up can pass the end even when `len` did not.
+        if (step > control.len - offset) return null;
+        offset += step;
     }
     return null;
 }
@@ -1310,24 +1359,47 @@ fn elapsed(io: Io, origin: Io.Timestamp) u64 {
 
 const testing = std.testing;
 
-/// Build one control message the way a kernel would, for the tests below.
+/// Build one control message the way the kernel actually does.
+///
+/// "The way a kernel would" is the whole point and was previously not true:
+/// this built `CMSG_LEN(2)` because the parser read two octets, so the two
+/// agreed with each other and with nothing else. `udp_cmsg_recv` puts an `int`
+/// here — verified against a live socket: `cmsg_len=20`, payload `b0 04 00 00`
+/// for a segment size of 1200 — and a fixture that says otherwise is a test
+/// asserting the bug.
 fn testControl(
     buffer: []align(@alignOf(usize)) u8,
     level: i32,
     kind: i32,
-    payload: u16,
+    payload: u32,
     /// Overridden so a test can express a length the kernel would never write.
     length: ?usize,
 ) []u8 {
     const linux = std.os.linux;
     const header: *align(@alignOf(usize)) linux.cmsghdr = @ptrCast(@alignCast(buffer.ptr));
-    const real = cmsgAlign(@sizeOf(linux.cmsghdr)) + @sizeOf(u16);
+    const real = cmsgAlign(@sizeOf(linux.cmsghdr)) + @sizeOf(u32);
     header.* = .{ .len = length orelse real, .level = level, .type = kind };
     @memcpy(
-        buffer[cmsgAlign(@sizeOf(linux.cmsghdr))..][0..@sizeOf(u16)],
+        buffer[cmsgAlign(@sizeOf(linux.cmsghdr))..][0..@sizeOf(u32)],
         std.mem.asBytes(&payload),
     );
     return buffer[0..cmsgAlign(real)];
+}
+
+/// An `IncomingMessage` as a read would leave it.
+fn testMessage(data: []u8, control: []u8, truncated: bool) net.IncomingMessage {
+    return .{
+        .from = undefined,
+        .data = data,
+        .control = control,
+        .flags = .{
+            .eor = false,
+            .trunc = truncated,
+            .ctrunc = false,
+            .oob = false,
+            .errqueue = false,
+        },
+    };
 }
 
 test "a coalesced read reports the size its segments were built from" {
@@ -1338,8 +1410,29 @@ test "a coalesced read reports the size its segments were built from" {
     const control = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, null);
     try testing.expectEqual(@as(?usize, 1452), segmentOctets(control));
 
-    // No control message at all is the ordinary case — a kernel that does not
-    // coalesce, or one that declined the socket option — and it has to read as
+    // The octets a live kernel wrote, byte for byte, so this test fails if the
+    // payload is ever read at the wrong width again — including on a
+    // big-endian target, where taking the low half would read zero.
+    var raw: [24]u8 align(@alignOf(usize)) = .{
+        0x14, 0, 0, 0, 0, 0, 0, 0, // cmsg_len = 20
+        0x11, 0, 0, 0, //             level = IPPROTO_UDP
+        0x68, 0, 0, 0, //             type  = UDP_GRO
+        0xb0, 0x04, 0, 0, //          gso_size = 1200, as an int
+        0xaa, 0xaa, 0xaa, 0xaa, //    padding
+    };
+    if (builtin.cpu.arch.endian() == .little) {
+        try testing.expectEqual(@as(?usize, 1200), segmentOctets(&raw));
+    }
+
+    // And a payload whose high octets are not zero, which is the only way a
+    // little-endian machine can tell a four-octet read from a two-octet one:
+    // the low half of this is 4464. Not a size any kernel sends — the point is
+    // the width this parser reads, not the value.
+    const wide = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 70_000, null);
+    try testing.expectEqual(@as(?usize, 70_000), segmentOctets(wide));
+
+    // No control message is the ordinary case — a kernel that does not
+    // coalesce, or one that declined the socket option — and has to read as
     // "one datagram" rather than as an error.
     try testing.expectEqual(@as(?usize, null), segmentOctets(&.{}));
 }
@@ -1354,17 +1447,27 @@ test "a control message this loop cannot trust is no segment size" {
     try testing.expectEqual(@as(?usize, null), segmentOctets(other));
 
     // A length that does not cover its own header, which is the step that
-    // would not advance — a walk that trusted it would never terminate.
+    // would not advance — a walk trusting it would never terminate.
     const short = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, 4);
     try testing.expectEqual(@as(?usize, null), segmentOctets(short));
 
+    // A header claiming room for a two-octet payload where four are read. The
+    // bound has to come from *this* message rather than from the buffer, or
+    // the read reaches into whatever follows.
+    const narrow = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, cmsgAlign(@sizeOf(linux.cmsghdr)) + 2);
+    try testing.expectEqual(@as(?usize, null), segmentOctets(narrow));
+
     // A length running past the buffer, which is how a cmsg walk reads its way
-    // off the end of what the kernel actually wrote.
+    // off the end of what the kernel wrote.
     const over = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, control_octets * 2);
     try testing.expectEqual(@as(?usize, null), segmentOctets(over));
 
-    // Zero would make the split loop consume nothing and spin for ever. The
-    // kernel does not send it; this is what says so rather than trusting it.
+    // And a length near the top of the range, where `offset + len` wraps in
+    // the build that ships and the guard becomes the defect it guards against.
+    const huge = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, std.math.maxInt(usize) - 3);
+    try testing.expectEqual(@as(?usize, null), segmentOctets(huge));
+
+    // Zero would make the split consume nothing and spin.
     const zero = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 0, null);
     try testing.expectEqual(@as(?usize, null), segmentOctets(zero));
 
@@ -1373,24 +1476,59 @@ test "a control message this loop cannot trust is no segment size" {
 }
 
 test "a burst splits into the datagrams it was coalesced from" {
-    // The arithmetic the receive loop does, on its own, because the loop it
-    // lives in needs a socket and a peer and this does not: every segment is
-    // the reported size except the last, which is the remainder.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var control: [control_octets]u8 align(@alignOf(usize)) = @splat(0);
+    var data: [9600]u8 = @splat(0);
+
     const segment: usize = 1200;
+    const encoded = testControl(&control, linux.IPPROTO.UDP, linux.UDP.GRO, @intCast(segment), null);
+
     for ([_]usize{ 1, 1200, 1201, 8800, 9600 }) |total| {
-        var rest: []const u8 = @as([*]const u8, @ptrFromInt(0x1000))[0..total];
+        var burst = burstOf(testMessage(data[0..total], encoded, false));
         var count: usize = 0;
         var seen: usize = 0;
-        while (rest.len > 0) {
-            const take = @min(segment, rest.len);
-            try testing.expect(take > 0);
-            rest = rest[take..];
-            seen += take;
+        while (burst.next()) |datagram| {
+            try testing.expect(datagram.len > 0);
+            try testing.expect(datagram.len <= segment);
+            seen += datagram.len;
             count += 1;
+            // Every segment but the last is exactly the reported size.
+            if (seen < total) try testing.expectEqual(segment, datagram.len);
         }
         try testing.expectEqual(total, seen);
         try testing.expectEqual((total + segment - 1) / segment, count);
     }
+
+    // No control message: the whole buffer is one datagram.
+    var single = burstOf(testMessage(data[0..1500], &.{}, false));
+    try testing.expectEqual(@as(usize, 1500), single.next().?.len);
+    try testing.expectEqual(@as(?[]u8, null), single.next());
+}
+
+test "a truncated read gives up the fragment rather than passing it on" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var control: [control_octets]u8 align(@alignOf(usize)) = @splat(0);
+    var data: [9600]u8 = @splat(0);
+    const segment: usize = 1200;
+    const encoded = testControl(&control, linux.IPPROTO.UDP, linux.UDP.GRO, @intCast(segment), null);
+
+    // Three whole segments and half of a fourth. The half is not a datagram,
+    // and handing it on would be handing QUIC a packet that cannot
+    // authenticate — discarded there without a word, rather than here with a
+    // reason.
+    var burst = burstOf(testMessage(data[0 .. 3 * segment + 600], encoded, true));
+    var count: usize = 0;
+    while (burst.next()) |datagram| : (count += 1) {
+        try testing.expectEqual(segment, datagram.len);
+    }
+    try testing.expectEqual(@as(usize, 3), count);
+
+    // And an uncoalesced read that was truncated is one incomplete datagram,
+    // so there is nothing to keep at all.
+    var lone = burstOf(testMessage(data[0..900], &.{}, true));
+    try testing.expectEqual(@as(?[]u8, null), lone.next());
 }
 
 test "a connection's transport state is a bounded, allocation-free block" {
