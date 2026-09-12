@@ -196,12 +196,14 @@ number from it:
   chose. HTTP/1.1 and HTTP/2 still verify by default, and `-k` there is still
   opt-in, so the case where that is not enough is covered on the transports
   that can cover it.
-- **One datagram per syscall**, which bounds throughput per core and nothing
-  else. [#76](https://github.com/zoxy-io/zrk/issues/76) is the work, and it is
-  larger than the API surface suggests: `std.Io.net.Socket` has `sendMany` and
-  `receiveManyTimeout`, but zio implements the first as a loop over `sendmsg`
-  and the second one `recvmsg` at a time, and nothing in the stack exposes
-  `UDP_SEGMENT` or `UDP_GRO`. The batched API is there; the batching is not.
+- **One datagram per syscall on the way out.** Reads are batched where the
+  kernel and the peer allow it — Linux generic receive offload, which collapses
+  a burst into one read — but sends are not, and that is the half that bounds
+  throughput per core. It is not a plumbing problem: offload only batches
+  datagrams of equal size, a QUIC client's egress is small request packets whose
+  lengths jitter, and making the runs long means padding traffic that zrk is
+  supposed to be measuring rather than generating.
+  [#76](https://github.com/zoxy-io/zrk/issues/76) carries the argument.
 
 Everything else carries over: `--closed`, ramps, `--timeseries`, the JSON
 summary and the CI gates all work unchanged.

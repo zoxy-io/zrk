@@ -41,15 +41,18 @@
 //!   Accepted rather than outstanding: a load generator is pointed at a target
 //!   its operator chose, and the other two transports keep verification on by
 //!   default for the case where that is not enough.
-//! * **One datagram per syscall** — `flush` calls `socket.send` once per
-//!   datagram and the loop below receives one per `receiveTimeout`.
-//!   zoxy-io/zrk#76 is the work, and it is larger than the API surface
-//!   suggests: `std.Io.net.Socket` has `sendMany` and `receiveManyTimeout`,
-//!   but zio implements the first as a `for` loop over `sendmsg` and the
-//!   second one `recvmsg` at a time, and nothing in the stack exposes
-//!   `UDP_SEGMENT` or `UDP_GRO`. So the batched *API* is here and the batching
-//!   is not, and closing that is plumbing in a dependency rather than a
-//!   call-site change in this file.
+//! * **One datagram per syscall on the way out.** `flush` calls `socket.send`
+//!   once per datagram. The way *in* is batched — see `enableOffload` — but
+//!   the two are duals and only one of them is done: segmentation offload on
+//!   this endpoint's send side is what would let a peer read a burst per
+//!   syscall, and it is also the half that would cut *this* endpoint's own
+//!   syscalls, which is the thing zoxy-io/zrk#74 asked about. It is not done
+//!   because the mechanism is the easy part and the policy is not: offload
+//!   only batches datagrams of equal size, and a QUIC client's egress is small
+//!   request packets whose lengths jitter as varint widths change. Making the
+//!   runs long means padding, and a load generator that inflates its own
+//!   traffic is answering a different question than the one it was asked.
+//!   zoxy-io/zrk#76 carries the argument and the measurement that settles it.
 //! * **No connection migration, no 0-RTT, no session resumption.** A run that
 //!   reconnects pays a full handshake every time.
 //!
@@ -74,6 +77,7 @@
 //!   `cli.zig` enforces both rather than letting them fail on the wire.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 const h3 = @import("h3");
@@ -172,8 +176,30 @@ pub const request_octets_max: usize = stream_send_octets;
 /// wants to send is a bug this loop should not turn into a hang.
 const flush_datagrams_max: u32 = 32;
 
-/// Anything the path delivers, up to QUIC's own ceiling.
-const receive_octets: usize = 2048;
+/// One read's buffer.
+///
+/// Far past a datagram, because with generic receive offload one read is a
+/// *burst*: the kernel coalesces consecutive datagrams of one flow into a
+/// single buffer and reports the segment size out of band. 64 KiB is the
+/// kernel's own ceiling on that, so a larger buffer could not be filled and a
+/// smaller one would cap the batch below what the path offers.
+///
+/// It is spent per connection whether or not the kernel does any coalescing —
+/// 64 KiB against the megabyte-and-a-half of stream windows beside it, so a
+/// `-c 100` run pays about six megabytes for the whole fleet. See
+/// `footprint_octets`.
+const receive_octets: usize = 64 * 1024;
+
+/// Room for the control messages one read can carry. `UDP_GRO` is a single
+/// cmsg of twenty-four octets; this is an order of magnitude of slack so that
+/// a kernel with something else to say cannot truncate it.
+const control_octets: usize = 256;
+
+/// RFC 3542's `CMSG_ALIGN`: a control message header begins on a boundary of
+/// its first field, which is a `usize`.
+fn cmsgAlign(len: usize) usize {
+    return (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize)) - 1);
+}
 
 /// Eight octets is what most implementations use and is well inside RFC 9000
 /// §17.2's twenty.
@@ -279,6 +305,13 @@ pub const State = struct {
 
     datagram: [Connection.datagram_octets]u8 = undefined,
     incoming: [receive_octets]u8 = undefined,
+    /// Where the kernel writes the control messages that came with a read.
+    ///
+    /// Aligned rather than merely sized: the first thing done with it is to
+    /// read a `cmsghdr` out of the front, and a `[N]u8` is aligned to one. The
+    /// first version of the probe that established this path panicked on
+    /// exactly that, which is cheaper to remember than to rediscover.
+    control: [control_octets]u8 align(@alignOf(usize)) = undefined,
     fields: [field_buffer_octets]u8 = undefined,
 
     /// The block arrives from `allocator.alloc` undefined, and nothing may read
@@ -373,6 +406,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         return;
     };
     defer socket.close(io);
+    enableOffload(&socket);
 
     // The clock. `h3` takes `now_ns` as a parameter and reads none, so this is
     // the owner of one; the origin is this attempt's start, which keeps every
@@ -467,7 +501,20 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
             .raw = Io.Duration.fromNanoseconds(wait_ns),
             .clock = .awake,
         } };
-        const message = socket.receiveTimeout(io, &state.incoming, timeout) catch |err| switch (err) {
+        // `receiveManyTimeout` rather than `receiveTimeout`, for the control
+        // buffer and nothing else: `receiveTimeout` builds its own
+        // `IncomingMessage` with an empty `control`, so the segment size the
+        // kernel reports would have nowhere to land. One message either way.
+        var incoming = [_]net.IncomingMessage{.init};
+        incoming[0].control = &state.control;
+        const maybe_error, const count = socket.receiveManyTimeout(
+            io,
+            &incoming,
+            &state.incoming,
+            .{},
+            timeout,
+        );
+        if (maybe_error) |err| switch (err) {
             error.Timeout => {
                 state.connection.onTimeout(elapsed(io, origin));
                 continue;
@@ -478,16 +525,99 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
                 return;
             },
         };
+        if (count == 0) continue;
         progress_ns = elapsed(io, origin);
-        state.connection.receive(message.data, elapsed(io, origin)) catch {
-            // A datagram that does not parse or does not authenticate is
-            // discarded inside the connection; what reaches here is a protocol
-            // error, and RFC 9000 §10.2 says close rather than ignore.
-            abandonAll(p, state, .read);
-            conn.noteError(p, .read);
-            return;
-        };
+
+        // What arrived is one datagram, or — where the kernel coalesced a
+        // burst — several laid end to end. `segmentOctets` is the only thing
+        // that can tell the two apart, because a coalesced read looks exactly
+        // like one large datagram from the buffer alone.
+        var rest = incoming[0].data;
+        const segment = segmentOctets(incoming[0].control) orelse rest.len;
+        // Bounded: `segment` is nonzero, so every pass consumes at least one
+        // octet of a buffer that cannot exceed `receive_octets`.
+        while (rest.len > 0) {
+            const take = @min(segment, rest.len);
+            const datagram = rest[0..take];
+            rest = rest[take..];
+            state.connection.receive(datagram, elapsed(io, origin)) catch {
+                // A datagram that does not parse or does not authenticate is
+                // discarded inside the connection; what reaches here is a
+                // protocol error, and RFC 9000 §10.2 says close rather than
+                // ignore.
+                abandonAll(p, state, .read);
+                conn.noteError(p, .read);
+                return;
+            };
+        }
     }
+}
+
+/// Ask the kernel to hand this socket a burst per read rather than a datagram.
+///
+/// Generic receive offload coalesces consecutive datagrams of one flow into a
+/// single buffer and reports the segment size as a control message, which turns
+/// the response to a request — three or four full-size datagrams for a body of
+/// any size — into one syscall instead of four. zrk reads far more than it
+/// writes, so this is the side that pays.
+///
+/// Best effort, and deliberately silent. It is Linux-only (macOS has no
+/// equivalent), it wants a kernel from 5.0, and a container or a sandbox may
+/// refuse it. Every one of those is a *performance* answer, not a correctness
+/// one: without it `segmentOctets` finds no control message, the read is one
+/// datagram, and the loop behaves exactly as it did before this existed. There
+/// is nothing for a caller to do about a refusal, so there is nothing to
+/// report.
+fn enableOffload(socket: *net.Socket) void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+    const on: c_int = 1;
+    std.posix.setsockopt(
+        socket.handle,
+        linux.IPPROTO.UDP,
+        linux.UDP.GRO,
+        std.mem.asBytes(&on),
+    ) catch {};
+}
+
+/// The segment size a coalesced read was built from, or null when the kernel
+/// coalesced nothing and the buffer is one datagram.
+///
+/// Every segment is exactly this long except the last, which carries whatever
+/// remains — the same rule in both directions, and what makes splitting the
+/// buffer a division rather than a parse.
+fn segmentOctets(control: []const u8) ?usize {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+
+    var offset: usize = 0;
+    // Bounded by the control buffer, and every pass advances by at least the
+    // header: `len` below is checked against it before it is used to step.
+    while (offset + @sizeOf(linux.cmsghdr) <= control.len) {
+        const header: *align(@alignOf(usize)) const linux.cmsghdr =
+            @ptrCast(@alignCast(&control[offset]));
+        // A header whose length does not cover itself, or runs past the buffer,
+        // is one this loop cannot step over — and stepping by a length the
+        // kernel did not write is how a cmsg walk reads its way off the end.
+        if (header.len < @sizeOf(linux.cmsghdr)) return null;
+        if (offset + header.len > control.len) return null;
+
+        const payload = offset + cmsgAlign(@sizeOf(linux.cmsghdr));
+        if (header.level == linux.IPPROTO.UDP and
+            header.type == linux.UDP.GRO and
+            payload + @sizeOf(u16) <= control.len)
+        {
+            var octets: u16 = 0;
+            @memcpy(std.mem.asBytes(&octets), control[payload..][0..@sizeOf(u16)]);
+            // A zero segment size would make the split loop above spin on a
+            // buffer it never consumes. The kernel does not send one; this is
+            // what says so rather than trusting it.
+            if (octets == 0) return null;
+            return octets;
+        }
+        offset += cmsgAlign(header.len);
+    }
+    return null;
 }
 
 /// Draw this attempt's identifiers and entropy, build the connection and the
@@ -1171,6 +1301,89 @@ fn elapsed(io: Io, origin: Io.Timestamp) u64 {
 }
 
 const testing = std.testing;
+
+/// Build one control message the way a kernel would, for the tests below.
+fn testControl(
+    buffer: []align(@alignOf(usize)) u8,
+    level: i32,
+    kind: i32,
+    payload: u16,
+    /// Overridden so a test can express a length the kernel would never write.
+    length: ?usize,
+) []u8 {
+    const linux = std.os.linux;
+    const header: *align(@alignOf(usize)) linux.cmsghdr = @ptrCast(@alignCast(buffer.ptr));
+    const real = cmsgAlign(@sizeOf(linux.cmsghdr)) + @sizeOf(u16);
+    header.* = .{ .len = length orelse real, .level = level, .type = kind };
+    @memcpy(
+        buffer[cmsgAlign(@sizeOf(linux.cmsghdr))..][0..@sizeOf(u16)],
+        std.mem.asBytes(&payload),
+    );
+    return buffer[0..cmsgAlign(real)];
+}
+
+test "a coalesced read reports the size its segments were built from" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var buffer: [control_octets]u8 align(@alignOf(usize)) = @splat(0);
+
+    const control = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, null);
+    try testing.expectEqual(@as(?usize, 1452), segmentOctets(control));
+
+    // No control message at all is the ordinary case — a kernel that does not
+    // coalesce, or one that declined the socket option — and it has to read as
+    // "one datagram" rather than as an error.
+    try testing.expectEqual(@as(?usize, null), segmentOctets(&.{}));
+}
+
+test "a control message this loop cannot trust is no segment size" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var buffer: [control_octets]u8 align(@alignOf(usize)) = @splat(0);
+
+    // Somebody else's message, walked past rather than misread.
+    const other = testControl(&buffer, linux.IPPROTO.IP, 8, 1452, null);
+    try testing.expectEqual(@as(?usize, null), segmentOctets(other));
+
+    // A length that does not cover its own header, which is the step that
+    // would not advance — a walk that trusted it would never terminate.
+    const short = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, 4);
+    try testing.expectEqual(@as(?usize, null), segmentOctets(short));
+
+    // A length running past the buffer, which is how a cmsg walk reads its way
+    // off the end of what the kernel actually wrote.
+    const over = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 1452, control_octets * 2);
+    try testing.expectEqual(@as(?usize, null), segmentOctets(over));
+
+    // Zero would make the split loop consume nothing and spin for ever. The
+    // kernel does not send it; this is what says so rather than trusting it.
+    const zero = testControl(&buffer, linux.IPPROTO.UDP, linux.UDP.GRO, 0, null);
+    try testing.expectEqual(@as(?usize, null), segmentOctets(zero));
+
+    // And a buffer too short to hold a header at all.
+    try testing.expectEqual(@as(?usize, null), segmentOctets(buffer[0..4]));
+}
+
+test "a burst splits into the datagrams it was coalesced from" {
+    // The arithmetic the receive loop does, on its own, because the loop it
+    // lives in needs a socket and a peer and this does not: every segment is
+    // the reported size except the last, which is the remainder.
+    const segment: usize = 1200;
+    for ([_]usize{ 1, 1200, 1201, 8800, 9600 }) |total| {
+        var rest: []const u8 = @as([*]const u8, @ptrFromInt(0x1000))[0..total];
+        var count: usize = 0;
+        var seen: usize = 0;
+        while (rest.len > 0) {
+            const take = @min(segment, rest.len);
+            try testing.expect(take > 0);
+            rest = rest[take..];
+            seen += take;
+            count += 1;
+        }
+        try testing.expectEqual(total, seen);
+        try testing.expectEqual((total + segment - 1) / segment, count);
+    }
+}
 
 test "a connection's transport state is a bounded, allocation-free block" {
     // The whole point of `h3` being comptime-sized: `-c 100` costs exactly a
