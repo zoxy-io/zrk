@@ -25,8 +25,8 @@
 //!     `io.random`.
 //!
 //! ALPN is why any of this exists rather than `std.crypto.tls`: HTTP/2 over
-//! TLS is selected by it (RFC 9113 §3.2), and `std.crypto.tls` has none, so
-//! `--http2` could only ever have been cleartext. See zoxy-io/zrk#21.
+//! TLS is selected by it (RFC 9113 §3.2), and `std.crypto.tls` has none, which
+//! would confine `--http2` to cleartext.
 //!
 //! Nothing here imposes a timeout; the right mechanism is `std.Io`
 //! cancellation, and when `connection.zig` arms it — around the HTTP/2
@@ -35,8 +35,8 @@
 //!
 //! The handshake itself is *not* covered by either: a peer that completes the
 //! TCP connect and then never sends a ServerHello pins the connection's
-//! coroutine past the run's end. That gap predates this file's rewrite and is
-//! noted here rather than papered over.
+//! coroutine past the run's end. That gap is noted here rather than papered
+//! over.
 
 const std = @import("std");
 const Io = std.Io;

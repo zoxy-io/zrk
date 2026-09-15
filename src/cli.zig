@@ -768,9 +768,8 @@ test "http3 parses, and its two preconditions are usage errors" {
     try testing.expectError(error.Http3WithoutTls, parse(a, &[_][]const u8{ "--http3", "-k", "http://x/" }));
 
     // And certificates are verified by default, as they are on the other two
-    // transports. `--http3` used to *require* `-k`, because its TLS engine
-    // checked nothing; it does now, so `-k` is an opt-out here and asking for
-    // HTTP/3 without it is an ordinary verified run rather than a usage error.
+    // transports: `-k` is an opt-out here, and asking for HTTP/3 without it is
+    // an ordinary verified run rather than a usage error.
     const verified = (try parse(a, &[_][]const u8{ "--http3", "https://x/" })).config;
     try testing.expect(verified.http3);
     try testing.expect(!verified.insecure);

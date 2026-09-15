@@ -158,7 +158,7 @@ pub fn buildRequestBlock(allocator: std.mem.Allocator, cfg: *const cli.Config) !
     // The field list and every string it points at live only until the block is
     // encoded — HPACK copies the octets in. An arena rather than a `defer free`
     // per allocation because there are a variable number of them (one lowered
-    // name per `-H`) and the first version of this leaked all of them.
+    // name per `-H`), which is exactly the bookkeeping that leaks.
     var scratch: std.heap.ArenaAllocator = .init(allocator);
     defer scratch.deinit();
     const tmp = scratch.allocator();

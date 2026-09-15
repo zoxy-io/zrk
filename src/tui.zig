@@ -107,8 +107,8 @@ pub const Dashboard = struct {
 
     /// Raised by the caller's signal watchers once a stop has been requested, so
     /// the panel can report it *itself*. Nothing else may write to this terminal
-    /// while the panel is live: two lines printed under it (the old stderr
-    /// "interrupt received" notice) scroll the panel down without `prev_lines`
+    /// while the panel is live: two lines printed under it (say, an "interrupt
+    /// received" notice on stderr) scroll the panel down without `prev_lines`
     /// knowing, so the next repaint moves up too few lines, lands mid-panel and
     /// leaves a duplicated header stranded above it.
     stop_requested: ?*const std.atomic.Value(bool) = null,
@@ -432,9 +432,9 @@ pub const Dashboard = struct {
         lines += 1;
 
         // --- latency: a compact percentile readout, then the spectrogram ------
-        // The bars are gone (issue #34): the spectrogram below shows the whole
-        // evolving distribution — including bimodality the bars hid — while this
-        // one line keeps the exact numbers the shape can't give, and carries the
+        // No percentile bars: the spectrogram below shows the whole evolving
+        // distribution — including bimodality bars would hide — while this one
+        // line keeps the exact numbers the shape can't give, and carries the
         // live SLO signal (p99 turns red past --slo-p99).
         const p99 = snap.hist.valueAtPercentile(99);
         const alarm = self.cfg.slo_p99_ns != null and
@@ -1019,8 +1019,8 @@ test "a requested stop shows on the panel without breaking its line accounting" 
 
     // The whole point of the accounting: `prev_lines` is how far the *next*
     // frame moves up, so a panel that writes more newlines than it reports
-    // repaints mid-panel and strands a duplicate header above itself. That is
-    // what the old stderr stop notice did, from outside the panel entirely.
+    // repaints mid-panel and strands a duplicate header above itself. A stop
+    // notice printed to stderr from outside the panel does exactly that.
     var running = Io.Writer.Allocating.init(testing.allocator);
     defer running.deinit();
     const live = try dash.drawPanel(&running.writer, &snap, .{ .rate = 100, .bps = 1000, .seconds = 1.0, .at_s = 1.0 }, 1.0, 30.0, false);
@@ -1205,8 +1205,8 @@ test "spectrogram renders a dense interval as an unbroken gradient" {
     }
 
     // A single mode must render as a single run of occupied cells: no interior
-    // blanks. Bins finer than the histogram's resolution used to leave gaps
-    // there, drawing an unbroken distribution as a comb of stripes (#43).
+    // blanks. Bins finer than the histogram's resolution would otherwise leave
+    // gaps there, drawing an unbroken distribution as a comb of stripes.
     var lo: usize = 0;
     while (lo < cols and level[lo] == 0) lo += 1;
     var hi: usize = cols - 1;

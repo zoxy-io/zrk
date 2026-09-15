@@ -34,15 +34,15 @@
 //! `scheduled` rather than from the actual send — means exactly what it means
 //! there, and is written here in the same order.
 //!
-//! ## What a prototype does not have yet
+//! ## What it does not do
 //!
 //! * **One datagram per syscall on the way out.** `flush` calls `socket.send`
 //!   once per datagram. The way *in* is batched — see `enableOffload` — but
 //!   the two are duals and only one of them is done: segmentation offload on
 //!   this endpoint's send side is what would let a peer read a burst per
 //!   syscall, and it is also the half that would cut *this* endpoint's own
-//!   syscalls, which is the thing zoxy-io/zrk#74 asked about. It is not done
-//!   because the mechanism is the easy part and the policy is not: offload
+//!   syscalls. It is not done because the mechanism is the easy part and the
+//!   policy is not: offload
 //!   only batches datagrams of equal size, and a QUIC client's egress is small
 //!   request packets whose lengths jitter as varint widths change. Making the
 //!   runs long means padding, and a load generator that inflates its own
@@ -50,22 +50,6 @@
 //!   zoxy-io/zrk#76 carries the argument and the measurement that settles it.
 //! * **No connection migration, no 0-RTT, no session resumption.** A run that
 //!   reconnects pays a full handshake every time.
-//!
-//! And one thing that *was* a gap and is not any more, kept here because the
-//! symptom looked like this file's and was not: a multiplexed connection ran at
-//! full rate for about a second and then went to zero req/s, with no errors, for
-//! the rest of the run. `Connection.receiveAck` handed `Recovery` a fixed
-//! 32-entry array for the acknowledged packets' contexts while `Recovery` tracks
-//! `sent_max` of them and clamps its writes to the caller's slice, so an
-//! acknowledgement retiring more than 32 packets — routine once the congestion
-//! window has grown — reported a prefix. `Streams.acknowledge` was then never
-//! called for the streams that did not fit: their send half stayed in "Data
-//! Sent" for ever, they never retired, and since retirement walks a contiguous
-//! watermark, one stranded stream pinned every stream above it until the table
-//! was full. Fixed upstream by sizing the report from `sent_max`, which is the
-//! only number that can bound it; the regression test is
-//! `src/quic/Connection.zig`'s "one acknowledgement settles every stream it
-//! retires, not the first 32", and the row is docs/VERIFICATION.md §1.
 //! * **Fixed comptime limits.** `Connection` is a comptime-sized value —
 //!   `footprint_octets` below is what one costs — so `--streams` cannot exceed
 //!   `requests_max` and a request body cannot exceed the stream send buffer.
@@ -309,9 +293,8 @@ pub const State = struct {
     /// Where the kernel writes the control messages that came with a read.
     ///
     /// Aligned rather than merely sized: the first thing done with it is to
-    /// read a `cmsghdr` out of the front, and a `[N]u8` is aligned to one. The
-    /// first version of the probe that established this path panicked on
-    /// exactly that, which is cheaper to remember than to rediscover.
+    /// read a `cmsghdr` out of the front, and a `[N]u8` is aligned to one, so
+    /// that read panics without the alignment.
     control: [control_octets]u8 align(@alignOf(usize)) = undefined,
     fields: [field_buffer_octets]u8 = undefined,
 
@@ -570,7 +553,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
 /// equivalent), it wants a kernel from 5.0, and a container or a sandbox may
 /// refuse it. Every one of those is a *performance* answer, not a correctness
 /// one: without it `segmentOctets` finds no control message, the read is one
-/// datagram, and the loop behaves exactly as it did before this existed. There
+/// datagram, and the loop behaves as if offload had never been asked for. There
 /// is nothing for a caller to do about a refusal, so there is nothing to
 /// report.
 fn enableOffload(socket: *net.Socket) void {
@@ -1074,9 +1057,9 @@ fn drain(p: *conn.Params, state: *State) bool {
     // because a stream can be retired without ever having been announced as
     // readable, and a request whose slot was only freed by its own `--timeout`
     // is a response this tool measured as a failure and the peer sent
-    // correctly. This was the whole of the first prototype's stall: a 17-octet
-    // response completed and a 4 KiB one hung, because only the small one
-    // arrived whole enough to produce a `finished` before the retire.
+    // correctly. Without the sweep, a 17-octet response completes and a 4 KiB
+    // one hangs, because only the small one arrives whole enough to produce a
+    // `finished` before the retire.
     //
     // Ordered after the drain so that a response finishing in *this* pass has
     // already had its HEADERS and DATA folded into the slot.
@@ -1094,7 +1077,7 @@ fn drain(p: *conn.Params, state: *State) bool {
 fn apply(p: *conn.Params, state: *State, event: h3.http3.Event) void {
     switch (event) {
         // The peer's SETTINGS and its GOAWAY are both connection-level facts
-        // this prototype has nothing to do with: it opens one stream per
+        // this loop has nothing to do with: it opens one stream per
         // request and never more than `--streams` of them, and a run that is
         // told to go away simply reconnects when the peer closes.
         .settings, .goaway => {},
@@ -1379,12 +1362,11 @@ const testing = std.testing;
 
 /// Build one control message the way the kernel actually does.
 ///
-/// "The way a kernel would" is the whole point and was previously not true:
-/// this built `CMSG_LEN(2)` because the parser read two octets, so the two
-/// agreed with each other and with nothing else. `udp_cmsg_recv` puts an `int`
-/// here — verified against a live socket: `cmsg_len=20`, payload `b0 04 00 00`
-/// for a segment size of 1200 — and a fixture that says otherwise is a test
-/// asserting the bug.
+/// "The way a kernel would" is the whole point: a fixture built as `CMSG_LEN(2)`
+/// because the parser reads two octets would agree with the parser and with
+/// nothing else. `udp_cmsg_recv` puts an `int` here — verified against a live
+/// socket: `cmsg_len=20`, payload `b0 04 00 00` for a segment size of 1200 —
+/// and a fixture that says otherwise is a test asserting a bug.
 fn testControl(
     buffer: []align(@alignOf(usize)) u8,
     level: i32,

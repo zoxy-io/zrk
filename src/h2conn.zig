@@ -1,26 +1,27 @@
-//! One HTTP/2 connection over an established byte stream, h2c prior knowledge.
+//! One HTTP/2 connection over an established byte stream.
 //!
-//! Slice 1 of zoxy-io/zrk#21: **one request in flight at a time**, which is what
-//! `connection.zig` already does over HTTP/1.1. That is not a simplification to
-//! be removed later without thought — it is what keeps every measurement
-//! semantic this tool exists for. Latency is recorded from a request's
-//! *scheduled* time, and `watchTimer` aborts a late request by shutting the
-//! socket down to unblock the read. Tearing down the connection is only
-//! equivalent to aborting one request while exactly one is in flight. Opening a
-//! second stream makes that abort wrong, which is why multiplexing is its own
-//! slice with its own decisions about what `-c` means.
+//! The transport is the caller's: `connection.zig` hands in a reader/writer
+//! pair, either cleartext (h2c prior knowledge) or the plaintext side of
+//! `tls.zig` once ALPN has chosen `h2`. This module speaks the protocol and
+//! nothing more: preface, settings, streams, and the flow control that keeps a
+//! long run from stalling.
 //!
-//! So this module speaks the protocol and nothing more: preface, settings,
-//! one exchange at a time, and the flow control that keeps a long run from
-//! stalling.
+//! Two callers share the seam. `exchange` is the serial path — one request in
+//! flight, the response returned whole — and it keeps every measurement
+//! semantic this tool has over HTTP/1.1: latency is recorded from a request's
+//! *scheduled* time, and a late request is aborted by shutting the socket
+//! down, which is only equivalent to aborting one request while exactly one is
+//! in flight. `beginStream`, `receive` and `resetStream` are the multiplexed
+//! path, where `connection.zig` keeps several streams open and the abort is a
+//! RST_STREAM for the one stream that blew its bound. docs/multiplexing.md has
+//! the reasoning.
 //!
 //! ## What it does not do
 //!
-//! No ALPN and no TLS — prior-knowledge h2c only, which is what makes this
-//! slice free of the zssl/libcrypto decision. No server push: we advertise
-//! `SETTINGS_ENABLE_PUSH = 0`, and a peer that sends `PUSH_PROMISE` anyway is a
-//! protocol error rather than something to handle. No priority: RFC 9113
-//! deprecates the scheme and a load generator has nothing to say about it.
+//! No server push: we advertise `SETTINGS_ENABLE_PUSH = 0`, and a peer that
+//! sends `PUSH_PROMISE` anyway is a protocol error rather than something to
+//! handle. No priority: RFC 9113 deprecates the scheme and a load generator
+//! has nothing to say about it.
 
 const std = @import("std");
 const Io = std.Io;

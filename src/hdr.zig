@@ -1123,7 +1123,7 @@ test "decodeBase64 errors (never panics) on malformed blobs" {
         try testing.expectError(error.InvalidArguments, decodeBase64(gpa, b64));
     }
     // lowest_discernible whose log2 doesn't fit unit_magnitude's u5, but which
-    // clears every other check (see the `init` @intCast this used to panic on).
+    // clears every other check, so `init`'s @intCast is what has to reject it.
     {
         const b64 = try buildTestBlob(gpa, 3, 1 << 32, (1 << 32) * 4, &.{});
         defer gpa.free(b64);

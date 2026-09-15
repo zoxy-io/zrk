@@ -249,7 +249,7 @@ pub const Sweeper = struct {
 
     /// Spawn the sweeper thread. Must be called on a pinned `Sweeper` (the
     /// thread keeps the pointer). Spawn failure is not fatal: `snapshot` then
-    /// merges inline, exactly as it did before this thread existed.
+    /// merges inline on the caller's thread.
     pub fn start(self: *Sweeper) void {
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
     }

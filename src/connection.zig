@@ -1,11 +1,13 @@
 //! A single load-generating connection: connect, then repeatedly pace-and-send
-//! one request at a time, recording coordinated-omission-corrected latency.
+//! requests, recording coordinated-omission-corrected latency.
 //!
-//! One request is in flight per connection at a time (like wrk/wrk2). Achieving
-//! a high total rate is a matter of running many connections; each connection
-//! paces its own sends to a fixed schedule so that, when the server falls
-//! behind, backlogged requests still accrue latency against their *intended*
-//! send time rather than their actual send time.
+//! By default one request is in flight per connection at a time (like
+//! wrk/wrk2); over HTTP/2, `--streams` lets a connection keep several open
+//! (`runMultiplexed`). Achieving a high total rate is a matter of running many
+//! connections; each connection paces its own sends to a fixed schedule so
+//! that, when the server falls behind, backlogged requests still accrue
+//! latency against their *intended* send time rather than their actual send
+//! time.
 
 const std = @import("std");
 const Io = std.Io;
@@ -475,8 +477,8 @@ const WorkResult = union(enum) {
 /// Requests are strictly sequential on a connection — at most one is ever on
 /// the wire — so one watcher can enforce every request's bound. The request
 /// loop only publishes the in-flight deadline here (`arm`) and withdraws it
-/// (`disarm`); both are a couple of atomic stores, against a task spawn plus
-/// cancel-and-join per request for the old `watchTimer`.
+/// (`disarm`); both are a couple of atomic stores, where a task spawned and
+/// cancelled per request would cost a spawn plus a join each time.
 const Watchdog = struct {
     /// Absolute monotonic-ns deadline of the request on the wire (0 = idle).
     deadline_ns: std.atomic.Value(u64) = .init(0),
@@ -1535,7 +1537,7 @@ test "run drives HTTP/2 requests against a local h2c server" {
     try testing.expectEqual(@as(u64, 0), counters.write_errors);
     try testing.expectEqual(@as(u64, 0), counters.connect_errors);
     // Every completed request is a recorded latency sample, exactly as over
-    // HTTP/1.1 — which is the property this whole slice exists to preserve.
+    // HTTP/1.1 — which is the property the HTTP/2 path exists to preserve.
     try testing.expectEqual(counters.completed, histogram.count());
     // Two octets of body plus the response header block, per request.
     try testing.expect(counters.bytes >= counters.completed * 2);
@@ -1732,17 +1734,17 @@ test "streams put more than one request on the wire at once" {
     // The server holds one request back by construction, so the stream still
     // open when the run ends has nothing to answer it: exactly one bound blows.
     try testing.expect(counters.timeouts <= 1);
-    // The property #21 shipped and this slice had to keep. Timed-out requests
-    // are recorded too (`record_timeouts` defaults on), so they count here.
+    // Timed-out requests are recorded too (`record_timeouts` defaults on), so
+    // they count here.
     try testing.expectEqual(counters.completed + counters.timeouts, histogram.count());
 }
 
 test "a stalled stream is reset alone, leaving the other samples intact" {
-    // The whole difference between this slice and the serial one. `run` would
-    // answer a stalled request by shutting the socket down, which is exact when
-    // the connection holds one request and destroys N − 1 innocent samples when
-    // it holds N. Here the bound is spent on a RST_STREAM for the one stream
-    // that blew it, and the connection carries on measuring.
+    // The whole difference between the multiplexed path and the serial one.
+    // The serial path answers a stalled request by shutting the socket down,
+    // which is exact when the connection holds one request and destroys N − 1
+    // innocent samples when it holds N. Here the bound is spent on a RST_STREAM
+    // for the one stream that blew it, and the connection carries on measuring.
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
     const io = rt.io();
@@ -1792,10 +1794,10 @@ test "a stalled stream is reset alone, leaving the other samples intact" {
 
 /// An h2c server that ends every response with a trailers section.
 ///
-/// Legal (RFC 9113 section 8.1) and routine — gRPC does nothing else — and the
-/// shape that used to be fatal: a second field block carries no `:status`, so
-/// decoding one as though it must have failed the whole connection and took
-/// every other in-flight stream's sample with it.
+/// Legal (RFC 9113 section 8.1) and routine — gRPC does nothing else — and a
+/// shape that has to be handled on its own terms: a second field block carries
+/// no `:status`, and decoding it as though it must would fail the whole
+/// connection and take every other in-flight stream's sample with it.
 fn h2TrailerServe(io: Io, server: *net.Server) void {
     var stream = server.accept(io) catch return;
     defer stream.close(io);
@@ -2405,8 +2407,8 @@ test "connect errors surface in the published snapshot during total outage" {
     run(&params);
 
     try testing.expect(counters.connect_errors > 0);
-    // The refused connects must be visible to the dashboard: previously only
-    // successful responses published, so an unreachable target showed nothing.
+    // The refused connects must be visible to the dashboard: if only successful
+    // responses published, an unreachable target would show nothing.
     try testing.expect(publish.counters.connect_errors > 0);
 }
 

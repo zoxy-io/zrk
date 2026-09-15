@@ -533,9 +533,9 @@ test "run's elapsed time tracks the duration, not the interval grid" {
     var cfg: cli.Config = .{
         .connections = 1,
         .rate = 200,
-        // 300ms run with a 1s snapshot interval: the old loop always slept a
-        // full interval before checking `end`, reporting ~1s elapsed for a
-        // 0.3s test and deflating Requests/sec by >3x.
+        // 300ms run with a 1s snapshot interval: a loop that slept a full
+        // interval before checking `end` would report ~1s elapsed for a 0.3s
+        // test and deflate Requests/sec by >3x.
         .duration_ns = 300 * std.time.ns_per_ms,
         .interval_ns = 1 * std.time.ns_per_s,
         .url = try cli.parseUrl(url),
@@ -618,7 +618,7 @@ fn runCapturing(io: Io, gpa: std.mem.Allocator, cfg: *const cli.Config, out: *?a
 
 test "a canceled run propagates instead of reporting a truncated success" {
     // `run` is the embeddable entry point, so an embedder can cancel the
-    // coroutine it runs in. Swallowing that (the old `catch break`) returned a
+    // coroutine it runs in. Swallowing that with a `catch break` would return a
     // Report covering a fraction of --duration with nothing marking it short,
     // which a CI gate would then happily evaluate.
     var rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(2) });
