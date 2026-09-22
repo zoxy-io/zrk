@@ -230,6 +230,14 @@ pub fn run(p: *Params) void {
     // drives it, persisting across reconnects so a stall is caught up (not reset).
     var anchor: ?Io.Timestamp = null;
     var send_index: u64 = 0;
+    // Whether the request at `send_index` is going out a second time, after
+    // an HTTP/2 peer declined the first without processing it. A second
+    // refusal is charged, so a peer declining everything is a run of errors
+    // rather than a silent loop.
+    var resending = false;
+    // The multiplexed path's equivalent, which can hold several: see
+    // `RetryQueue`.
+    var retry: RetryQueue = .{};
 
     while (!p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds) {
         // (Re)connect, bounded by the time left in the run. A peer that accepts
@@ -330,7 +338,7 @@ pub fn run(p: *Params) void {
         // one watchdog for the connection, one `send_index` consumed in place
         // — are exactly what a second open stream breaks.
         if (p.http2 and p.streams > 1) {
-            runMultiplexed(p, io, &h2_session, &anchor, &send_index);
+            runMultiplexed(p, io, &h2_session, &anchor, &send_index, &retry);
             stream.close(io);
             continue;
         }
@@ -352,6 +360,12 @@ pub fn run(p: *Params) void {
         while (conn_open and !p.stop.load(.monotonic)) {
             const t = now(io);
             if (t.nanoseconds >= p.end.nanoseconds) return;
+
+            // RFC 9113 section 6.8: no new stream after a GOAWAY. Checked
+            // before the schedule is consulted, so the request that would have
+            // gone out here goes out on the next connection instead — the same
+            // index, and so the same scheduled time.
+            if (p.http2 and h2_session.peer_going_away) break;
 
             // Anchor the schedule on the first request; each send's intended
             // time is a closed-form function of its index (constant or ramp).
@@ -422,14 +436,36 @@ pub fn run(p: *Params) void {
 
             switch (work) {
                 .write_failed => {
+                    resending = false;
                     if (deadline_hit) noteDeadline(p) else if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .write);
                     conn_open = false;
                 },
                 .read_failed => {
+                    resending = false;
                     if (deadline_hit) noteDeadline(p) else if (timed_out) noteTimeout(p, io, scheduled) else noteError(p, .read);
                     conn_open = false;
                 },
+                // The peer declined the request without processing it, so it
+                // is sent again on the next connection: `send_index` steps
+                // back, which gives it back its scheduled time — once.
+                .refused => {
+                    if (deadline_hit) {
+                        noteDeadline(p);
+                    } else if (timed_out) {
+                        noteTimeout(p, io, scheduled);
+                    } else if (!resending) {
+                        send_index -= 1;
+                        resending = true;
+                        conn_open = false;
+                        continue;
+                    } else {
+                        noteError(p, .read);
+                    }
+                    resending = false;
+                    conn_open = false;
+                },
                 .ok => |resp| {
+                    resending = false;
                     // Coordinated-omission-corrected latency: measured from the
                     // time the request *should* have been sent, not when it
                     // actually went out.
@@ -469,6 +505,9 @@ const WorkResult = union(enum) {
     ok: httpmod.Response,
     write_failed,
     read_failed,
+    /// HTTP/2 only: the peer declined the request without processing it, by
+    /// GOAWAY or REFUSED_STREAM, so it may be sent again.
+    refused,
 };
 
 /// One connection's wire-timeout/CO-abort state, enforced by a single
@@ -627,6 +666,57 @@ const Slot = struct {
     /// collapse of two bounds into one that `Watchdog` does, per stream.
     deadline_ns: u64 = 0,
     deadline_co: bool = false,
+    /// Whether this is the request's second attempt, after the peer declined
+    /// the first. See `RetryQueue`.
+    retried: bool = false,
+};
+
+/// Requests an HTTP/2 peer declined without processing them — streams past a
+/// GOAWAY's last stream, or reset with REFUSED_STREAM (RFC 9113 sections 6.8
+/// and 8.7) — and requests that lost the race with a GOAWAY and never left.
+/// Sent again ahead of the schedule, at the time each was *scheduled* for, so
+/// a server recycling connections costs a retry rather than a failure and a
+/// retried latency still runs from when the request was due.
+///
+/// Oldest first, and owned by the connection loop rather than by one `Mux`:
+/// the next connection is where these go out.
+///
+/// Never more than `streams_max`: an entry only ever comes out of a slot, and
+/// the sender takes from here before it takes from the schedule.
+const RetryQueue = struct {
+    entries: [streams_max]Entry = undefined,
+    len: usize = 0,
+
+    const Entry = struct {
+        scheduled: Io.Timestamp,
+        /// Whether sending it again is a second attempt.
+        retried: bool,
+    };
+
+    fn push(queue: *RetryQueue, entry: Entry) void {
+        std.debug.assert(queue.len < queue.entries.len);
+        var at = queue.len;
+        while (at > 0 and queue.entries[at - 1].scheduled.nanoseconds > entry.scheduled.nanoseconds) : (at -= 1) {
+            queue.entries[at] = queue.entries[at - 1];
+        }
+        queue.entries[at] = entry;
+        queue.len += 1;
+    }
+
+    fn pop(queue: *RetryQueue) ?Entry {
+        if (queue.len == 0) return null;
+        const head = queue.entries[0];
+        std.mem.copyForwards(Entry, queue.entries[0 .. queue.len - 1], queue.entries[1..queue.len]);
+        queue.len -= 1;
+        return head;
+    }
+};
+
+/// Where a request `Mux.send` is about to put on a stream came from: the
+/// schedule, which it advances, or the retry queue, which it does not.
+const Origin = union(enum) {
+    schedule: *u64,
+    retry: RetryQueue.Entry,
 };
 
 /// State shared by one connection's three coroutines.
@@ -635,6 +725,8 @@ const Mux = struct {
     p: *Params,
     session: *h2conn.Session,
     slots: []Slot,
+    /// The connection loop's, not this connection's. Guarded by `state`.
+    retry: *RetryQueue,
 
     /// Guards `slots` and the three flags below — and `p.histogram` and
     /// `p.counters`, which stop being the sender's private property the moment
@@ -794,6 +886,41 @@ const Mux = struct {
         mux.slot_free.broadcast(mux.io);
     }
 
+    /// A request the peer declined without processing: freed without an
+    /// error and queued to go out again — once. Declined a second time, it is
+    /// a read error like any other refusal. Caller holds `state`.
+    fn requeue(mux: *Mux, slot: *Slot) void {
+        const entry: RetryQueue.Entry = .{ .scheduled = slot.scheduled, .retried = true };
+        const again = slot.retried;
+        mux.release(slot);
+        if (again) {
+            noteError(mux.p, .read);
+            return;
+        }
+        mux.retry.push(entry);
+    }
+
+    /// GOAWAY: open nothing more, and retry what the peer will not process.
+    /// Caller holds `state`.
+    fn goAway(mux: *Mux) void {
+        mux.no_new_streams = true;
+        const last = mux.session.peer_last_stream;
+        for (mux.slots) |*slot| {
+            // 0 is a slot the sender has claimed but not opened; `send` finds
+            // the GOAWAY when it tries.
+            if (!slot.busy or slot.stream == 0 or slot.stream <= last) continue;
+            mux.requeue(slot);
+        }
+        mux.slot_free.broadcast(mux.io);
+    }
+
+    /// Whether a declined request is waiting to go out again.
+    fn hasRetry(mux: *Mux) bool {
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        return mux.retry.len > 0;
+    }
+
     /// Stop on our own terms; see `retiring`.
     fn retire(mux: *Mux) void {
         mux.state.lockUncancelable(mux.io);
@@ -807,7 +934,7 @@ const Mux = struct {
     /// blown. Verbatim the serial path's rule: a request staler than the
     /// deadline can never meet it, so it is failed here without touching the
     /// wire, which drains backlog instead of serializing through it.
-    fn shed(mux: *Mux, scheduled: Io.Timestamp, t: Io.Timestamp, send_index: *u64) bool {
+    fn shed(mux: *Mux, scheduled: Io.Timestamp, t: Io.Timestamp, origin: Origin) bool {
         const p = mux.p;
         mux.state.lockUncancelable(mux.io);
         defer mux.state.unlock(mux.io);
@@ -815,13 +942,17 @@ const Mux = struct {
         if (behind_ns > 0) p.counters.noteBehind(@intCast(behind_ns));
         if (p.deadline_ns == 0 or behind_ns <= p.deadline_ns) return false;
         noteDeadline(p);
-        send_index.* += 1;
+        switch (origin) {
+            .schedule => |send_index| send_index.* += 1,
+            // Already off the queue; shedding it is dropping it.
+            .retry => {},
+        }
         return true;
     }
 
     /// Publish the stream, arm its deadline, and write the request on it.
     /// False when the connection can carry nothing more.
-    fn send(mux: *Mux, slot: *Slot, send_index: *u64) bool {
+    fn send(mux: *Mux, slot: *Slot, origin: Origin) bool {
         const p = mux.p;
         const io = mux.io;
 
@@ -840,7 +971,15 @@ const Mux = struct {
             // here — `shed` yields, and `fail` reclaims every open slot. Then
             // this slot is somebody else's (or nobody's) and must not be
             // written into.
-            if (!slot.busy or mux.dead) break :blk 0;
+            if (!slot.busy or mux.dead) {
+                // A retry is already off the queue, and the schedule has no
+                // index to resume it from: put it back for the next connection.
+                switch (origin) {
+                    .retry => |entry| mux.retry.push(entry),
+                    .schedule => {},
+                }
+                break :blk 0;
+            }
             slot.stream = mux.session.peekStream();
             // Both bounds are absolute timestamps — the wire timeout from the
             // actual send, the CO abort from `scheduled` — so the earlier one
@@ -861,7 +1000,10 @@ const Mux = struct {
         // resumes here on the next connection.
         if (stream == 0) return false;
 
-        send_index.* += 1;
+        switch (origin) {
+            .schedule => |send_index| send_index.* += 1,
+            .retry => {},
+        }
 
         _ = mux.session.beginStream(p.request_block, p.body) catch |err| {
             mux.state.lockUncancelable(io);
@@ -871,10 +1013,16 @@ const Mux = struct {
             // which case the request has been charged once already and charging
             // it again would double-count one send as two errors.
             if (slot.busy and slot.stream == stream) {
-                // A refusal to open (GOAWAY, or identifiers exhausted) sent no
-                // request and is not a failure to report; a broken write is.
-                mux.release(slot);
-                if (err != error.Closed and !mux.retiring) noteError(p, .write);
+                // A refusal to open — a GOAWAY that landed after `acquire` —
+                // sent no request, so it goes out on the next connection
+                // rather than being dropped. A broken write is a failure.
+                if (err == error.Closed) {
+                    mux.retry.push(.{ .scheduled = slot.scheduled, .retried = slot.retried });
+                    mux.release(slot);
+                } else {
+                    mux.release(slot);
+                    if (!mux.retiring) noteError(p, .write);
+                }
             }
             mux.dead = true;
             mux.slot_free.broadcast(io);
@@ -895,6 +1043,7 @@ fn runMultiplexed(
     session: *h2conn.Session,
     anchor: *?Io.Timestamp,
     send_index: *u64,
+    retry: *RetryQueue,
 ) void {
     // The peer's SETTINGS arrived during `open`, so its concurrency limit is
     // known before the first send instead of discovered by overshooting it.
@@ -910,6 +1059,7 @@ fn runMultiplexed(
         .p = p,
         .session = session,
         .slots = slot_storage[0..depth],
+        .retry = retry,
     };
 
     var group: Io.Group = .init;
@@ -955,6 +1105,29 @@ fn muxSend(mux: *Mux, anchor: *?Io.Timestamp, send_index: *u64) void {
         const t = now(io);
         if (t.nanoseconds >= p.end.nanoseconds) return;
 
+        // A request the peer declined goes first, at the time it was scheduled
+        // for: it is older than anything the schedule has due. Only this
+        // coroutine takes from the queue, so what it saw there is still there
+        // once it holds a slot.
+        if (mux.hasRetry()) {
+            const slot = mux.acquire() orelse return;
+            const entry = blk: {
+                mux.state.lockUncancelable(io);
+                defer mux.state.unlock(io);
+                break :blk mux.retry.pop().?;
+            };
+            if (mux.shed(entry.scheduled, now(io), .{ .retry = entry })) {
+                mux.state.lockUncancelable(io);
+                defer mux.state.unlock(io);
+                mux.release(slot);
+                continue;
+            }
+            slot.scheduled = entry.scheduled;
+            slot.retried = entry.retried;
+            if (!mux.send(slot, .{ .retry = entry })) return;
+            continue;
+        }
+
         // Closed loop has no schedule to solve: the send is intended for
         // whenever a stream frees, so the slot is taken first and `scheduled`
         // read off the clock after. That degenerately zeroes the pacing wait,
@@ -964,7 +1137,7 @@ fn muxSend(mux: *Mux, anchor: *?Io.Timestamp, send_index: *u64) void {
         if (p.schedule == .closed) {
             const slot = mux.acquire() orelse return;
             slot.scheduled = now(io);
-            if (!mux.send(slot, send_index)) return;
+            if (!mux.send(slot, .{ .schedule = send_index })) return;
             continue;
         }
 
@@ -974,7 +1147,7 @@ fn muxSend(mux: *Mux, anchor: *?Io.Timestamp, send_index: *u64) void {
         const offset = p.schedule.offsetNs(send_index.*, p.phase);
         const scheduled = anchor.*.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
 
-        if (mux.shed(scheduled, t, send_index)) continue;
+        if (mux.shed(scheduled, t, .{ .schedule = send_index })) continue;
 
         // Pace: ahead of schedule, wait; behind, fire immediately.
         if (scheduled.nanoseconds > t.nanoseconds) {
@@ -989,7 +1162,7 @@ fn muxSend(mux: *Mux, anchor: *?Io.Timestamp, send_index: *u64) void {
         // previous response, at N only a connection already N deep waits at
         // all. Charge it, and re-test the deadline against it — a request that
         // spent its whole deadline queued here is shed rather than sent stale.
-        if (mux.shed(scheduled, now(io), send_index)) {
+        if (mux.shed(scheduled, now(io), .{ .schedule = send_index })) {
             mux.state.lockUncancelable(io);
             defer mux.state.unlock(io);
             mux.release(slot);
@@ -997,7 +1170,7 @@ fn muxSend(mux: *Mux, anchor: *?Io.Timestamp, send_index: *u64) void {
         }
 
         slot.scheduled = scheduled;
-        if (!mux.send(slot, send_index)) return;
+        if (!mux.send(slot, .{ .schedule = send_index })) return;
     }
 }
 
@@ -1025,6 +1198,12 @@ fn muxReceive(mux: *Mux) void {
                 resetOneSlot(mux, stream);
                 break :blk true;
             },
+            .refused => |stream| blk: {
+                mux.state.lockUncancelable(io);
+                defer mux.state.unlock(io);
+                if (mux.find(stream)) |slot| mux.requeue(slot);
+                break :blk true;
+            },
             // Recorded, not sent: `flushOwed` below decides whether the
             // writer can be had without stalling the read.
             .reply => |owed| blk: {
@@ -1034,12 +1213,12 @@ fn muxReceive(mux: *Mux) void {
                 }
                 break :blk false;
             },
-            // Open streams may still finish; the sender stops opening new ones.
+            // Open streams up to the last one the peer took may still finish;
+            // the rest are retried, and the sender stops opening new ones.
             .going_away => blk: {
                 mux.state.lockUncancelable(io);
                 defer mux.state.unlock(io);
-                mux.no_new_streams = true;
-                mux.slot_free.broadcast(io);
+                mux.goAway();
                 break :blk false;
             },
             .idle => false,
@@ -1216,6 +1395,7 @@ fn performWorkHttp2(p: *Params, session: *h2conn.Session) WorkResult {
         // the transport did not fail. Counted as a read error for the same
         // reason an HTTP/1.1 server closing mid-response is.
         error.Closed => return .read_failed,
+        error.Refused => return .refused,
         error.Protocol, error.TooLarge => return .read_failed,
     };
     return .{ .ok = resp };
@@ -2689,4 +2869,20 @@ test "a generous deadline never fires against a healthy server" {
     try testing.expectEqual(@as(u64, 0), counters.deadline_errors);
     try testing.expectEqual(@as(u64, 0), counters.timeouts);
     try testing.expectEqual(counters.completed, histogram.count());
+}
+
+test "the HTTP/2 retry queue gives requests back oldest first" {
+    var queue: RetryQueue = .{};
+    // Handed over in slot-table order, which a GOAWAY walks and which is not
+    // the order the requests were scheduled in.
+    queue.push(.{ .scheduled = .{ .nanoseconds = 300 }, .retried = true });
+    queue.push(.{ .scheduled = .{ .nanoseconds = 100 }, .retried = true });
+    queue.push(.{ .scheduled = .{ .nanoseconds = 200 }, .retried = false });
+
+    try testing.expectEqual(@as(i96, 100), queue.pop().?.scheduled.nanoseconds);
+    const second = queue.pop().?;
+    try testing.expectEqual(@as(i96, 200), second.scheduled.nanoseconds);
+    try testing.expect(!second.retried);
+    try testing.expectEqual(@as(i96, 300), queue.pop().?.scheduled.nanoseconds);
+    try testing.expectEqual(@as(?RetryQueue.Entry, null), queue.pop());
 }
