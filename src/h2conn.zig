@@ -150,6 +150,10 @@ pub const Error = error{
     /// The peer sent GOAWAY, or closed. Not an error in itself — the caller
     /// reconnects — but this exchange did not complete.
     Closed,
+    /// The peer did not process this request, and said so: its stream is past
+    /// the last one a GOAWAY accepted (section 6.8), or it was reset with
+    /// REFUSED_STREAM (section 8.7). Either way it is safe to send again.
+    Refused,
     /// A response exceeded a bound we advertised or hold.
     TooLarge,
     /// The transport failed.
@@ -175,10 +179,15 @@ pub const Incoming = union(enum) {
     /// The peer reset `stream` (section 6.4). That stream is over; the
     /// connection is not.
     reset: u31,
+    /// The peer reset `stream` with REFUSED_STREAM: section 8.7 guarantees
+    /// none of the request was processed, so it may be sent again.
+    refused: u31,
     /// The peer is owed an answer. Sent with `Session.reply` by whoever holds
     /// the writer.
     reply: Reply,
-    /// GOAWAY: no new stream may be opened. Open streams may still finish.
+    /// GOAWAY: no new stream may be opened. Open streams up to
+    /// `Session.peer_last_stream` may still finish; the rest were not
+    /// processed.
     going_away,
     /// Nothing a caller can act on — a field-block fragment mid-assembly, or a
     /// frame the RFC says to ignore.
@@ -219,6 +228,10 @@ pub const Session = struct {
     /// Set when the peer has sent GOAWAY. The exchange in flight may still
     /// complete; no new stream may be opened.
     peer_going_away: bool = false,
+    /// The last stream the peer's GOAWAY said it may process. Section 6.8:
+    /// anything above it was not processed and can be retried. Only meaningful
+    /// once `peer_going_away` is set; a second GOAWAY can only lower it.
+    peer_last_stream: u31 = std.math.maxInt(u31),
 
     /// DATA octets received since the last connection-level `WINDOW_UPDATE`.
     /// See `window_replenish_at`.
@@ -433,9 +446,12 @@ pub const Session = struct {
                     if (data.end_stream) return finish(status, bytes);
                 },
                 .reset => |reset| if (reset == stream) return error.Closed,
+                .refused => |refused| if (refused == stream) return error.Refused,
                 .reply => |owed| try session.reply(owed),
-                // Recorded on the session; the exchange in flight may finish.
-                .going_away, .idle => {},
+                // Recorded on the session. The exchange in flight may still
+                // finish — unless it is past the last stream the peer took.
+                .going_away => if (stream > session.peer_last_stream) return error.Refused,
+                .idle => {},
             }
         }
         return error.Protocol;
@@ -481,7 +497,10 @@ pub const Session = struct {
                     .end_stream = header.has(.end_stream),
                 } };
             },
-            .rst_stream => return .{ .reset = header.stream_identifier },
+            .rst_stream => |reset| return if (reset.error_code == .refused_stream)
+                .{ .refused = header.stream_identifier }
+            else
+                .{ .reset = header.stream_identifier },
             // Section 6.5: take what we are told, and acknowledge.
             .settings => {
                 if (header.has(.ack)) return .idle;
@@ -494,8 +513,12 @@ pub const Session = struct {
             },
             // Section 6.8: no new stream after this. Streams already open may
             // still finish, so this is recorded rather than raised.
-            .goaway => {
+            .goaway => |goaway| {
                 session.peer_going_away = true;
+                // A later GOAWAY may lower the bound but not raise it: section
+                // 6.8 forbids the increase, and taking the minimum means a
+                // peer that sends one anyway cannot un-refuse a stream.
+                session.peer_last_stream = @min(session.peer_last_stream, goaway.last_stream_identifier);
                 return .going_away;
             },
             // Window updates only matter to a sender, and the only thing this
@@ -890,11 +913,11 @@ test "a stream that ends with data and no headers is refused" {
     try testing.expectError(error.Protocol, session.exchange(request[0..request_len], ""));
 }
 
-test "GOAWAY stops new streams" {
+test "GOAWAY stops new streams, and refuses the ones past its last" {
     var wire: [2048]u8 = undefined;
     var used: usize = 0;
     used += renderFrame(wire[used..], .settings, 0, 0, &.{});
-    // Last-stream-id 0, error code 0: a graceful shutdown.
+    // Last-stream-id 0, error code 0: a graceful shutdown that took nothing.
     used += renderFrame(wire[used..], .goaway, 0, 0, &[_]u8{0} ** 8);
 
     var reader: Io.Reader = .fixed(wire[0..used]);
@@ -905,9 +928,56 @@ test "GOAWAY stops new streams" {
 
     var request: [256]u8 = undefined;
     const request_len = renderResponseBlock(&request, &.{.{ .name = ":method", .value = "GET" }});
-    // The first exchange consumes the GOAWAY while looking for its response and
-    // ends without one; the second is refused before touching the wire.
-    try testing.expectError(error.Io, session.exchange(request[0..request_len], ""));
+    // The first exchange went out on stream 1 before the GOAWAY was read, and
+    // the GOAWAY says the peer processed nothing past 0: section 6.8 makes that
+    // a request safe to send again, not one that failed.
+    try testing.expectError(error.Refused, session.exchange(request[0..request_len], ""));
     try testing.expect(session.peer_going_away);
+    try testing.expectEqual(@as(u31, 0), session.peer_last_stream);
+    // The second is refused before touching the wire.
+    try testing.expectError(error.Closed, session.exchange(request[0..request_len], ""));
+}
+
+test "a stream at or below GOAWAY's last still gets its response" {
+    var wire: [2048]u8 = undefined;
+    var used: usize = 0;
+    used += renderFrame(wire[used..], .settings, 0, 0, &.{});
+    // Last-stream-id 1: the request about to go out on stream 1 is the peer's
+    // to finish, so the exchange waits for it rather than giving up.
+    used += renderFrame(wire[used..], .goaway, 0, 0, &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 0 });
+    var block: [64]u8 = undefined;
+    const block_len = renderResponseBlock(&block, &.{.{ .name = ":status", .value = "200" }});
+    used += renderFrame(wire[used..], .headers, frame.Flag.end_headers.bit() | frame.Flag.end_stream.bit(), 1, block[0..block_len]);
+
+    var reader: Io.Reader = .fixed(wire[0..used]);
+    var out: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out);
+    var session: Session = .init(&reader, &writer);
+    try session.open();
+
+    var request: [256]u8 = undefined;
+    const request_len = renderResponseBlock(&request, &.{.{ .name = ":method", .value = "GET" }});
+    const response = try session.exchange(request[0..request_len], "");
+    try testing.expectEqual(@as(u16, 200), response.status);
+}
+
+test "REFUSED_STREAM is a refusal, any other reset is not" {
+    var wire: [2048]u8 = undefined;
+    var used: usize = 0;
+    used += renderFrame(wire[used..], .settings, 0, 0, &.{});
+    // Section 8.7: REFUSED_STREAM (0x7) guarantees no processing.
+    used += renderFrame(wire[used..], .rst_stream, 0, 1, &[_]u8{ 0, 0, 0, 0x07 });
+    // CANCEL (0x8) promises nothing.
+    used += renderFrame(wire[used..], .rst_stream, 0, 3, &[_]u8{ 0, 0, 0, 0x08 });
+
+    var reader: Io.Reader = .fixed(wire[0..used]);
+    var out: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out);
+    var session: Session = .init(&reader, &writer);
+    try session.open();
+
+    var request: [256]u8 = undefined;
+    const request_len = renderResponseBlock(&request, &.{.{ .name = ":method", .value = "GET" }});
+    try testing.expectError(error.Refused, session.exchange(request[0..request_len], ""));
     try testing.expectError(error.Closed, session.exchange(request[0..request_len], ""));
 }
