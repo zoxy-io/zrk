@@ -236,6 +236,13 @@ const qpack_decoder_stream: u64 = 10;
 /// on its own `--timeout` or `--deadline` is.
 const h3_request_cancelled: u64 = 0x010c;
 
+/// RFC 9114 §8.1's `H3_NO_ERROR`: a close that is a shutdown, not a failure.
+const h3_no_error: u64 = 0x0100;
+
+/// RFC 9114 §8.1's `H3_REQUEST_REJECTED`: the peer declined a request without
+/// processing any of it, which §4.1.1 makes safe to send again.
+const h3_request_rejected: u64 = 0x010b;
+
 /// One request in flight on this connection.
 ///
 /// Deliberately the same fields as `connection.Slot`, and for the same reasons:
@@ -259,6 +266,10 @@ const Slot = struct {
     /// timeout.
     deadline_ns: u64 = 0,
     deadline_co: bool = false,
+    /// Whether this is the request's second attempt, after the peer declined
+    /// the first. A second refusal is charged rather than retried, so a peer
+    /// that declines everything is a run of errors and not a silent loop.
+    retried: bool = false,
 };
 
 /// Everything one connection needs that is too large for a coroutine stack.
@@ -282,6 +293,22 @@ pub const State = struct {
     next_stream: u64 = 0,
     /// Whether this endpoint's control and QPACK streams have gone out.
     http3_started: bool = false,
+    /// The identifier the peer's GOAWAY named, once one has arrived. RFC 9114
+    /// §5.2: no request is opened after it, and requests already on a stream
+    /// at or past it were never processed.
+    goaway: ?u64 = null,
+
+    /// Requests the peer declined without processing, oldest first, by the
+    /// time each was *scheduled*. They go out again ahead of the schedule, so
+    /// a server retiring a connection costs a retry rather than a failure,
+    /// and a retried latency still runs from when the request should have
+    /// been sent.
+    ///
+    /// Kept across reconnects — the next connection is where they are sent.
+    /// Never more than the slot table: an entry only ever comes out of a busy
+    /// slot, and `issue` fills a slot from here before it takes a new one.
+    retry: [requests_max]Io.Timestamp = undefined,
+    retry_len: usize = 0,
 
     datagram: [Connection.datagram_octets]u8 = undefined,
     incoming: [receive_octets]u8 = undefined,
@@ -367,6 +394,11 @@ pub fn run(p: *conn.Params) void {
         serve(p, state, &anchor, &send_index);
         if (p.stop.load(.monotonic)) return;
         if (conn.now(io).nanoseconds >= p.end.nanoseconds) return;
+        // A connection the peer retired with GOAWAY is replaced at once. The
+        // backoff is for a target refusing everything, and a server recycling
+        // connections is not one: the pause would land in every retried
+        // request's latency.
+        if (state.goaway != null) continue;
         // Back off briefly so a target that refuses everything does not spin
         // the CPU building handshakes.
         io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
@@ -376,6 +408,9 @@ pub fn run(p: *conn.Params) void {
 /// One connection attempt: bind, handshake, serve requests, close.
 fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u64) void {
     const io = p.io;
+    // Before anything that can fail: `run` reads this to decide whether the
+    // attempt ended in a GOAWAY, and a stale one would skip its backoff.
+    state.goaway = null;
 
     // A fresh ephemeral port per attempt. QUIC identifies a connection by its
     // connection ID rather than its 4-tuple, so this is not required — but
@@ -465,6 +500,16 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         }
 
         expire(p, state);
+
+        // RFC 9114 §5.2's graceful shutdown, from the client's side: once
+        // every request the peer accepted before its GOAWAY has been answered,
+        // there is nothing left on this connection, so close it cleanly and
+        // let `run` open the next one.
+        if (state.goaway != null and busySlots(state) == 0) {
+            state.connection.closeApplication(h3_no_error);
+            _ = flush(p, state, &socket, now_ns);
+            return;
+        }
 
         if (!flush(p, state, &socket, now_ns)) return;
 
@@ -884,16 +929,24 @@ fn issue(
         // to one it has not permitted is a connection error at the far end
         // rather than a short write here.
         if (!state.connection.streams.peerPermits(state.next_stream)) return;
+        // RFC 9114 §5.2: no new request after a GOAWAY, whatever identifier it
+        // named. What is still waiting goes out on the next connection.
+        if (state.goaway != null) return;
 
         const t = conn.now(io);
         if (t.nanoseconds >= p.end.nanoseconds) return;
+
+        // A request the peer declined goes first, at the time it was scheduled
+        // for — it is older than anything the schedule has due, and it is not
+        // a new request, so it does not advance `send_index`.
+        const retrying = state.retry_len > 0;
 
         // Closed loop has no schedule to solve: the send is intended for
         // whenever a stream frees, which degenerately zeroes the pacing wait,
         // the deadline check and the coordinated-omission correction, leaving
         // genuine round-trip latency.
         if (anchor.* == null) anchor.* = t;
-        const scheduled = if (p.schedule == .closed) t else blk: {
+        const scheduled = if (retrying) state.retry[0] else if (p.schedule == .closed) t else blk: {
             const offset = p.schedule.offsetNs(send_index.*, p.phase);
             break :blk anchor.*.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
         };
@@ -911,7 +964,7 @@ fn issue(
         // ever-staler queue.
         if (p.deadline_ns != 0 and behind_ns > p.deadline_ns) {
             conn.noteDeadline(p);
-            send_index.* += 1;
+            advance(state, send_index, retrying);
             continue;
         }
 
@@ -948,7 +1001,7 @@ fn issue(
         // what keeps that a fact rather than a comment.
         std.debug.assert(state.next_stream % 4 == 0);
         state.next_stream += 4;
-        send_index.* += 1;
+        advance(state, send_index, retrying);
 
         // Both bounds are absolute timestamps — the wire timeout from the
         // actual send, the coordinated-omission abort from `scheduled` — so the
@@ -970,8 +1023,69 @@ fn issue(
             .scheduled = scheduled,
             .deadline_ns = if (co_binds) co_deadline_ns else wire_deadline_ns,
             .deadline_co = co_binds,
+            .retried = retrying,
         };
     }
+}
+
+/// Move past the request `issue` just sent or shed: the head of the retry
+/// queue when that is where it came from, the schedule otherwise.
+fn advance(state: *State, send_index: *u64, retrying: bool) void {
+    if (!retrying) {
+        send_index.* += 1;
+        return;
+    }
+    std.mem.copyForwards(
+        Io.Timestamp,
+        state.retry[0 .. state.retry_len - 1],
+        state.retry[1..state.retry_len],
+    );
+    state.retry_len -= 1;
+}
+
+/// A request the peer did not process: freed without an error, and queued to
+/// go out again at the time it was scheduled for — once. Declined a second
+/// time, it is a read error like any other refusal.
+fn requeue(p: *conn.Params, state: *State, slot: *Slot) void {
+    if (slot.retried) {
+        release(state, slot);
+        conn.noteError(p, .read);
+        return;
+    }
+    std.debug.assert(state.retry_len < state.retry.len);
+    // In scheduled order, which is not the slot table's: a GOAWAY hands its
+    // requests over in whatever order the table holds them.
+    var at = state.retry_len;
+    while (at > 0 and state.retry[at - 1].nanoseconds > slot.scheduled.nanoseconds) : (at -= 1) {
+        state.retry[at] = state.retry[at - 1];
+    }
+    state.retry[at] = slot.scheduled;
+    state.retry_len += 1;
+    release(state, slot);
+}
+
+/// RFC 9114 §5.2's GOAWAY, received. False when the frame itself is a
+/// connection error; the failure is already counted.
+fn goAway(p: *conn.Params, state: *State, identifier: u64) bool {
+    // §7.2.6: from a server, the identifier is a client-initiated
+    // bidirectional stream. `Http3` cannot check this — it does not know which
+    // end it is reading for.
+    if (identifier % 4 != 0) {
+        abandonAll(p, state, .read);
+        conn.noteError(p, .read);
+        return false;
+    }
+    state.goaway = identifier;
+    // §5.2: a request on a stream at or past the identifier "was not or will
+    // not be processed", so it is retried rather than charged. The ones below
+    // it are the peer's to finish, and the connection closes when they have.
+    for (&state.slots) |*slot| {
+        if (!slot.busy or slot.stream < identifier) continue;
+        state.connection.resetStream(slot.stream, h3_request_cancelled) catch {};
+        state.connection.stopSending(slot.stream, h3_request_cancelled) catch {};
+        requeue(p, state, slot);
+    }
+    return true;
 }
 
 /// Drive `Http3` over every stream the connection has reported data on, and
@@ -1010,10 +1124,7 @@ fn drain(p: *conn.Params, state: *State) bool {
         // not this branch is the one that has to be right.
         const stream = state.connection.findStream(id) orelse continue;
         if (stream.receive_state == .reset) {
-            if (slotFor(state, id)) |slot| {
-                release(state, slot);
-                conn.noteError(p, .read);
-            }
+            if (slotFor(state, id)) |slot| resetBy(p, state, slot, stream.reset_code);
             continue;
         }
 
@@ -1036,7 +1147,9 @@ fn drain(p: *conn.Params, state: *State) bool {
             conn.noteError(p, .read);
             return false;
         };
-        for (events[0..result.events]) |event| apply(p, state, event);
+        for (events[0..result.events]) |event| {
+            if (!apply(p, state, event)) return false;
+        }
         if (result.consumed > 0) {
             state.connection.consume(id, result.consumed) catch {
                 abandonAll(p, state, .read);
@@ -1073,29 +1186,31 @@ fn drain(p: *conn.Params, state: *State) bool {
     return true;
 }
 
-/// One HTTP/3 event, applied to the request it belongs to.
-fn apply(p: *conn.Params, state: *State, event: h3.http3.Event) void {
+/// One HTTP/3 event, applied to the request it belongs to. False when the
+/// event ends the connection; the failure is already counted.
+fn apply(p: *conn.Params, state: *State, event: h3.http3.Event) bool {
     switch (event) {
-        // The peer's SETTINGS and its GOAWAY are both connection-level facts
-        // this loop has nothing to do with: it opens one stream per
-        // request and never more than `--streams` of them, and a run that is
-        // told to go away simply reconnects when the peer closes.
-        .settings, .goaway => {},
+        // The peer's SETTINGS is a connection-level fact this loop has nothing
+        // to do with: it opens one stream per request and never more than
+        // `--streams` of them.
+        .settings => {},
+        .goaway => |identifier| return goAway(p, state, identifier),
         .headers => |value| {
-            const slot = slotFor(state, value.stream) orelse return;
+            const slot = slotFor(state, value.stream) orelse return true;
             slot.bytes += value.section.len;
-            if (value.trailers) return;
+            if (value.trailers) return true;
             slot.status = statusOf(state, value.section);
         },
         .data => |value| {
-            const slot = slotFor(state, value.stream) orelse return;
+            const slot = slotFor(state, value.stream) orelse return true;
             slot.bytes += value.payload.len;
         },
         .finished => |id| {
-            const slot = slotFor(state, id) orelse return;
+            const slot = slotFor(state, id) orelse return true;
             complete(p, state, slot);
         },
     }
+    return true;
 }
 
 /// `:status` out of a QPACK field section, or null if it is not there.
@@ -1179,6 +1294,18 @@ fn expire(p: *conn.Params, state: *State) void {
     }
 }
 
+/// A request whose stream the peer reset. RFC 9114 §4.1.1: one rejected with
+/// `H3_REQUEST_REJECTED` was not processed at all and may be sent again, so
+/// it is retried; any other code is the peer failing it.
+fn resetBy(p: *conn.Params, state: *State, slot: *Slot, code: u64) void {
+    if (code == h3_request_rejected) {
+        requeue(p, state, slot);
+        return;
+    }
+    release(state, slot);
+    conn.noteError(p, .read);
+}
+
 /// Every in-flight request, charged to one error kind. The connection is going
 /// away and these responses are never arriving.
 fn abandonAll(p: *conn.Params, state: *State, kind: conn.ErrorKind) void {
@@ -1199,20 +1326,27 @@ fn pollTransport(p: *conn.Params, state: *State) bool {
         switch (event) {
             .stream_readable => |id| noteReadable(state, id),
             .stream_reset => |value| {
-                if (slotFor(state, value.stream)) |slot| {
-                    release(state, slot);
-                    conn.noteError(p, .read);
-                }
+                if (slotFor(state, value.stream)) |slot| resetBy(p, state, slot, value.code);
             },
             .stream_stopped => |value| {
-                if (slotFor(state, value.stream)) |slot| {
+                const slot = slotFor(state, value.stream) orelse continue;
+                // A rejection can arrive as STOP_SENDING ahead of the reset
+                // that carries the same code, and it means the same thing.
+                if (value.code == h3_request_rejected) {
+                    requeue(p, state, slot);
+                } else {
                     release(state, slot);
                     conn.noteError(p, .write);
                 }
             },
-            .closed => {
+            .closed => |value| {
+                // Requests still in flight are lost whatever the code says.
+                // The close itself is a failure only when it names one: a
+                // server shutting down cleanly — after a GOAWAY, or retiring
+                // an idle connection — has done nothing wrong.
                 abandonAll(p, state, .read);
-                conn.noteError(p, .read);
+                const clean = value.code == if (value.application) h3_no_error else 0;
+                if (!clean) conn.noteError(p, .read);
                 return false;
             },
             // `overflowed` means events were produced faster than this loop
@@ -1359,6 +1493,8 @@ fn elapsed(io: Io, origin: Io.Timestamp) u64 {
 }
 
 const testing = std.testing;
+const zio = @import("zio");
+const hdr = @import("hdr.zig");
 
 /// Build one control message the way the kernel actually does.
 ///
@@ -1567,4 +1703,150 @@ test "a request body rides in a DATA frame after the header block" {
     // frame layer wrote; finding them is enough to say the two frames were
     // concatenated rather than one overwriting the other.
     try testing.expect(std.mem.indexOf(u8, frame, "hello") != null);
+}
+
+/// A connection's bookkeeping with no socket under it, for the tests that
+/// drive the GOAWAY and rejection paths by hand. The transport is built but
+/// never handshakes, so the stream resets those paths send are refused — they
+/// are best effort, and what is under test is what happens to the slots.
+const Fixture = struct {
+    rt: *zio.Runtime,
+    state: *State,
+    histogram: hdr.Histogram,
+    counters: conn.Counters = .{},
+    stop: std.atomic.Value(bool) = .init(false),
+    params: conn.Params = undefined,
+
+    fn create() !*Fixture {
+        const self = try testing.allocator.create(Fixture);
+        errdefer testing.allocator.destroy(self);
+        self.* = .{
+            .rt = undefined,
+            .state = try testing.allocator.create(State),
+            .histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3),
+        };
+        self.rt = try zio.Runtime.init(testing.allocator, .{});
+        self.state.init();
+        const ids = [_]u8{0x5a} ** (2 * connection_id_octets);
+        self.state.connection = .init(.{
+            .side = .client,
+            .original_destination = try quic.ConnectionId.init(ids[0..connection_id_octets]),
+            .source = try quic.ConnectionId.init(ids[connection_id_octets..]),
+        });
+        self.state.http3 = .init(.client);
+        const io = self.rt.io();
+        self.params = .{
+            .io = io,
+            .address = try net.IpAddress.parse("127.0.0.1", 443),
+            .host = "127.0.0.1",
+            .request = "",
+            .http3 = true,
+            .is_tls = true,
+            .insecure = true,
+            .schedule = .closed,
+            .timeout_ns = 0,
+            .end = conn.now(io),
+            .stop = &self.stop,
+            .histogram = &self.histogram,
+            .counters = &self.counters,
+        };
+        return self;
+    }
+
+    fn destroy(self: *Fixture) void {
+        self.histogram.deinit();
+        self.rt.deinit();
+        testing.allocator.destroy(self.state);
+        testing.allocator.destroy(self);
+    }
+
+    /// Put a request in flight on `stream`, scheduled `at` nanoseconds in.
+    fn inFlight(self: *Fixture, stream: u64, at: i96) *Slot {
+        const slot = freeSlot(self.state).?;
+        slot.* = .{ .busy = true, .stream = stream, .scheduled = .{ .nanoseconds = at } };
+        return slot;
+    }
+};
+
+test "a GOAWAY retries what the peer never processed and leaves the rest to finish" {
+    const f = try Fixture.create();
+    defer f.destroy();
+
+    _ = f.inFlight(8, 100);
+    _ = f.inFlight(12, 200);
+    _ = f.inFlight(16, 300);
+
+    // RFC 9114 §5.2: 12 and 16 are at or past the identifier, so the peer
+    // did not and will not process them. 8 is below it, and still the
+    // peer's to answer.
+    try testing.expect(goAway(&f.params, f.state, 12));
+
+    try testing.expectEqual(@as(?u64, 12), f.state.goaway);
+    try testing.expectEqual(@as(usize, 1), busySlots(f.state));
+    try testing.expect(slotFor(f.state, 8) != null);
+    // Retried, not charged — and in the order they were scheduled, carrying
+    // the time they were due rather than the time of the retry.
+    try testing.expectEqual(@as(u64, 0), f.counters.read_errors);
+    try testing.expectEqual(@as(usize, 2), f.state.retry_len);
+    try testing.expectEqual(@as(i96, 200), f.state.retry[0].nanoseconds);
+    try testing.expectEqual(@as(i96, 300), f.state.retry[1].nanoseconds);
+}
+
+test "a GOAWAY naming anything but a client request stream is a connection error" {
+    const f = try Fixture.create();
+    defer f.destroy();
+
+    _ = f.inFlight(0, 100);
+
+    // §7.2.6: from a server the identifier is a client-initiated
+    // bidirectional stream. 2 is a client unidirectional one.
+    try testing.expect(!goAway(&f.params, f.state, 2));
+    try testing.expectEqual(@as(usize, 0), busySlots(f.state));
+    try testing.expectEqual(@as(usize, 0), f.state.retry_len);
+    // The in-flight request, and the connection itself.
+    try testing.expectEqual(@as(u64, 2), f.counters.read_errors);
+}
+
+test "a request the peer rejected is retried once, then charged" {
+    const f = try Fixture.create();
+    defer f.destroy();
+
+    // §4.1.1: H3_REQUEST_REJECTED means no part of the request was
+    // processed, so it may go out again.
+    resetBy(&f.params, f.state, f.inFlight(0, 100), h3_request_rejected);
+    try testing.expectEqual(@as(usize, 1), f.state.retry_len);
+    try testing.expectEqual(@as(u64, 0), f.counters.read_errors);
+
+    // Its second attempt is marked as one. Refused again, it is an error —
+    // otherwise a peer rejecting everything would be a run reporting nothing.
+    const again = f.inFlight(4, 100);
+    again.retried = true;
+    resetBy(&f.params, f.state, again, h3_request_rejected);
+    try testing.expectEqual(@as(usize, 1), f.state.retry_len);
+    try testing.expectEqual(@as(u64, 1), f.counters.read_errors);
+
+    // Any other code is the peer failing the request, first attempt or not.
+    resetBy(&f.params, f.state, f.inFlight(8, 100), h3_request_cancelled);
+    try testing.expectEqual(@as(usize, 1), f.state.retry_len);
+    try testing.expectEqual(@as(u64, 2), f.counters.read_errors);
+}
+
+test "retries go out oldest first and do not advance the schedule" {
+    const f = try Fixture.create();
+    defer f.destroy();
+
+    // Handed over out of order, as a GOAWAY walking the slot table would.
+    requeue(&f.params, f.state, f.inFlight(4, 200));
+    requeue(&f.params, f.state, f.inFlight(0, 100));
+    try testing.expectEqual(@as(i96, 100), f.state.retry[0].nanoseconds);
+
+    var send_index: u64 = 7;
+    advance(f.state, &send_index, true);
+    try testing.expectEqual(@as(u64, 7), send_index);
+    try testing.expectEqual(@as(usize, 1), f.state.retry_len);
+    try testing.expectEqual(@as(i96, 200), f.state.retry[0].nanoseconds);
+
+    advance(f.state, &send_index, false);
+    try testing.expectEqual(@as(u64, 8), send_index);
+    try testing.expectEqual(@as(usize, 1), f.state.retry_len);
 }
