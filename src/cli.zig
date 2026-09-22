@@ -256,7 +256,7 @@ pub const usage =
     \\                            connection per request, like ab. Enforced
     \\                            client-side, so it also covers servers that
     \\                            ignore the Connection: close it sends.
-    \\                            Not available with --http2
+    \\                            Not available with --http2 or --http3
     \\  -H, --header  <K: V>      Add a request header (repeatable)
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
