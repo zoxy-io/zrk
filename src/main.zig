@@ -3,6 +3,7 @@ const zio = @import("zio");
 const Io = std.Io;
 
 const cli = @import("cli.zig");
+const h3conn = @import("h3conn.zig");
 const runner = @import("runner.zig");
 const stats = @import("stats.zig");
 const report = @import("report.zig");
@@ -43,6 +44,20 @@ pub fn main(init: std.process.Init) !void {
         cfg.body = readBody(arena, io, path) catch |err| {
             try printBodyError(io, path, err);
             std.process.exit(2);
+        };
+    }
+
+    // `cli.parse` bounds an inline `--body` for `--http3`, but it cannot see a
+    // body read from a file, nor the headers that share the same stream write.
+    // Building the request is the one exact check, and doing it here makes an
+    // oversized request the usage error it is rather than a failed run.
+    if (cfg.http3) {
+        _ = h3conn.buildRequest(arena, &cfg) catch |err| switch (err) {
+            error.RequestTooLarge => {
+                try printUsageError(io, error.Http3BodyTooLarge);
+                std.process.exit(2);
+            },
+            else => return err,
         };
     }
 
@@ -422,13 +437,13 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.ZeroRefresh => "zrk: --refresh must be greater than 0\n\n",
         error.ClosedWithRamp => "zrk: --closed is incompatible with a ramp (-R A:B)\n\n",
         error.ClosedWithDeadline => "zrk: --closed is incompatible with --deadline\n\n",
-        error.KeepaliveWithHttp2 => "zrk: --disable-keepalive is incompatible with --http2\n\n",
+        error.KeepaliveWithHttp2 => "zrk: --disable-keepalive is incompatible with --http2 and --http3\n\n",
         error.ZeroStreams => "zrk: streams (-s) must be greater than 0\n\n",
         error.StreamsWithoutHttp2 => "zrk: streams (-s) requires --http2 or --http3; HTTP/1.1 has no second stream to open\n\n",
         error.TooManyStreams => "zrk: streams (-s) exceeds the per-connection maximum\n\n",
         error.Http3WithHttp2 => "zrk: --http3 and --http2 are different transports; run them separately\n\n",
         error.Http3WithoutTls => "zrk: --http3 needs an https:// URL; QUIC has no cleartext mode\n\n",
-        error.Http3BodyTooLarge => "zrk: --body is too large for --http3; the request must fit one QUIC stream write\n\n",
+        error.Http3BodyTooLarge => "zrk: the request is too large for --http3; its headers and --body must fit one QUIC stream write\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);
