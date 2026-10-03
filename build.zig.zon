@@ -46,7 +46,7 @@
         // it every HTTPS connection to a Go server (Caddy, Traefik, net/http)
         // failed on its first read.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#c68966b49dfe68cba2d272510aa1ad272fe73e61",
+            .url = "git+https://github.com/zoxy-io/zssl#9a9448014596c16f7b5c5b5c3ce2a9919f799e47",
             .hash = "zssl-0.0.1-5ocyiLfSEAC7WHwl8JhFXEiYfNXzPxTtDfGeuUspoqtQ",
         },
         // QUIC, QPACK and HTTP/3 — sans-I/O, like h2 and zssl. It opens no
