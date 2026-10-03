@@ -51,6 +51,11 @@ pub const Counters = struct {
     /// Completed responses bucketed by status class, indexed by status/100
     /// (so [1]=1xx .. [5]=5xx; index 0 is unused). Sums to `completed`.
     status_class: [6]u64 = [_]u64{0} ** 6,
+    /// Why the first connection that could not be established failed — a
+    /// refused port, a certificate, a handshake that never finished. Kept so a
+    /// run in which nothing succeeded can say why, instead of reporting a bare
+    /// count of connect errors. See `noteConnectFailure`.
+    first_connect_error: ?anyerror = null,
 
     pub fn add(self: *Counters, other: Counters) void {
         self.completed += other.completed;
@@ -63,6 +68,7 @@ pub const Counters = struct {
         self.deadline_errors += other.deadline_errors;
         self.max_behind_ns = @max(self.max_behind_ns, other.max_behind_ns);
         for (&self.status_class, other.status_class) |*d, s| d.* += s;
+        if (self.first_connect_error == null) self.first_connect_error = other.first_connect_error;
     }
 
     /// Update the peak schedule-lag gauge with one send's observed lag (ns).
@@ -249,11 +255,11 @@ pub fn run(p: *Params) void {
         const connect_remaining_ns = p.end.nanoseconds - now(io).nanoseconds;
         if (connect_remaining_ns <= 0) return;
         const connect_timeout_ns = deadlineBoundedTimeout(p.timeout_ns, @intCast(connect_remaining_ns));
-        var stream = connect(io, p.address, connect_timeout_ns) catch {
+        var stream = connect(io, p.address, connect_timeout_ns) catch |err| {
             // A connect cut off by the run's own end deadline is a teardown
             // artifact, not a target failure — don't count it as a connect error.
             if (now(io).nanoseconds >= p.end.nanoseconds) return;
-            noteError(p, .connect);
+            noteConnectFailure(p, err);
             // Back off briefly so a refused port doesn't spin the CPU.
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
             continue;
@@ -272,10 +278,30 @@ pub fn run(p: *Params) void {
             // `http/1.1` to an `h2` offer is a real thing to meet, so the
             // negotiated protocol is checked below rather than assumed.
             const alpn = if (p.http2) tlsmod.alpn_http2 else tlsmod.alpn_http1;
-            ts.handshake(io, p.allocator, stream, p.host, p.insecure, p.ca_store, alpn) catch {
-                // A failed handshake counts as a connect error; try again later.
-                noteError(p, .connect);
+            // Bounded the way `connect` is, and the HTTP/2 SETTINGS exchange
+            // below: a peer that accepts the connection and never answers the
+            // ClientHello would otherwise hold this read until the run's end,
+            // and the run would report no requests and no errors at all.
+            var tls_fired: std.atomic.Value(bool) = .init(false);
+            var tls_group: Io.Group = .init;
+            const handshake_remaining_ns = p.end.nanoseconds - now(io).nanoseconds;
+            if (handshake_remaining_ns <= 0) {
                 stream.close(io);
+                return;
+            }
+            const handshake_timeout_ns = deadlineBoundedTimeout(p.timeout_ns, @intCast(handshake_remaining_ns));
+            tls_group.concurrent(io, watchTimer, .{ io, &stream, handshake_timeout_ns, &tls_fired }) catch {};
+            var shook: anyerror!void = ts.handshake(io, p.allocator, stream, p.host, p.insecure, p.ca_store, alpn);
+            tls_group.cancel(io);
+            // The timer can fire as the handshake finishes, and then the socket
+            // is already shut down under a session that looks fine.
+            if (tls_fired.load(.acquire)) shook = error.HandshakeTimeout;
+            shook catch |err| {
+                stream.close(io);
+                // Cut off by the run's own end: a teardown artifact.
+                if (now(io).nanoseconds >= p.end.nanoseconds) return;
+                // A failed handshake counts as a connect error; try again later.
+                noteConnectFailure(p, err);
                 io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
                 continue;
             };
@@ -285,7 +311,7 @@ pub fn run(p: *Params) void {
             // exactly the failure mode the cleartext-only guard existed to
             // prevent, now that ALPN makes the question answerable.
             if (p.http2 and !alpnIs(ts.negotiatedAlpn(), "h2")) {
-                noteError(p, .connect);
+                noteConnectFailure(p, error.AlpnH2Declined);
                 stream.close(io);
                 io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
                 continue;
@@ -319,14 +345,16 @@ pub fn run(p: *Params) void {
             var handshake_group: Io.Group = .init;
             if (p.timeout_ns != 0)
                 handshake_group.concurrent(io, watchTimer, .{ io, &stream, p.timeout_ns, &handshake_fired }) catch {};
-            const opened = h2_session.open();
+            var opened = h2_session.open();
             handshake_group.cancel(io);
+            // As for the TLS handshake: fired at the finish line is fired.
+            if (handshake_fired.load(.acquire)) opened = error.Io;
 
-            opened catch {
+            opened catch |err| {
                 // A handshake cut off by the run's own end is a teardown
                 // artifact, like the connect above.
                 if (now(io).nanoseconds >= p.end.nanoseconds) return;
-                noteError(p, .connect);
+                noteConnectFailure(p, if (handshake_fired.load(.acquire)) error.HandshakeTimeout else err);
                 stream.close(io);
                 io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
                 continue;
@@ -338,8 +366,28 @@ pub fn run(p: *Params) void {
         // one watchdog for the connection, one `send_index` consumed in place
         // — are exactly what a second open stream breaks.
         if (p.http2 and p.streams > 1) {
+            const opened_at = now(io);
             runMultiplexed(p, io, &h2_session, &anchor, &send_index, &retry);
             stream.close(io);
+            // A connection that ended before it opened a single stream — a
+            // GOAWAY straight after SETTINGS, from a proxy draining, or a read
+            // that broke first — carried nothing for `Mux.fail` to charge.
+            // Counted and paced like any other connection that could not be
+            // used, or a peer refusing every connection would spin this loop
+            // and leave a report with no requests and no errors.
+            //
+            // Only a quick end, though. One that sat idle long enough for the
+            // server to retire it — a large `-c` at a small `-R` leaves a
+            // connection waiting longer than many idle timeouts — is a server
+            // doing its job.
+            const lived_ns = now(io).nanoseconds - opened_at.nanoseconds;
+            const quick_ns: i96 = if (p.timeout_ns != 0) p.timeout_ns else std.time.ns_per_s;
+            if (h2_session.peekStream() == 1 and lived_ns < quick_ns and
+                !p.stop.load(.monotonic) and now(io).nanoseconds < p.end.nanoseconds)
+            {
+                noteError(p, .connect);
+                io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
+            }
             continue;
         }
 
@@ -1006,29 +1054,114 @@ const Mux = struct {
         }
 
         _ = mux.session.beginStream(p.request_block, p.body) catch |err| {
+            // A broken write is a failure, of this request and of the
+            // connection under it.
+            if (err != error.Closed) return mux.writeFailed(slot, stream);
+
+            // A refusal to open — a GOAWAY that landed after `acquire`, or the
+            // identifier space running out — sent no request, so it goes out
+            // on the next connection rather than being dropped.
             mux.state.lockUncancelable(io);
             defer mux.state.unlock(io);
-            // The stream never opened, so nothing will ever close it — unless
-            // `fail` already reclaimed the slot while this write was parked, in
-            // which case the request has been charged once already and charging
-            // it again would double-count one send as two errors.
+            // Unless `fail` already reclaimed the slot while this write was
+            // parked, in which case it has been accounted for once already.
             if (slot.busy and slot.stream == stream) {
-                // A refusal to open — a GOAWAY that landed after `acquire` —
-                // sent no request, so it goes out on the next connection
-                // rather than being dropped. A broken write is a failure.
-                if (err == error.Closed) {
-                    mux.retry.push(.{ .scheduled = slot.scheduled, .retried = slot.retried });
-                    mux.release(slot);
-                } else {
-                    mux.release(slot);
-                    if (!mux.retiring) noteError(p, .write);
-                }
+                mux.retry.push(.{ .scheduled = slot.scheduled, .retried = slot.retried });
+                mux.release(slot);
             }
-            mux.dead = true;
+            // Open nothing more, and let what is open finish. Not `dead`: the
+            // connection is fine, and the streams already on it are still the
+            // peer's to answer. Marking it dead ended the drain at once, and
+            // `retire` then dropped every one of them uncounted.
+            mux.no_new_streams = true;
             mux.slot_free.broadcast(io);
             return false;
         };
-        return true;
+        return mux.sendBody(slot, stream);
+    }
+
+    /// A write broke: this request is lost, and so is every other one on the
+    /// connection, each charged once. False, for `send` to return.
+    fn writeFailed(mux: *Mux, slot: *Slot, stream: u31) bool {
+        {
+            mux.state.lockUncancelable(mux.io);
+            defer mux.state.unlock(mux.io);
+            mux.session.abandonBody();
+            // `fail` may already have reclaimed it while this write was
+            // parked, and charged it with the rest.
+            if (slot.busy and slot.stream == stream) {
+                mux.release(slot);
+                if (!mux.retiring) noteError(mux.p, .write);
+            }
+        }
+        mux.fail(.write);
+        return false;
+    }
+
+    /// Send the request body `beginStream` left pending, as far as the peer's
+    /// flow-control windows allow and then as fast as it credits them. Called
+    /// and returns holding `write`; gives it up while waiting for credit, so
+    /// the receiver can still answer a PING and the watchdog can still reset a
+    /// stream. False when the connection can carry nothing more.
+    ///
+    /// Only one body is ever pending, and while it is, no other request goes
+    /// out: a request has to finish before the next starts, and this is the
+    /// one coroutine that sends them. That queue is flow control working.
+    fn sendBody(mux: *Mux, slot: *Slot, stream: u31) bool {
+        const io = mux.io;
+        const session = mux.session;
+        // Bounded by the body, which every write shortens, and by the waits,
+        // each of which ends with credit, a freed slot or a dead connection.
+        while (true) {
+            mux.state.lockUncancelable(io);
+            if (!session.bodyPending()) {
+                mux.state.unlock(io);
+                return true;
+            }
+            // The stream ended under us: answered early, reset by the peer or
+            // by the watchdog, or the connection died. Nothing more goes out
+            // on it.
+            if (mux.dead or !slot.busy or slot.stream != stream) {
+                session.abandonBody();
+                const alive = !mux.dead;
+                mux.state.unlock(io);
+                if (alive) mux.session.resetStream(stream) catch {};
+                return alive;
+            }
+            const octets = session.reserveBody();
+            if (octets > 0) {
+                mux.state.unlock(io);
+                session.writeBody(octets) catch return mux.writeFailed(slot, stream);
+                session.writer.flush() catch return mux.writeFailed(slot, stream);
+                continue;
+            }
+            // No credit. The HEADERS, and anything written so far, go out
+            // before waiting for the peer to answer them.
+            mux.state.unlock(io);
+            session.writer.flush() catch return mux.writeFailed(slot, stream);
+
+            // Wait without the writer. `write` before `state` is the order
+            // everything takes them in, so it is let go here and taken back
+            // only once `state` is free again.
+            mux.state.lockUncancelable(io);
+            mux.write.unlock(io);
+            const canceled = if (mux.dead or !slot.busy or slot.stream != stream or session.bodySendable())
+                false
+            else blk: {
+                mux.slot_free.wait(io, &mux.state) catch break :blk true;
+                break :blk false;
+            };
+            mux.state.unlock(io);
+            mux.write.lockUncancelable(io);
+            if (canceled) {
+                mux.state.lockUncancelable(io);
+                defer mux.state.unlock(io);
+                session.abandonBody();
+                mux.dead = true;
+                mux.slot_free.broadcast(io);
+                return false;
+            }
+        }
     }
 };
 
@@ -1180,9 +1313,8 @@ fn muxReceive(mux: *Mux) void {
     const io = mux.io;
     const session = mux.session;
 
-    // The connection-level replacement for `frames_per_exchange_max`: this loop
-    // never finishes, so what it bounds is frames that finish *nothing*. An
-    // endless SETTINGS or PING flood is the case it exists for.
+    // Frames that carry nothing forward, the same bound the serial exchange
+    // keeps. An endless SETTINGS or PING flood is the case it exists for.
     var idle_frames: u32 = 0;
 
     while (idle_frames < h2conn.frames_without_progress_max) {
@@ -1208,7 +1340,14 @@ fn muxReceive(mux: *Mux) void {
             // writer can be had without stalling the read.
             .reply => |owed| blk: {
                 switch (owed) {
-                    .settings_ack => mux.owed_settings_ack = true,
+                    .settings_ack => {
+                        mux.owed_settings_ack = true;
+                        // A raised SETTINGS_INITIAL_WINDOW_SIZE is credit for
+                        // a pending body as much as a WINDOW_UPDATE is.
+                        mux.state.lockUncancelable(io);
+                        defer mux.state.unlock(io);
+                        if (session.bodyPending()) mux.slot_free.broadcast(io);
+                    },
                     .ping_ack => mux.owed_ping = owed,
                 }
                 break :blk false;
@@ -1220,6 +1359,22 @@ fn muxReceive(mux: *Mux) void {
                 defer mux.state.unlock(io);
                 mux.goAway();
                 break :blk false;
+            },
+            // Send credit, for a body the sender may be waiting to finish.
+            .window => |update| blk: {
+                const credited, const waiting = credit: {
+                    mux.state.lockUncancelable(io);
+                    defer mux.state.unlock(io);
+                    const waiting = session.bodyPending();
+                    session.credit(update.stream, update.increment) catch break :credit .{ false, waiting };
+                    if (waiting) mux.slot_free.broadcast(io);
+                    break :credit .{ true, waiting };
+                };
+                if (!credited) {
+                    mux.fail(.read);
+                    return;
+                }
+                break :blk waiting;
             },
             .idle => false,
         };
@@ -1429,6 +1584,14 @@ pub fn noteError(p: *Params, kind: ErrorKind) void {
         .read => p.counters.read_errors += 1,
     }
     maybePublish(p, now(p.io).nanoseconds);
+}
+
+/// A connect error whose cause is known: counted like any other, and the
+/// first cause kept for the message a run with no successful request ends on.
+pub fn noteConnectFailure(p: *Params, reason: anyerror) void {
+    if (p.stop.load(.monotonic)) return;
+    if (p.counters.first_connect_error == null) p.counters.first_connect_error = reason;
+    noteError(p, .connect);
 }
 
 /// A timed-out request (the watchdog shut the socket down): count it and, unless

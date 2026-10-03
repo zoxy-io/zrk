@@ -3,6 +3,7 @@ const zio = @import("zio");
 const Io = std.Io;
 
 const cli = @import("cli.zig");
+const connection = @import("connection.zig");
 const h3conn = @import("h3conn.zig");
 const runner = @import("runner.zig");
 const stats = @import("stats.zig");
@@ -161,6 +162,16 @@ pub fn main(init: std.process.Init) !void {
     // without evaluating the gates.
     if (result.interrupted) std.process.exit(interrupt.exit_code.load(.monotonic));
 
+    // A run in which no request completed measured nothing, whatever the
+    // report says about it. Exit 1, which is "the run failed", with the reason
+    // when one is known: a certificate, a refused port, a server that does not
+    // speak the protocol asked for. Without this a target that was never
+    // reached exited 0 with a report of zeros.
+    if (snapshot.counters.completed == 0) {
+        try printNothingCompleted(io, snapshot.counters);
+        std.process.exit(1);
+    }
+
     // CI gates: a breach exits 3 so a harness can fail the build.
     const slo = report.checkSlo(&cfg, &snapshot);
     if (!slo.passed()) {
@@ -310,6 +321,43 @@ fn printBodyError(io: Io, path: []const u8, err: anyerror) !void {
     const src = if (std.mem.eql(u8, path, "-")) "stdin" else path;
     const msg = std.fmt.bufPrint(&buf, "zrk: cannot read body from {s}: {s}\n", .{ src, @errorName(err) }) catch
         "zrk: cannot read request body\n";
+    try writeAll(io, .stderr(), msg);
+}
+
+fn printNothingCompleted(io: Io, counters: connection.Counters) !void {
+    var buf: [512]u8 = undefined;
+    // The connect failure is the reason only when connecting is all that
+    // failed; one early refusal followed by a run of timeouts is a run of
+    // timeouts.
+    const only_connects = counters.connect_errors > 0 and
+        counters.read_errors + counters.write_errors + counters.timeouts + counters.deadline_errors == 0;
+    const reason = (if (only_connects) counters.first_connect_error else null) orelse {
+        const msg = if (counters.socketErrors() + counters.deadline_errors == 0)
+            "zrk: no request completed within --duration (try a longer --duration, or a larger --timeout for slow responses)\n"
+        else if (counters.socketErrors() == 0)
+            "zrk: no request completed; every one missed --deadline\n"
+        else
+            "zrk: no request completed; see the socket errors above\n";
+        return writeAll(io, .stderr(), msg);
+    };
+    const hint: []const u8 = switch (reason) {
+        error.CertificateVerificationFailed,
+        error.CertificateHostMismatch,
+        error.CertificateNotTrusted,
+        error.CertificateIssuerNotFound,
+        error.CertificateIssuerNotCa,
+        error.CertificateMalformed,
+        => " (-k skips certificate verification)",
+        error.AlpnH2Declined => " (the server does not speak HTTP/2 over TLS; drop --http2)",
+        error.HandshakeTimeout => " (the handshake did not finish within --timeout)",
+        error.ConnectionRefused => " (nothing is listening on that port)",
+        else => "",
+    };
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "zrk: no request completed; connecting failed: {s}{s}\n",
+        .{ @errorName(reason), hint },
+    ) catch "zrk: no request completed\n";
     try writeAll(io, .stderr(), msg);
 }
 

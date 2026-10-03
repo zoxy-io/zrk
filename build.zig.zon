@@ -40,9 +40,14 @@
         // the `std.Io` adapter and the X.509 chain and hostname verification
         // are zrk's now, because zssl deliberately declines both. That trade
         // is the whole point; see src/tls.zig.
+        //
+        // Pinned at the commit that accepts a session ticket with an empty
+        // nonce. Go's crypto/tls sends one after every handshake, and below
+        // it every HTTPS connection to a Go server (Caddy, Traefik, net/http)
+        // failed on its first read.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#b6a65537b394931b80dbdfa25ec7763b5837b7ae",
-            .hash = "zssl-0.0.1-5ocyiNy-DgCb3DwVFeLhGK8x9olBEfyuRarEMDuMcIl8",
+            .url = "git+https://github.com/zoxy-io/zssl#9a9448014596c16f7b5c5b5c3ce2a9919f799e47",
+            .hash = "zssl-0.0.1-5ocyiLfSEAC7WHwl8JhFXEiYfNXzPxTtDfGeuUspoqtQ",
         },
         // QUIC, QPACK and HTTP/3 — sans-I/O, like h2 and zssl. It opens no
         // socket, reads no clock, draws no entropy and runs no TLS handshake:
