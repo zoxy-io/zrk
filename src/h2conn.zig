@@ -105,23 +105,17 @@ comptime {
     std.debug.assert(advertised_window_size <= window_max);
 }
 
-/// Frames a single exchange may see before its response completes.
+/// Frames a connection may read in a row without any of them carrying a
+/// response forward.
 ///
 /// A bound rather than a trust: a peer that answers every request with an
 /// endless stream of SETTINGS or PING would otherwise keep one connection's
 /// coroutine busy forever, and the run's wall clock would silently become the
-/// only thing stopping it. Generous enough that no conforming server reaches it
-/// — a 16 KiB-framed megabyte response is 64 DATA frames.
-const frames_per_exchange_max: u32 = 4096;
-
-/// The same bound, moved to the connection for a multiplexing caller.
-///
-/// `frames_per_exchange_max` works because a serial exchange either finishes or
-/// gives up. A receive loop that serves N streams never finishes, so what it
-/// bounds instead is frames *without progress*: an endless SETTINGS or PING
-/// flood completes no stream, and a connection that completes nothing after
-/// this many frames is not one worth measuring through.
-pub const frames_without_progress_max: u32 = frames_per_exchange_max;
+/// only thing stopping it. It counts frames *without progress*, not frames: a
+/// bound on every frame an exchange sees is a bound on response size — 4096
+/// frames of 16 KiB failed every response over 64 MiB — and a large body is
+/// not a flood.
+pub const frames_without_progress_max: u32 = 4096;
 
 /// Connection-window debt at which we hand the peer its credit back.
 ///
@@ -185,6 +179,10 @@ pub const Incoming = union(enum) {
     /// The peer is owed an answer. Sent with `Session.reply` by whoever holds
     /// the writer.
     reply: Reply,
+    /// WINDOW_UPDATE: the peer gave back send credit, on the connection
+    /// (`stream` 0) or on one stream. Applied with `Session.credit` by whoever
+    /// guards the send windows; see there.
+    window: struct { stream: u31, increment: u31 },
     /// GOAWAY: no new stream may be opened. Open streams up to
     /// `Session.peer_last_stream` may still finish; the rest were not
     /// processed.
@@ -236,6 +234,29 @@ pub const Session = struct {
     /// DATA octets received since the last connection-level `WINDOW_UPDATE`.
     /// See `window_replenish_at`.
     window_debt: u32 = 0,
+
+    /// The send side of flow control (section 6.9), for a request body.
+    ///
+    /// The peer's `SETTINGS_INITIAL_WINDOW_SIZE`, which every stream's send
+    /// window starts at. A change applies to streams already open (section
+    /// 6.9.2), which `bodyWindow` gets for free by being computed from it.
+    peer_initial_window: u32 = window_initial_default,
+    /// What the peer lets us send on the connection: the 65,535 every
+    /// connection starts with, plus every connection-level WINDOW_UPDATE,
+    /// minus every DATA octet sent. Signed because section 6.9.2 lets a
+    /// SETTINGS change take a window below zero — only on streams, but one
+    /// type for both keeps the arithmetic in one place.
+    send_window: i64 = window_initial_default,
+    /// The one stream whose body is still going out, or 0. Only one can be:
+    /// a body is written by whoever holds the writer, and nothing else
+    /// writes a request until it is done.
+    body_stream: u31 = 0,
+    /// What is left of that body.
+    body_rest: []const u8 = &.{},
+    /// WINDOW_UPDATE credit for `body_stream`, and octets of it sent. With
+    /// `peer_initial_window` these give its send window; see `bodyWindow`.
+    body_credit: i64 = 0,
+    body_sent: i64 = 0,
 
     /// Field-block assembly and HPACK decoding, both connection-scoped.
     ///
@@ -293,7 +314,7 @@ pub const Session = struct {
         // The peer's SETTINGS is the first frame it must send (section 3.4).
         // Everything before it that is legal is handled and skipped.
         var frames: u32 = 0;
-        while (frames < frames_per_exchange_max) : (frames += 1) {
+        while (frames < frames_without_progress_max) : (frames += 1) {
             const header = try session.readHeader();
             if (header.frame_type == .settings and !header.has(.ack)) {
                 try session.applySettings(header);
@@ -314,7 +335,21 @@ pub const Session = struct {
     /// replayed byte-identically on every stream. That guarantee is why this
     /// function takes bytes rather than fields.
     pub fn exchange(session: *Session, block: []const u8, body: []const u8) Error!httpmod.Response {
-        return session.readResponse(try session.beginStream(block, body));
+        const stream = try session.beginStream(block, body);
+        if (session.bodyPending()) {
+            try session.writeBody(session.reserveBody());
+            session.writer.flush() catch return error.Io;
+        }
+        const response = session.readResponse(stream);
+        // The stream ended with body still unsent. On a response, that is a
+        // server answering early (RFC 9113 section 8.1), and our half of the
+        // stream is closed with a reset rather than left open; on a failure,
+        // there is nothing left to send it on.
+        if (session.body_stream == stream) {
+            session.abandonBody();
+            if (response) |_| session.resetStream(stream) catch {} else |_| {}
+        }
+        return response;
     }
 
     /// Open one stream and send the request on it, without waiting for the
@@ -336,9 +371,95 @@ pub const Session = struct {
         session.next_stream = stream + 2;
 
         try session.writeHeaders(stream, block, body.len == 0);
-        if (body.len > 0) try session.writeData(stream, body);
+        if (body.len > 0) {
+            // Pending, not written: what may go out depends on windows the
+            // receiver credits, so the caller sends it — `exchange` inline, a
+            // multiplexing caller under the lock that guards them — and
+            // flushes the HEADERS with it.
+            session.body_stream = stream;
+            session.body_rest = body;
+            session.body_credit = 0;
+            session.body_sent = 0;
+            return stream;
+        }
         session.writer.flush() catch return error.Io;
         return stream;
+    }
+
+    /// Whether the request body `beginStream` started is still going out:
+    /// the peer's flow-control windows ran out before it did. The caller
+    /// sends the rest with `reserveBody` and `writeBody` as `credit` arrives.
+    pub fn bodyPending(session: *const Session) bool {
+        return session.body_stream != 0;
+    }
+
+    /// Whether the pending body could send anything now, without taking it.
+    pub fn bodySendable(session: *const Session) bool {
+        if (session.body_stream == 0) return false;
+        return @min(session.send_window, session.bodyWindow()) > 0;
+    }
+
+    /// The stream whose body is pending, or 0.
+    pub fn bodyStream(session: *const Session) u31 {
+        return session.body_stream;
+    }
+
+    /// Octets of the pending body both windows allow now, taken out of them.
+    ///
+    /// Split from `writeBody` for the multiplexing caller: the windows are
+    /// shared with the receiver that credits them, so the arithmetic runs under
+    /// its state lock and the write does not.
+    pub fn reserveBody(session: *Session) usize {
+        if (session.body_stream == 0) return 0;
+        const allowed = @min(session.send_window, session.bodyWindow());
+        if (allowed <= 0) return 0;
+        const octets: usize = @intCast(@min(allowed, @as(i64, @intCast(session.body_rest.len))));
+        session.send_window -= @intCast(octets);
+        session.body_sent += @intCast(octets);
+        return octets;
+    }
+
+    /// Write `octets` of the pending body, as `reserveBody` granted them. The
+    /// last octet carries END_STREAM, and with it the body is no longer
+    /// pending. Does not flush.
+    pub fn writeBody(session: *Session, octets: usize) Error!void {
+        std.debug.assert(octets <= session.body_rest.len);
+        if (octets == 0) return;
+        const stream = session.body_stream;
+        const chunk = session.body_rest[0..octets];
+        session.body_rest = session.body_rest[octets..];
+        const done = session.body_rest.len == 0;
+        if (done) session.abandonBody();
+        try session.writeData(stream, chunk, done);
+    }
+
+    /// Stop sending the pending body: its stream is over, answered or reset,
+    /// and nothing more may go out on it.
+    pub fn abandonBody(session: *Session) void {
+        session.body_stream = 0;
+        session.body_rest = &.{};
+    }
+
+    /// The pending body's stream send window (section 6.9.2): where the
+    /// peer's initial window puts it, plus credit, less what was sent.
+    fn bodyWindow(session: *const Session) i64 {
+        return @as(i64, session.peer_initial_window) + session.body_credit - session.body_sent;
+    }
+
+    /// Apply an `Incoming.window`. Section 6.9.1: a window pushed past
+    /// 2^31-1 is a flow-control error, on the connection for the connection
+    /// window. A stream's is treated the same way, since a peer doing that
+    /// is not one to keep measuring through. Credit for a stream with no
+    /// body pending is ignored: its request is already all sent.
+    pub fn credit(session: *Session, stream: u31, increment: u31) Error!void {
+        if (stream == 0) {
+            session.send_window += increment;
+            if (session.send_window > window_max) return error.Protocol;
+            return;
+        }
+        if (stream != session.body_stream) return;
+        session.body_credit += increment;
+        if (session.bodyWindow() > window_max) return error.Protocol;
     }
 
     /// The identifier `beginStream` will use next.
@@ -410,6 +531,7 @@ pub const Session = struct {
     fn answer(session: *Session, incoming: Incoming) Error!void {
         switch (incoming) {
             .reply => |owed| try session.reply(owed),
+            .window => |update| try session.credit(update.stream, update.increment),
             else => {},
         }
     }
@@ -423,13 +545,16 @@ pub const Session = struct {
     fn readResponse(session: *Session, stream: u31) Error!httpmod.Response {
         var status: ?u16 = null;
         var bytes: u64 = 0;
+        // Frames since the last one that carried this response forward; see
+        // `frames_without_progress_max`.
         var frames: u32 = 0;
 
-        while (frames < frames_per_exchange_max) : (frames += 1) {
+        while (frames < frames_without_progress_max) : (frames += 1) {
             if (session.windowDue()) try session.replenishWindow();
             switch (try session.receive()) {
                 .headers => |head| {
                     if (head.stream != stream) continue;
+                    frames = 0;
                     if (head.status) |code| {
                         // Two blocks each carrying a `:status` is malformed
                         // (RFC 9113 section 8.3.2). A second block *without*
@@ -442,12 +567,34 @@ pub const Session = struct {
                 },
                 .data => |data| {
                     if (data.stream != stream) continue;
+                    frames = 0;
                     bytes += data.bytes;
                     if (data.end_stream) return finish(status, bytes);
                 },
                 .reset => |reset| if (reset == stream) return error.Closed,
                 .refused => |refused| if (refused == stream) return error.Refused,
-                .reply => |owed| try session.reply(owed),
+                .reply => |owed| {
+                    try session.reply(owed);
+                    // A SETTINGS can raise the initial window, which is credit
+                    // for the body too (section 6.9.2).
+                    const octets = session.reserveBody();
+                    if (octets > 0) {
+                        frames = 0;
+                        try session.writeBody(octets);
+                        session.writer.flush() catch return error.Io;
+                    }
+                },
+                // Credit for the body still going out, if there is one.
+                .window => |update| {
+                    try session.credit(update.stream, update.increment);
+                    const octets = session.reserveBody();
+                    if (octets > 0) {
+                        // Credit the body could use is the request moving.
+                        frames = 0;
+                        try session.writeBody(octets);
+                        session.writer.flush() catch return error.Io;
+                    }
+                },
                 // Recorded on the session. The exchange in flight may still
                 // finish — unless it is past the last stream the peer took.
                 .going_away => if (stream > session.peer_last_stream) return error.Refused,
@@ -521,9 +668,13 @@ pub const Session = struct {
                 session.peer_last_stream = @min(session.peer_last_stream, goaway.last_stream_identifier);
                 return .going_away;
             },
-            // Window updates only matter to a sender, and the only thing this
-            // client sends is a request block. Ignorable rather than tracked.
-            .window_update => return .idle,
+            // Send credit, for a request body. Handed to the caller rather
+            // than applied here: on a multiplexed connection the windows are
+            // shared with the sender, under a lock this layer does not hold.
+            .window_update => |update| return .{ .window = .{
+                .stream = header.stream_identifier,
+                .increment = update.increment,
+            } },
             // Section 5.3.1 allows PRIORITY on any stream at any time, and
             // section 4.1 says to skip an unknown type by its length — which
             // the payload read already did.
@@ -574,8 +725,8 @@ pub const Session = struct {
     /// bounds what we may send, and our send is a header block that could
     /// exceed the default if a caller passes enough `-H`.
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` bounds how many streams `--streams`
-    /// may actually open. The rest describe limits on a sender we are not: we
-    /// send no body large enough to meet a window.
+    /// may actually open. `SETTINGS_INITIAL_WINDOW_SIZE` is every stream's
+    /// send window, which a request body has to stay inside.
     fn takeSettings(session: *Session, payload: frame.Payload) Error!void {
         var entries = payload.settings.iterate();
         while (entries.next()) |entry| {
@@ -588,6 +739,11 @@ pub const Session = struct {
                     session.peer_max_frame_size = entry.value;
                 },
                 .max_concurrent_streams => session.peer_max_concurrent_streams = entry.value,
+                // Section 6.9.2: over 2^31-1 is a flow-control error.
+                .initial_window_size => {
+                    if (entry.value > window_max) return error.Protocol;
+                    session.peer_initial_window = entry.value;
+                },
                 // Section 6.5.3: acknowledged whether or not we act on it, and
                 // section 6.5.2 requires an unrecognized identifier to be
                 // ignored rather than refused.
@@ -636,14 +792,16 @@ pub const Session = struct {
         }
     }
 
-    fn writeData(session: *Session, stream: u31, body: []const u8) Error!void {
+    /// `body` as DATA frames, the last of them carrying END_STREAM when
+    /// `end_stream` says this is the end of the request.
+    fn writeData(session: *Session, stream: u31, body: []const u8, end_stream: bool) Error!void {
         var offset: usize = 0;
         while (offset < body.len) {
             const len = @min(body.len - offset, session.peer_max_frame_size);
             const last = offset + len == body.len;
             try session.writeFrame(
                 .data,
-                if (last) frame.Flag.end_stream.bit() else 0,
+                if (last and end_stream) frame.Flag.end_stream.bit() else 0,
                 stream,
                 body[offset..][0..len],
             );
@@ -824,6 +982,139 @@ test "a plain exchange reads its status" {
     // The preface goes first, before anything else. A server reading it
     // otherwise sees a malformed connection.
     try testing.expect(std.mem.startsWith(u8, out[0..writer.end], preface));
+}
+
+test "a response longer than the frame bound still completes" {
+    // 4096 frames was once a bound on every frame an exchange saw, which
+    // made it a bound on response size: past 64 MiB at 16 KiB a frame,
+    // every response failed. What it bounds is frames without progress.
+    const data_frames = frames_without_progress_max + 100;
+    const wire = try testing.allocator.alloc(u8, 64 + data_frames * 10 + 64);
+    defer testing.allocator.free(wire);
+    var used: usize = 0;
+    used += renderFrame(wire[used..], .settings, 0, 0, &.{});
+
+    var block: [64]u8 = undefined;
+    const block_len = renderResponseBlock(&block, &.{.{ .name = ":status", .value = "200" }});
+    used += renderFrame(wire[used..], .headers, frame.Flag.end_headers.bit(), 1, block[0..block_len]);
+    for (0..data_frames - 1) |_| used += renderFrame(wire[used..], .data, 0, 1, "x");
+    used += renderFrame(wire[used..], .data, frame.Flag.end_stream.bit(), 1, "x");
+
+    var reader: Io.Reader = .fixed(wire[0..used]);
+    var out: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out);
+    var session: Session = .init(&reader, &writer);
+    try session.open();
+
+    const response = try session.exchange(block[0..block_len], "");
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqual(@as(u64, data_frames), response.bytes - block_len);
+}
+
+test "frames that carry the response nowhere are still bounded" {
+    // The flood the bound exists for: frames on a stream that is not ours,
+    // forever. Without progress, the exchange gives up.
+    const late_frames = frames_without_progress_max + 1;
+    const wire = try testing.allocator.alloc(u8, 64 + late_frames * 10);
+    defer testing.allocator.free(wire);
+    var used: usize = 0;
+    used += renderFrame(wire[used..], .settings, 0, 0, &.{});
+    for (0..late_frames) |_| used += renderFrame(wire[used..], .data, 0, 3, "x");
+
+    var reader: Io.Reader = .fixed(wire[0..used]);
+    var out: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out);
+    var session: Session = .init(&reader, &writer);
+    try session.open();
+
+    var block: [64]u8 = undefined;
+    const block_len = renderResponseBlock(&block, &.{.{ .name = ":method", .value = "GET" }});
+    try testing.expectError(error.Protocol, session.exchange(block[0..block_len], ""));
+}
+
+/// The DATA octets on `stream` in what a session wrote, and whether the last
+/// DATA frame on it carried END_STREAM.
+fn sentData(written: []const u8, stream: u31) struct { octets: usize, ended: bool } {
+    var at: usize = preface.len;
+    var octets: usize = 0;
+    var ended = false;
+    while (at + frame.Header.octets <= written.len) {
+        const header = frame.Header.parse(written[at..][0..frame.Header.octets]) catch unreachable;
+        at += frame.Header.octets;
+        if (header.frame_type == .data and header.stream_identifier == stream) {
+            octets += header.length;
+            ended = header.has(.end_stream);
+        }
+        at += header.length;
+    }
+    return .{ .octets = octets, .ended = ended };
+}
+
+test "a request body waits for the peer's windows" {
+    // Section 6.9: the peer's 65,535-octet defaults bound what may be sent
+    // before it gives credit back. A 100,000-octet body sends 65,535, then
+    // the rest once both windows are raised.
+    const body_octets = 100_000;
+    const body = try testing.allocator.alloc(u8, body_octets);
+    defer testing.allocator.free(body);
+    @memset(body, 'b');
+
+    var wire: [512]u8 = undefined;
+    var used: usize = 0;
+    used += renderFrame(wire[used..], .settings, 0, 0, &.{});
+    var increment: [4]u8 = undefined;
+    std.mem.writeInt(u32, &increment, 1 << 20, .big);
+    used += renderFrame(wire[used..], .window_update, 0, 0, &increment);
+    used += renderFrame(wire[used..], .window_update, 0, 1, &increment);
+    var block: [64]u8 = undefined;
+    const block_len = renderResponseBlock(&block, &.{.{ .name = ":status", .value = "200" }});
+    used += renderFrame(wire[used..], .headers, frame.Flag.end_headers.bit() | frame.Flag.end_stream.bit(), 1, block[0..block_len]);
+
+    var reader: Io.Reader = .fixed(wire[0..used]);
+    const out = try testing.allocator.alloc(u8, body_octets + 4096);
+    defer testing.allocator.free(out);
+    var writer: Io.Writer = .fixed(out);
+    var session: Session = .init(&reader, &writer);
+    try session.open();
+
+    const before = writer.end;
+    try testing.expectEqual(@as(u31, 1), try session.beginStream(block[0..block_len], body));
+    try session.writeBody(session.reserveBody());
+    const first = sentData(out[0..writer.end], 1);
+    try testing.expect(writer.end > before);
+    try testing.expectEqual(@as(usize, window_initial_default), first.octets);
+    try testing.expect(!first.ended);
+    try testing.expect(session.bodyPending());
+    try testing.expect(!session.bodySendable());
+
+    // The two WINDOW_UPDATEs, then the response.
+    _ = try session.readResponse(1);
+    const all = sentData(out[0..writer.end], 1);
+    try testing.expectEqual(@as(usize, body_octets), all.octets);
+    try testing.expect(all.ended);
+    try testing.expect(!session.bodyPending());
+}
+
+test "an initial window of zero sends no body until credit arrives" {
+    var session: Session = .init(undefined, undefined);
+    session.peer_initial_window = 0;
+    session.body_stream = 1;
+    session.body_rest = "hello";
+    try testing.expectEqual(@as(usize, 0), session.reserveBody());
+    try session.credit(1, 3);
+    try testing.expectEqual(@as(usize, 3), session.reserveBody());
+    try testing.expectEqual(@as(usize, 0), session.reserveBody());
+    // Credit for a stream with nothing pending is not a window to track.
+    try session.credit(7, 100);
+    try testing.expectEqual(@as(usize, 0), session.reserveBody());
+}
+
+test "a window pushed past 2^31-1 is a flow-control error" {
+    var session: Session = .init(undefined, undefined);
+    try testing.expectError(error.Protocol, session.credit(0, std.math.maxInt(u31)));
+    session.body_stream = 1;
+    session.body_rest = "x";
+    try testing.expectError(error.Protocol, session.credit(1, std.math.maxInt(u31)));
 }
 
 test "stream identifiers are odd and ascending" {

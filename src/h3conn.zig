@@ -420,8 +420,8 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         .ip4 => .{ .ip4 = .unspecified(0) },
         .ip6 => .{ .ip6 = .unspecified(0) },
     };
-    var socket = any.bind(io, .{ .mode = .dgram }) catch {
-        conn.noteError(p, .connect);
+    var socket = any.bind(io, .{ .mode = .dgram }) catch |err| {
+        conn.noteConnectFailure(p, err);
         return;
     };
     defer socket.close(io);
@@ -471,7 +471,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         if (!pumpCrypto(p, state)) return;
 
         if (state.connection.state == .handshaking and now_ns > handshake_bound_ns) {
-            conn.noteError(p, .connect);
+            conn.noteConnectFailure(p, error.HandshakeTimeout);
             return;
         }
         // Requests whose own bound already fired were counted and freed by
@@ -481,7 +481,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         // those are real failures: they were on the wire and no answer is
         // coming.
         if (state.connection.state == .established and now_ns - progress_ns > progress_bound_ns) {
-            abandonAll(p, state, .read);
+            _ = abandonAll(p, state, .read);
             return;
         }
 
@@ -519,7 +519,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
         // response.
         switch (state.connection.state) {
             .draining, .closing => {
-                abandonAll(p, state, .read);
+                _ = abandonAll(p, state, .read);
                 return;
             },
             else => {},
@@ -549,8 +549,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
                 continue;
             },
             else => {
-                abandonAll(p, state, .read);
-                conn.noteError(p, .read);
+                failAll(p, state, .read);
                 return;
             },
         };
@@ -570,8 +569,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
                 // discarded inside the connection; what reaches here is a
                 // protocol error, and RFC 9000 §10.2 says close rather than
                 // ignore.
-                abandonAll(p, state, .read);
-                conn.noteError(p, .read);
+                failAll(p, state, .read);
                 return;
             };
         }
@@ -858,10 +856,9 @@ fn pumpCrypto(p: *conn.Params, state: *State) bool {
 /// A TLS or key-schedule failure, charged to whichever phase it happened in.
 fn failHandshakeOrRead(p: *conn.Params, state: *State) void {
     if (state.connection.state == .handshaking) {
-        conn.noteError(p, .connect);
+        conn.noteConnectFailure(p, if (state.trust.failed) error.CertificateVerificationFailed else error.TlsHandshakeFailed);
     } else {
-        abandonAll(p, state, .read);
-        conn.noteError(p, .read);
+        failAll(p, state, .read);
     }
 }
 
@@ -1071,8 +1068,7 @@ fn goAway(p: *conn.Params, state: *State, identifier: u64) bool {
     // bidirectional stream. `Http3` cannot check this — it does not know which
     // end it is reading for.
     if (identifier % 4 != 0) {
-        abandonAll(p, state, .read);
-        conn.noteError(p, .read);
+        failAll(p, state, .read);
         return false;
     }
     state.goaway = identifier;
@@ -1117,7 +1113,18 @@ fn drain(p: *conn.Params, state: *State) bool {
         // peer's unidirectional streams are not filtered — the control stream
         // has no slot and never will, and it is where SETTINGS and GOAWAY come
         // from.
-        if (id % 4 == 0 and slotFor(state, id) == null) continue;
+        //
+        // What it must still get is its data consumed. A stream whose slot was
+        // freed by `expire` can carry the rest of a response the peer had
+        // already sent — RFC 9000 §3.5 lets it skip the RESET_STREAM once
+        // everything is sent — and a receive side that is never read never
+        // reaches `data_read`. Streams retire in identifier order, so one such
+        // stream holds back every later one, the table fills, and `issue` sees
+        // `TooManyStreams` until the connection is given up.
+        if (id % 4 == 0 and slotFor(state, id) == null) {
+            discard(state, id);
+            continue;
+        }
 
         // A stream the connection has already given up is handled by the sweep
         // at the end of this function, not here — see it for why the sweep and
@@ -1143,8 +1150,7 @@ fn drain(p: *conn.Params, state: *State) bool {
             // A malformed HTTP/3 message. RFC 9114 §8 makes most of these
             // connection errors, and this endpoint has no reason to be lenient
             // about a response it is measuring.
-            abandonAll(p, state, .read);
-            conn.noteError(p, .read);
+            failAll(p, state, .read);
             return false;
         };
         for (events[0..result.events]) |event| {
@@ -1152,8 +1158,7 @@ fn drain(p: *conn.Params, state: *State) bool {
         }
         if (result.consumed > 0) {
             state.connection.consume(id, result.consumed) catch {
-                abandonAll(p, state, .read);
-                conn.noteError(p, .read);
+                failAll(p, state, .read);
                 return false;
             };
         }
@@ -1184,6 +1189,25 @@ fn drain(p: *conn.Params, state: *State) bool {
 
     compactReadable(state);
     return true;
+}
+
+/// Read and drop whatever a finished request's stream still holds, so its
+/// receive side can complete and the stream can retire.
+///
+/// Only once the peer has said where the stream ends. Before that, reading
+/// returns flow-control credit, and an expired request's stream would go on
+/// pulling the rest of a response nobody is waiting for: at `--timeout` close
+/// to the response time on 1 MiB bodies that cut completed responses by four
+/// fifths. Unread, the stream's window holds the peer back until it acts on
+/// our STOP_SENDING.
+fn discard(state: *State, id: u64) void {
+    const stream = state.connection.findStream(id) orelse return;
+    if (stream.received.final_size == null) return;
+    const data = state.connection.readable(id);
+    if (data.len == 0) return;
+    // Only `NotFound` (already retired) or a count over `readable`, which
+    // this one is not; either way there is nothing left to release.
+    state.connection.consume(id, data.len) catch {};
 }
 
 /// One HTTP/3 event, applied to the request it belongs to. False when the
@@ -1306,14 +1330,46 @@ fn resetBy(p: *conn.Params, state: *State, slot: *Slot, code: u64) void {
     conn.noteError(p, .read);
 }
 
+/// The peer stopped reading a request stream. True when the stream had a
+/// request on it.
+fn stopped(p: *conn.Params, state: *State, stream: u64, code: u64) bool {
+    const slot = slotFor(state, stream) orelse return false;
+    if (code == h3_request_rejected) {
+        // A rejection can arrive as STOP_SENDING ahead of the reset that
+        // carries the same code, and it means the same thing.
+        requeue(p, state, slot);
+    } else if (code == h3_no_error) {
+        // RFC 9114 §4.1: a server may answer before it has read the whole
+        // request and then stop reading it with H3_NO_ERROR. The response is
+        // still coming, and the slot stays to receive it. quic-go does this
+        // after every handler that leaves the body unread, which made every
+        // `--http3 -b` against Caddy a write error.
+    } else {
+        release(state, slot);
+        conn.noteError(p, .write);
+    }
+    return true;
+}
+
 /// Every in-flight request, charged to one error kind. The connection is going
-/// away and these responses are never arriving.
-fn abandonAll(p: *conn.Params, state: *State, kind: conn.ErrorKind) void {
+/// away and these responses are never arriving. Returns how many there were.
+fn abandonAll(p: *conn.Params, state: *State, kind: conn.ErrorKind) u32 {
+    var abandoned: u32 = 0;
     for (&state.slots) |*slot| {
         if (!slot.busy) continue;
         conn.noteError(p, kind);
         release(state, slot);
+        abandoned += 1;
     }
+    return abandoned;
+}
+
+/// The connection failed. N requests in flight is N errors, the same count the
+/// HTTP/2 path makes, so `--max-error-rate` reads alike on both. A failure with
+/// nothing in flight is still one, or a connection failing between requests
+/// would never show up at all.
+fn failAll(p: *conn.Params, state: *State, kind: conn.ErrorKind) void {
+    if (abandonAll(p, state, kind) == 0) conn.noteError(p, kind);
 }
 
 /// Empty the transport's event queue. The one event this loop must act on is
@@ -1328,25 +1384,18 @@ fn pollTransport(p: *conn.Params, state: *State) bool {
             .stream_reset => |value| {
                 if (slotFor(state, value.stream)) |slot| resetBy(p, state, slot, value.code);
             },
-            .stream_stopped => |value| {
-                const slot = slotFor(state, value.stream) orelse continue;
-                // A rejection can arrive as STOP_SENDING ahead of the reset
-                // that carries the same code, and it means the same thing.
-                if (value.code == h3_request_rejected) {
-                    requeue(p, state, slot);
-                } else {
-                    release(state, slot);
-                    conn.noteError(p, .write);
-                }
-            },
+            .stream_stopped => |value| _ = stopped(p, state, value.stream, value.code),
             .closed => |value| {
                 // Requests still in flight are lost whatever the code says.
                 // The close itself is a failure only when it names one: a
                 // server shutting down cleanly — after a GOAWAY, or retiring
                 // an idle connection — has done nothing wrong.
-                abandonAll(p, state, .read);
                 const clean = value.code == if (value.application) h3_no_error else 0;
-                if (!clean) conn.noteError(p, .read);
+                if (clean) {
+                    _ = abandonAll(p, state, .read);
+                } else {
+                    failAll(p, state, .read);
+                }
                 return false;
             },
             // `overflowed` means events were produced faster than this loop
@@ -1355,8 +1404,7 @@ fn pollTransport(p: *conn.Params, state: *State) bool {
             // the connection is retired rather than left to time out one
             // request at a time.
             .overflowed => {
-                abandonAll(p, state, .read);
-                conn.noteError(p, .read);
+                failAll(p, state, .read);
                 return false;
             },
             .handshake_confirmed, .stream_delivered, .key_updated, .packets_lost => {},
@@ -1369,8 +1417,7 @@ fn pollTransport(p: *conn.Params, state: *State) bool {
 fn flush(p: *conn.Params, state: *State, socket: *net.Socket, now_ns: u64) bool {
     for (0..flush_datagrams_max) |_| {
         const octets = state.connection.send(&state.datagram, now_ns) catch {
-            abandonAll(p, state, .write);
-            conn.noteError(p, .write);
+            failAll(p, state, .write);
             return false;
         };
         if (octets == 0) return true;
@@ -1803,8 +1850,34 @@ test "a GOAWAY naming anything but a client request stream is a connection error
     try testing.expect(!goAway(&f.params, f.state, 2));
     try testing.expectEqual(@as(usize, 0), busySlots(f.state));
     try testing.expectEqual(@as(usize, 0), f.state.retry_len);
-    // The in-flight request, and the connection itself.
-    try testing.expectEqual(@as(u64, 2), f.counters.read_errors);
+    // The in-flight request, and nothing more for the connection: N in
+    // flight is N errors, as on HTTP/2.
+    try testing.expectEqual(@as(u64, 1), f.counters.read_errors);
+}
+
+test "a connection failing with nothing in flight is still one error" {
+    const f = try Fixture.create();
+    defer f.destroy();
+
+    try testing.expect(!goAway(&f.params, f.state, 2));
+    try testing.expectEqual(@as(u64, 1), f.counters.read_errors);
+}
+
+test "STOP_SENDING with H3_NO_ERROR leaves the request waiting for its response" {
+    const f = try Fixture.create();
+    defer f.destroy();
+
+    _ = f.inFlight(0, 100);
+    // RFC 9114 §4.1: a server may answer early and stop reading the request.
+    try testing.expect(stopped(&f.params, f.state, 0, h3_no_error));
+    try testing.expect(slotFor(f.state, 0) != null);
+    try testing.expectEqual(@as(u64, 0), f.counters.write_errors);
+
+    // Any other code is the peer failing it.
+    _ = f.inFlight(4, 200);
+    try testing.expect(stopped(&f.params, f.state, 4, h3_request_cancelled));
+    try testing.expect(slotFor(f.state, 4) == null);
+    try testing.expectEqual(@as(u64, 1), f.counters.write_errors);
 }
 
 test "a request the peer rejected is retried once, then charged" {

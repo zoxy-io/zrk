@@ -156,7 +156,7 @@ zrk -c20 -d1m -R500 --latency https://api.example.com/health
 zrk -c10 -R100 -m POST -b '{"ping":1}' \
     -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
 
-# HTTP/3 over QUIC (prototype — see "HTTP/3" below for what that costs you)
+# HTTP/3 over QUIC (experimental — see "HTTP/3" below for what that costs you)
 zrk --http3 -k -c10 -R500 -d30s https://127.0.0.1:4433/
 
 # CI-friendly, no redrawing dashboard
@@ -178,7 +178,7 @@ zrk -c50 -R1000 -d5m --timeseries - http://127.0.0.1:8080/ \
 ### HTTP/3
 
 `--http3` speaks HTTP/3 over QUIC through
-[h3](https://github.com/zoxy-io/h3), and is a **prototype**
+[h3](https://github.com/zoxy-io/h3), and is **experimental**
 ([#74](https://github.com/zoxy-io/zrk/issues/74)). It works, and the latency it
 reports means what every other transport's does — the coordinated-omission
 correction, `--deadline` shedding and the backlog gauge are the same code
@@ -186,8 +186,21 @@ reading the same clock. Certificates are verified the same way too: `tls.Trust`
 builds the chain to a system anchor and matches the name for all three
 transports, so `-k/--insecure` is an opt-out here exactly as it is elsewhere.
 
-One thing is worth knowing before quoting a number from it:
+Three things are worth knowing before quoting a number from it:
 
+- **Large responses over a real network measure zrk, not the server.** Each
+  stream's receive window is 16 KiB, so one stream moves at most 16 KiB per
+  round trip. Over loopback that is invisible; at a 62 ms round trip a 126 KB
+  page takes about 700 ms against HTTP/2's 110 ms, and a 1.3 MB one runs past
+  the default `--timeout`. For responses beyond a few tens of KiB across a
+  network, compare against `--http2` before trusting the figure;
+  [#89](https://github.com/zoxy-io/zrk/issues/89) tracks raising it.
+- **A connection quiet for twice `--timeout` is replaced.** zrk sends no
+  keepalive, and a QUIC server forgets an idle connection without a word, so a
+  connection that has heard nothing for that long is not trusted with the next
+  request. At a rate low enough to leave each connection idle that long — a
+  large `-c` at a small `-R`, or the bottom of a ramp — requests carry a fresh
+  handshake in their latency.
 - **One datagram per syscall on the way out.** Reads are batched — Linux
   generic receive offload collapses a burst into one read, worth about 40%
   against a server that segments — but sends are not. That was measured rather
@@ -215,7 +228,7 @@ soak now runs 296,866 requests at 14.8k req/s where it previously managed
 | code | meaning |
 |------|---------|
 | 0 | run completed; any configured gates passed |
-| 1 | the run failed to start or complete (see the message on stderr) |
+| 1 | the run failed to start or complete, or completed without a single successful request (see the message on stderr) |
 | 2 | bad arguments, or a `--body` file that could not be read |
 | 3 | run completed but a `--slo-p99` / `--max-error-rate` gate was breached |
 | 130 | interrupted by SIGINT (`Ctrl-C`); a partial report was still written |
