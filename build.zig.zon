@@ -63,10 +63,18 @@
             .url = "git+https://github.com/zoxy-io/h3#3accaf4b8d35d299315927296c0bc49b5f5ffc3a",
             .hash = "h3-0.0.0-RBkp8tYDFwAKtZHosUA5okrC2lg9y6gFkh4BZvmtvZSI",
         },
+        // LuaJIT 2.1, for `--script`: what wrk links, so wrk scripts — Lua 5.1
+        // plus `bit` and `unpack` — run unchanged. Built from source by
+        // build/luajit.zig rather than through ziglua; see that file for why.
+        .luajit = .{
+            .url = "https://github.com/LuaJIT/LuaJIT/archive/c6ffc141a8762b41703f9287d63d93622a13dd8f.tar.gz",
+            .hash = "N-V-__8AAMWIQwCGw4eqOoJrHtVD_Y9ncbO7UOh1zLkDTMva",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "build",
         "src",
         "README.md",
     },

@@ -20,6 +20,8 @@ pub const tls = @import("tls.zig");
 pub const h2conn = @import("h2conn.zig");
 pub const workload = @import("workload.zig");
 pub const Workload = workload.Workload;
+pub const lua = @import("lua.zig");
+pub const script = @import("script.zig");
 
 test {
     std.testing.refAllDecls(@This());

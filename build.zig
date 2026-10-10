@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const manifest = @import("build.zig.zon");
+const luajit_build = @import("build/luajit.zig");
 
 /// Refuse to build the vendored C against a libc Zig could not find.
 ///
@@ -104,6 +105,11 @@ pub fn build(b: *std.Build) void {
         .assertions = false,
     });
 
+    // LuaJIT, for `--script`. Built from source like libcrypto, and statically
+    // linked like it, so the release binaries stay single files; see
+    // build/luajit.zig for how it cross-compiles.
+    const luajit = luajit_build.build(b, target, optimize, b.dependency("luajit", .{}));
+
     // Hung off each runnable artifact below rather than off the dependency,
     // so `zig build check` keeps working without a C toolchain.
     const libc_guard = nativeLibcGuard(b, target);
@@ -131,6 +137,7 @@ pub fn build(b: *std.Build) void {
     // missing from the other. Every other dependency here is already listed
     // twice for exactly that reason; this one was not, and CI caught it.
     mod.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
+    mod.linkLibrary(luajit);
 
     // A standing check that the dependency options above actually applied.
     const pin_tests = b.addTest(.{
@@ -161,6 +168,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
+    // Linked into both for the reason `readme` is imported into both:
+    // `main.zig` compiles `script.zig` into this module by file import.
+    exe.root_module.linkLibrary(luajit);
     if (libc_guard) |guard| exe.step.dependOn(guard);
     b.installArtifact(exe);
 
