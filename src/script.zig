@@ -566,7 +566,12 @@ fn globalName(L: *lua.State) [*:0]const u8 {
 fn threadGet(state: ?*lua.State) callconv(.c) c_int {
     const L = state.?;
     const target = threadShared(L).L;
-    lua.getGlobal(target, globalName(L));
+    // Raw, as the copy below is: the thread's state is idle, with no
+    // `lua_pcall` to catch an error, and an ordinary lookup runs the script's
+    // own `_G` metamethods — a strict-globals `__index` that raises on an
+    // unknown name would end the process.
+    lua.pushString(target, std.mem.span(globalName(L)));
+    lua.lua_rawget(target, lua.globals_index);
     // Checked before anything is copied, and raised in `L`: the thread's
     // state is idle, with no `lua_pcall` of its own to catch an error, and
     // one raised there takes the process down.
@@ -584,8 +589,11 @@ fn threadSet(state: ?*lua.State) callconv(.c) c_int {
     const target = threadShared(L).L;
     const name = globalName(L);
     if (uncopyable(L, 3, 0)) |message| lua.raise(L, message);
+    // Raw, for the reason `threadGet` gives: a `__newindex` on `_G` would run
+    // in a state with nothing to catch its error.
+    lua.pushString(target, std.mem.span(name));
     copyValue(L, 3, target);
-    lua.setGlobal(target, name);
+    lua.lua_rawset(target, lua.globals_index);
     return 0;
 }
 
@@ -944,6 +952,33 @@ test "script failures say what and where" {
         var diag: Diagnostic = .{};
         try testing.expectError(error.ScriptFailed, Script.load(testing.allocator, testing.io, &cfg, "f.lua", "function wrk.format() return nil end", &.{}, &diag));
         try testing.expect(std.mem.indexOf(u8, diag.message().?, "wrk.format() returned nil") != null);
+    }
+    {
+        // Strict globals, a common wrk-script idiom: `_G` raises on an unknown
+        // name. thread:get/set must not run that in the thread's own state,
+        // which has no handler for it.
+        var diag: Diagnostic = .{};
+        const script = try Script.load(testing.allocator, testing.io, &cfg, "strict.lua",
+            \\local threads = {}
+            \\function setup(t) table.insert(threads, t); t:set("seen", 1) end
+            \\function init() setmetatable(_G, { __index = function(_, k) error("undeclared " .. k) end, __newindex = function(_, k) error("undeclared " .. k) end }) end
+            \\function request() return wrk.format() end
+            \\function done() result = { threads[1]:get("missing"), threads[1]:get("seen") } end
+        , &.{test_url}, &diag);
+        defer script.deinit();
+        var latency = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+        defer latency.deinit();
+        try script.done(&.{
+            .duration_us = 1,
+            .requests = 0,
+            .bytes = 0,
+            .errors = .{ .connect = 0, .read = 0, .write = 0, .status = 0, .timeout = 0, .deadline = 0 },
+            .latency = &latency,
+            .rates = &.{},
+        });
+        // Neither the unknown name nor the write in `setup` raised: raw access
+        // never meets the metamethods.
+        try testing.expectEqual(@as(?[]const u8, null), diag.message());
     }
     {
         // A static request that cannot be sent frees what it had parsed.

@@ -72,6 +72,8 @@ pub extern fn lua_createtable(L: *State, narr: c_int, nrec: c_int) void;
 pub extern fn lua_getfield(L: *State, index: c_int, key: [*:0]const u8) void;
 pub extern fn lua_setfield(L: *State, index: c_int, key: [*:0]const u8) void;
 pub extern fn lua_settable(L: *State, index: c_int) void;
+pub extern fn lua_rawget(L: *State, index: c_int) void;
+pub extern fn lua_rawset(L: *State, index: c_int) void;
 pub extern fn lua_rawseti(L: *State, index: c_int, n: c_int) void;
 
 /// Where a C closure's upvalue `n` (1-based) sits on its stack.
