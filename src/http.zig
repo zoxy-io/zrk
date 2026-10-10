@@ -17,15 +17,23 @@ const h2 = @import("h2");
 const zurl = @import("zurl");
 const Io = std.Io;
 const cli = @import("cli.zig");
+const workload = @import("workload.zig");
 
 /// Build the raw request bytes for a config. The result is built once per run
 /// and reused for every request on every connection (the request is fixed).
 pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 {
     var alloc_writer = Io.Writer.Allocating.init(allocator);
     errdefer alloc_writer.deinit();
-    const w = &alloc_writer.writer;
+    const fixed: workload.Fixed = .init(cfg);
+    try writeRequest(&alloc_writer.writer, cfg, &fixed.request);
+    return alloc_writer.toOwnedSlice();
+}
 
-    try w.print("{s} {s} HTTP/1.1\r\n", .{ cfg.method, cfg.url.target });
+/// Write one HTTP/1.1 request: `request` framed against the run's origin and
+/// keep-alive mode in `cfg`. The fixed request is this, once; a workload's are
+/// this, per send (see `workload.Generator`).
+pub fn writeRequest(w: *Io.Writer, cfg: *const cli.Config, request: *const workload.Request) Io.Writer.Error!void {
+    try w.print("{s} {s} HTTP/1.1\r\n", .{ request.method, request.target });
 
     // Host header: include the port only when it is non-default.
     const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
@@ -40,7 +48,7 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
     var has_ua = false;
     var has_conn = false;
     var has_cl = false;
-    for (cfg.headers) |h| {
+    for (request.headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
         if (std.ascii.eqlIgnoreCase(h.name, "connection")) has_conn = true;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
@@ -60,18 +68,16 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
         "Connection: keep-alive\r\n");
 
     if (!has_cl) {
-        if (cfg.body.len > 0) {
-            try w.print("Content-Length: {d}\r\n", .{cfg.body.len});
-        } else if (methodAnticipatesBody(cfg.method)) {
+        if (request.body.len > 0) {
+            try w.print("Content-Length: {d}\r\n", .{request.body.len});
+        } else if (methodAnticipatesBody(request.method)) {
             // An empty body on a body-bearing method still needs an explicit
             // length: many servers answer 411 otherwise.
             try w.writeAll("Content-Length: 0\r\n");
         }
     }
     try w.writeAll("\r\n");
-    try w.writeAll(cfg.body);
-
-    return alloc_writer.toOwnedSlice();
+    try w.writeAll(request.body);
 }
 
 /// One request field, in the form both HPACK and QPACK take it.
@@ -94,13 +100,17 @@ pub const Field = struct {
 /// Validated here rather than by each caller: a malformed request would be
 /// answered with a stream error on every single stream, and the run would
 /// report the target failing when it was us.
-pub fn buildRequestFields(scratch: std.mem.Allocator, cfg: *const cli.Config) ![]const Field {
+pub fn buildRequestFields(
+    scratch: std.mem.Allocator,
+    cfg: *const cli.Config,
+    request: *const workload.Request,
+) ![]const Field {
     var fields: std.ArrayList(Field) = .empty;
 
     // RFC 9113 §8.3 and RFC 9114 §4.3.1 name the same four, and they come first.
-    try fields.append(scratch, .{ .name = ":method", .value = cfg.method });
+    try fields.append(scratch, .{ .name = ":method", .value = request.method });
     try fields.append(scratch, .{ .name = ":scheme", .value = if (cfg.url.isTls()) "https" else "http" });
-    try fields.append(scratch, .{ .name = ":path", .value = cfg.url.target });
+    try fields.append(scratch, .{ .name = ":path", .value = request.target });
 
     // §8.3.1: `:authority` replaces `Host`, and carries the port only when it
     // is not the scheme's default — the same rule `buildRequest` applies to
@@ -114,7 +124,7 @@ pub fn buildRequestFields(scratch: std.mem.Allocator, cfg: *const cli.Config) ![
 
     var has_ua = false;
     var has_cl = false;
-    for (cfg.headers) |h| {
+    for (request.headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
         // §8.2.1 requires field names to be lowercase on the wire. `-H` takes
@@ -131,12 +141,12 @@ pub fn buildRequestFields(scratch: std.mem.Allocator, cfg: *const cli.Config) ![
     // No `Connection: keep-alive`: §8.2.2 makes connection-specific header
     // fields malformed above HTTP/1.1, and `buildRequest` adds one.
     if (!has_cl) {
-        if (cfg.body.len > 0) {
+        if (request.body.len > 0) {
             try fields.append(scratch, .{
                 .name = "content-length",
-                .value = try std.fmt.allocPrint(scratch, "{d}", .{cfg.body.len}),
+                .value = try std.fmt.allocPrint(scratch, "{d}", .{request.body.len}),
             });
-        } else if (methodAnticipatesBody(cfg.method)) {
+        } else if (methodAnticipatesBody(request.method)) {
             try fields.append(scratch, .{ .name = "content-length", .value = "0" });
         }
     }
@@ -163,34 +173,52 @@ pub fn buildRequestBlock(allocator: std.mem.Allocator, cfg: *const cli.Config) !
     defer scratch.deinit();
     const tmp = scratch.allocator();
 
-    const fields = try buildRequestFields(tmp, cfg);
+    const fixed: workload.Fixed = .init(cfg);
+    const fields = try buildRequestFields(tmp, cfg, &fixed.request);
 
-    // Into h2's own field type at the last moment; see `Field`.
-    const hpack_fields = try tmp.alloc(h2.hpack.Field, fields.len);
-    for (hpack_fields, fields) |*out, in| out.* = .{ .name = in.name, .value = in.value };
-
-    return encodeBlock(allocator, hpack_fields);
+    var block: std.ArrayList(u8) = .empty;
+    errdefer block.deinit(allocator);
+    _ = try encodeRequestBlock(tmp, allocator, &block, fields);
+    return block.toOwnedSlice(allocator);
 }
 
-/// Encode into a buffer sized from the fields themselves.
-fn encodeBlock(allocator: std.mem.Allocator, fields: []const h2.hpack.Field) ![]u8 {
+/// Encode `fields` as one static-only HPACK block into `out`, replacing what
+/// it held and growing it from `gpa` as needed; returns the block, which
+/// borrows `out`. `scratch` holds the h2-typed copy of the field list.
+///
+/// The fixed request's block is this, once. A workload's are this per send,
+/// into a buffer each connection keeps, so the steady state allocates
+/// nothing — and static-only is what makes the result valid on any stream of
+/// any connection, in any order, exactly as for the fixed block.
+pub fn encodeRequestBlock(
+    scratch: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    fields: []const Field,
+) ![]const u8 {
+    // Into h2's own field type at the last moment; see `Field`.
+    const hpack_fields = try scratch.alloc(h2.hpack.Field, fields.len);
+    for (hpack_fields, fields) |*o, in| o.* = .{ .name = in.name, .value = in.value };
+
     // An upper bound rather than a guess: a literal costs its two lengths, the
     // octets themselves, and a few of framing, and Huffman only ever shortens.
     var bound: usize = 0;
-    for (fields) |field| bound += field.name.len + field.value.len + block_field_overhead;
+    for (hpack_fields) |field| bound += field.name.len + field.value.len + block_field_overhead;
 
-    const buffer = try allocator.alloc(u8, bound);
-    errdefer allocator.free(buffer);
+    out.clearRetainingCapacity();
+    try out.ensureTotalCapacity(gpa, bound);
+    const buffer = out.allocatedSlice();
 
     var storage: h2.hpack.Encoder.Storage(0) = .{};
     var encoder = storage.encoder(.static_only);
-    const encoded = encoder.encode(buffer, fields);
+    const encoded = encoder.encode(buffer, hpack_fields);
     // `encode` reports how many fields fit rather than failing, so a short
     // buffer is a partial block. The bound above makes that unreachable, and
     // this is what says so.
-    if (encoded.fields != fields.len) return error.RequestTooLarge;
+    if (encoded.fields != hpack_fields.len) return error.RequestTooLarge;
 
-    return allocator.realloc(buffer, encoded.written);
+    out.items.len = encoded.written;
+    return out.items;
 }
 
 /// Framing octets one literal field can cost on top of its text: the two length

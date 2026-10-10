@@ -143,6 +143,7 @@ pub const Fleet = struct {
             p.counters = &self.live_counters[i];
             p.publish = &self.publish[i];
             p.phase = @as(f64, @floatFromInt(i)) / n;
+            p.index = @intCast(i);
             if (self.tls_state) |ts| p.tls_state = &ts[i];
             if (self.h3_state) |hs| p.h3_state = &hs[i];
         }

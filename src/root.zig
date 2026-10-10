@@ -18,6 +18,8 @@ pub const report = @import("report.zig");
 pub const tui = @import("tui.zig");
 pub const tls = @import("tls.zig");
 pub const h2conn = @import("h2conn.zig");
+pub const workload = @import("workload.zig");
+pub const Workload = workload.Workload;
 
 test {
     std.testing.refAllDecls(@This());

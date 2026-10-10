@@ -15,6 +15,7 @@ const httpmod = @import("http.zig");
 const pace = @import("pace.zig");
 const stats = @import("stats.zig");
 const tlsmod = @import("tls.zig");
+const workload = @import("workload.zig");
 
 /// The outcome of one complete load test. `snapshot.hist` is the
 /// coordinated-omission-corrected latency histogram; both live in the
@@ -113,6 +114,20 @@ pub fn run(
     const h3_request = if (cfg.http3) try h3conn.buildRequest(arena, cfg) else &[_]u8{};
     const address = try resolveAddress(io, cfg.url.host, cfg.url.port);
 
+    // A workload generates each request on its connection instead. Shared by
+    // the whole fleet, and on this frame because every connection holds a
+    // pointer to it until `group` is joined below.
+    //
+    // Scratch comes from `smp_allocator` rather than `arena`: connections
+    // allocate concurrently from executor threads, and an arena is not safe to
+    // share between them. A connection's scratch grows to its largest request
+    // and stays there, so the steady state allocates nothing.
+    var dynamic: workload.Dynamic = undefined;
+    const dynamic_ptr: ?*workload.Dynamic = if (cfg.workload) |w| blk: {
+        dynamic = .{ .workload = w, .cfg = cfg, .allocator = std.heap.smp_allocator };
+        break :blk &dynamic;
+    } else null;
+
     // Load the system trust store once (shared, read-mostly) for HTTPS
     // with verification enabled.
     //
@@ -191,7 +206,8 @@ pub fn run(
         .stop = &stop,
         .allocator = arena,
         .ca_store = ca_ptr,
-        // histogram/counters/publish/tls_state are filled in by buildParams.
+        .dynamic = dynamic_ptr,
+        // histogram/counters/publish/tls_state/index are filled in by buildParams.
         .histogram = undefined,
         .counters = undefined,
     });
@@ -242,8 +258,11 @@ pub fn run(
         if (before.nanoseconds >= end.nanoseconds) break;
         var next_wake = @min(@min(next_frame, next_row), end.nanoseconds);
         // Bound the sleep so the interrupt check below runs on a fixed cadence
-        // rather than only at the next frame/row deadline.
-        if (interrupt != null) next_wake = @min(next_wake, before.nanoseconds + interrupt_poll_ns);
+        // rather than only at the next frame/row deadline. A workload's
+        // failure is checked on the same cadence: it stops every connection,
+        // and without this the run would sit idle to its full duration first.
+        if (interrupt != null or dynamic_ptr != null)
+            next_wake = @min(next_wake, before.nanoseconds + interrupt_poll_ns);
         if (next_wake > before.nanoseconds) {
             // Propagate rather than `catch break`. The only failure here is
             // cancellation, and breaking would run the normal completion path:
@@ -257,6 +276,10 @@ pub fn run(
             // The errdefer above stops and joins the connections on the way out.
             try io.sleep(Io.Duration.fromNanoseconds(@intCast(next_wake - before.nanoseconds)), .awake);
         }
+
+        // Nothing past this point is a result; the error is returned below,
+        // once the fleet is joined.
+        if (dynamic_ptr) |d| if (d.failure.get() != null) break;
 
         const t = Io.Timestamp.now(io, .awake);
         // The wake at `end` flushes both consumers so the last partial window
@@ -301,6 +324,11 @@ pub fn run(
     // interrupted by the cancellation so shutdown never hangs.
     stop.store(true, .monotonic);
     group.cancel(io);
+
+    // A workload that could not build a request stopped the run early, and
+    // what was measured before it is not a result: the requests after it were
+    // never sent. The fleet is joined, so nothing touches `dynamic` past here.
+    if (dynamic_ptr) |d| if (d.failure.get()) |err| return err;
 
     const elapsed = start.durationTo(Io.Timestamp.now(io, .awake));
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_s;
@@ -662,4 +690,58 @@ test "a canceled run propagates instead of reporting a truncated success" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "a workload that fails stops the run and is returned, not reported" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const FailsAtFive = struct {
+        fn open(ptr: *anyopaque, index: u32) anyerror!*anyopaque {
+            _ = index;
+            return ptr;
+        }
+        fn next(ptr: *anyopaque, state: *anyopaque, seq: u64) anyerror!workload.Request {
+            _ = .{ ptr, state };
+            if (seq == 5) return error.ScriptFailed;
+            return .{};
+        }
+        fn close(ptr: *anyopaque, state: *anyopaque) void {
+            _ = .{ ptr, state };
+        }
+    };
+    var token: u8 = 0;
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var cfg: cli.Config = .{
+        .connections = 1,
+        .rate = 200,
+        // Long enough that returning promptly is the workload's doing.
+        .duration_ns = 10 * std.time.ns_per_s,
+        .url = try cli.parseUrl(url),
+        .workload = .{
+            .ptr = &token,
+            .vtable = &.{ .open = FailsAtFive.open, .next = FailsAtFive.next, .close = FailsAtFive.close },
+        },
+    };
+
+    const before = Io.Timestamp.now(io, .awake);
+    try testing.expectError(error.ScriptFailed, run(arena_state.allocator(), io, &cfg, 0, null, null, null));
+    const took = before.durationTo(Io.Timestamp.now(io, .awake));
+    try testing.expect(took.nanoseconds < 2 * std.time.ns_per_s);
+
+    group.cancel(io);
+    server.deinit(io);
 }
