@@ -129,8 +129,11 @@ pub fn run(
     var timing: workload.Timing = undefined;
     const dynamic_ptr: ?*workload.Dynamic = if (cfg.workload) |w| blk: {
         // zrk times the calls from outside only for a workload that does not
-        // report its own; see `workload.Workload.VTable.timing`.
+        // report its own; see `workload.Workload.VTable.timing`. One that
+        // does is asked once now, to start this run from zero: an earlier
+        // run that failed or was canceled never got to its report.
         const self_timed = w.vtable.timing != null;
+        if (w.vtable.timing) |own| _ = try own(w.ptr, arena);
         // One shard per executor thread; see `workload.Timing`.
         if (!self_timed) timing = try .init(arena, cfg.threads);
         dynamic = .{
@@ -764,4 +767,64 @@ test "a workload that fails stops the run and is returned, not reported" {
 
     group.cancel(io);
     server.deinit(io);
+}
+
+test "a self-timed workload's report covers only the run it ends" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    // Counts timing reports; any calls recorded before the run started are
+    // stale, and the runner must clear them before launching.
+    const Stale = struct {
+        reports: u32 = 0,
+        stale: bool = true,
+        fn open(ptr: *anyopaque, index: u32) anyerror!*anyopaque {
+            _ = index;
+            return ptr;
+        }
+        fn next(ptr: *anyopaque, state: *anyopaque, seq: u64) anyerror!workload.Request {
+            _ = .{ ptr, state, seq };
+            return .{};
+        }
+        fn close(ptr: *anyopaque, state: *anyopaque) void {
+            _ = .{ ptr, state };
+        }
+        fn timing(ptr: *anyopaque, gpa: std.mem.Allocator) anyerror!workload.TimingSummary {
+            _ = gpa;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reports += 1;
+            const calls: u64 = if (self.stale) 1000 else 1;
+            self.stale = false;
+            return .{ .next = .{ .calls = calls } };
+        }
+    };
+    var stale: Stale = .{};
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var cfg: cli.Config = .{
+        .connections = 1,
+        .rate = 100,
+        .duration_ns = 100 * std.time.ns_per_ms,
+        .url = try cli.parseUrl(url),
+        .workload = .{
+            .ptr = &stale,
+            .vtable = &.{ .open = Stale.open, .next = Stale.next, .close = Stale.close, .timing = Stale.timing },
+        },
+    };
+    const result = try run(arena_state.allocator(), io, &cfg, 0, null, null, null);
+    group.cancel(io);
+    server.deinit(io);
+
+    try testing.expectEqual(@as(u32, 2), stale.reports);
+    try testing.expectEqual(@as(u64, 1), result.workload.?.next.calls);
 }

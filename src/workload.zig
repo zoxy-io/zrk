@@ -95,9 +95,10 @@ pub const Workload = struct {
         /// `Response` is borrowed for the call. An error fails the run.
         response: ?*const fn (ptr: *anyopaque, state: *anyopaque, seq: u64, response: *const Response) anyerror!void = null,
         /// Optional: what the workload's own calls cost, measured by the
-        /// workload, for the report. Called once per run, after the fleet is
-        /// joined, and covers that run alone: a workload run more than once
-        /// starts counting again after reporting.
+        /// workload, for the report. Covers the calls since the previous
+        /// call, and starts counting again. The runner calls it before the
+        /// fleet launches, discarding the result — so a run that failed or
+        /// was canceled leaves nothing behind — and after it is joined.
         ///
         /// Null, zrk times `next` and `response` from outside, which counts
         /// any wait inside them. A workload whose calls wait on shared state
