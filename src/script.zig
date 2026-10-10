@@ -173,6 +173,21 @@ pub const Script = struct {
         fixed_raw: std.ArrayList(u8) = .empty,
         fixed_headers: std.ArrayList(wl.Header) = .empty,
 
+        /// Spin briefly before parking. The lock is held for one Lua call —
+        /// microseconds, and never across a yield — so a waiter is almost
+        /// always better off spinning than parking its coroutine, whose resume
+        /// can lag the unlock by far more than the call took. Parking stays
+        /// for the long holds: a JIT trace or a GC cycle inside the call.
+        fn lock(shared: *Shared, io: Io) void {
+            for (0..spins_before_park) |_| {
+                if (shared.mutex.tryLock()) return;
+                std.atomic.spinLoopHint();
+            }
+            shared.mutex.lockUncancelable(io);
+        }
+
+        const spins_before_park = 1000;
+
         fn deinit(shared: *Shared, gpa: Allocator) void {
             lua.lua_close(shared.L);
             shared.fixed_raw.deinit(gpa);
@@ -370,7 +385,7 @@ pub const Script = struct {
         if (conn.shared.fixed) |request| return request;
         {
             const shared = conn.shared;
-            shared.mutex.lockUncancelable(script.io);
+            shared.lock(script.io);
             defer shared.mutex.unlock(script.io);
             const L = shared.L;
             defer lua.lua_settop(L, 0);
@@ -394,7 +409,7 @@ pub const Script = struct {
         const script: *Script = @ptrCast(@alignCast(ptr));
         const conn: *Connection = @ptrCast(@alignCast(state));
         const shared = conn.shared;
-        shared.mutex.lockUncancelable(script.io);
+        shared.lock(script.io);
         defer shared.mutex.unlock(script.io);
         const L = shared.L;
         defer lua.lua_settop(L, 0);

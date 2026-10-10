@@ -10,6 +10,7 @@ const cli = @import("cli.zig");
 const stats = @import("stats.zig");
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
+const workload = @import("workload.zig");
 
 /// Fraction of outcomes that were failures: non-2xx/3xx responses, socket
 /// errors (connect/read/write/timeout), and `--deadline` misses, over all
@@ -87,7 +88,21 @@ pub const Run = struct {
     end_bytes_per_sec: f64 = 0,
     end_window_s: f64 = 0,
     end_window_at_s: f64 = 0,
+    /// What a workload's calls cost — a `--script`'s, for one — when the run
+    /// had one; see `workload.Timing`.
+    workload: ?workload.TimingSummary = null,
 };
+
+/// The share of the client's thread time a workload's calls took: their total
+/// over `elapsed × threads`. Wall time, so a call that waited for a lock
+/// counts its wait.
+pub fn workloadShare(run: Run, threads: u8) f64 {
+    const timing = run.workload orelse return 0;
+    const capacity = run.elapsed_s * @as(f64, @floatFromInt(@max(threads, 1))) * std.time.ns_per_s;
+    if (capacity <= 0) return 0;
+    const spent: f64 = @floatFromInt(timing.next.total_ns + timing.response.total_ns);
+    return spent / capacity;
+}
 
 /// Write the JSON run summary. Latencies are microseconds (the histogram's
 /// native unit); `duration_s`/`*_rate` are derived from the measured elapsed
@@ -245,12 +260,38 @@ pub fn writeJson(
         c.connect_errors, c.read_errors, c.write_errors, c.timeouts, c.deadline_errors, c.status_errors,
     });
 
+    // Present only for a run with a workload: absent and all-zero would say
+    // different things.
+    if (run.workload) |timing| {
+        try w.writeAll("  \"workload\": {\n");
+        try w.print("    \"thread_share\": {d:.6},\n", .{workloadShare(run, cfg.threads)});
+        try writeCallStats(w, "next", timing.next, ",");
+        try writeCallStats(w, "response", timing.response, "");
+        try w.writeAll("  },\n");
+    }
+
     // Full distribution, losslessly re-decodable by any HdrHistogram library.
     const b64 = try h.encodeBase64(gpa);
     defer gpa.free(b64);
     try w.print("  \"latency_histogram\": \"{s}\"\n", .{b64});
 
     try w.writeAll("}\n");
+}
+
+fn writeCallStats(w: *Io.Writer, name: []const u8, s: workload.CallStats, comma: []const u8) !void {
+    try w.print(
+        "    \"{s}\": {{ \"calls\": {d}, \"total_ms\": {d:.3}, \"mean_us\": {d:.3}, \"p50_us\": {d:.3}, \"p99_us\": {d:.3}, \"max_us\": {d:.3} }}{s}\n",
+        .{
+            name,
+            s.calls,
+            @as(f64, @floatFromInt(s.total_ns)) / std.time.ns_per_ms,
+            s.mean_ns / std.time.ns_per_us,
+            @as(f64, @floatFromInt(s.p50_ns)) / std.time.ns_per_us,
+            @as(f64, @floatFromInt(s.p99_ns)) / std.time.ns_per_us,
+            @as(f64, @floatFromInt(s.max_ns)) / std.time.ns_per_us,
+            comma,
+        },
+    );
 }
 
 /// Streams one NDJSON line per progress interval: the *interval's* throughput
@@ -860,4 +901,41 @@ test "errorRate and checkSlo gates" {
     try testing.expect(r.p99_ok);
     try testing.expect(!r.error_rate_ok);
     try testing.expect(!r.passed());
+}
+
+test "writeJson reports a workload's cost only for a run that had one" {
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 1;
+    var cfg = testConfig();
+    cfg.threads = 2;
+
+    var without = Io.Writer.Allocating.init(testing.allocator);
+    defer without.deinit();
+    try writeJson(testing.allocator, &without.writer, &cfg, &snap, .{ .elapsed_s = 1.0, .launched = 1 });
+    try testing.expect(std.mem.indexOf(u8, without.written(), "\"workload\"") == null);
+
+    var with = Io.Writer.Allocating.init(testing.allocator);
+    defer with.deinit();
+    const run: Run = .{
+        .elapsed_s = 1.0,
+        .launched = 1,
+        .workload = .{
+            .next = .{ .calls = 4, .total_ns = 20_000_000, .mean_ns = 5_000_000, .p50_ns = 4_000_000, .p99_ns = 9_000_000, .max_ns = 9_500_000 },
+            .response = .{},
+        },
+    };
+    try writeJson(testing.allocator, &with.writer, &cfg, &snap, run);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, with.written(), .{});
+    defer parsed.deinit();
+    const w = parsed.value.object.get("workload").?.object;
+    // 20 ms of calls over 1 s on 2 threads.
+    try testing.expectApproxEqAbs(@as(f64, 0.01), w.get("thread_share").?.float, 1e-9);
+    const next = w.get("next").?.object;
+    try testing.expectEqual(@as(i64, 4), next.get("calls").?.integer);
+    try testing.expectApproxEqAbs(@as(f64, 20), next.get("total_ms").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 9000), next.get("p99_us").?.float, 1e-9);
+    try testing.expectEqual(@as(i64, 0), w.get("response").?.object.get("calls").?.integer);
 }

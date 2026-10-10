@@ -51,6 +51,9 @@ pub const Report = struct {
     /// `--interval` (a signal raises no row of its own), and a consumer placing
     /// the window on a ramp's schedule has to know where it actually sat.
     end_window_at_s: f64 = 0,
+    /// What the workload's calls cost, when the run had a workload. See
+    /// `workload.Timing`.
+    workload: ?workload.TimingSummary = null,
 };
 
 /// One published counter reading at a progress-row boundary. Kept so `run` can
@@ -123,8 +126,17 @@ pub fn run(
     // share between them. A connection's scratch grows to its largest request
     // and stays there, so the steady state allocates nothing.
     var dynamic: workload.Dynamic = undefined;
+    var timing: workload.Timing = undefined;
     const dynamic_ptr: ?*workload.Dynamic = if (cfg.workload) |w| blk: {
-        dynamic = .{ .workload = w, .cfg = cfg, .allocator = std.heap.smp_allocator };
+        // One shard per executor thread; see `workload.Timing`.
+        timing = try .init(arena, cfg.threads);
+        dynamic = .{
+            .workload = w,
+            .cfg = cfg,
+            .allocator = std.heap.smp_allocator,
+            .timing = &timing,
+            .io = io,
+        };
         break :blk &dynamic;
     } else null;
 
@@ -329,6 +341,7 @@ pub fn run(
     // what was measured before it is not a result: the requests after it were
     // never sent. The fleet is joined, so nothing touches `dynamic` past here.
     if (dynamic_ptr) |d| if (d.failure.get()) |err| return err;
+    const workload_timing = if (dynamic_ptr != null) try timing.summarize(arena) else null;
 
     const elapsed = start.durationTo(Io.Timestamp.now(io, .awake));
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_s;
@@ -347,6 +360,7 @@ pub fn run(
             @as(f64, @floatFromInt(t.end_ns - start.nanoseconds)) / std.time.ns_per_s
         else
             elapsed_s,
+        .workload = workload_timing,
     };
 }
 

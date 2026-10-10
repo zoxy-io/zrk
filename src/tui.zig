@@ -16,6 +16,7 @@ const cli = @import("cli.zig");
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 const stats = @import("stats.zig");
+const workload = @import("workload.zig");
 const report = @import("report.zig");
 
 /// Live latency spectrogram geometry. The waterfall keeps the last
@@ -777,6 +778,17 @@ pub const Dashboard = struct {
         if (c.deadline_errors > 0) {
             try w.print("  deadline misses: {d} (CO latency exceeded --deadline)\n", .{c.deadline_errors});
         }
+        // What a script cost the client, so a slow script is told apart from
+        // a slow server. Only for runs that had one.
+        if (run.workload) |timing| {
+            try w.writeAll("  script: ");
+            try writeCalls(w, "request()", timing.next);
+            if (timing.response.calls > 0) {
+                try w.writeAll(", ");
+                try writeCalls(w, "response()", timing.response);
+            }
+            try w.print("  ·  {d:.2}% of client thread time\n", .{report.workloadShare(run, self.cfg.threads) * 100});
+        }
         // Peak schedule lag is the backlog gauge; sub-millisecond lag is normal
         // jitter, so only report it once it's large enough to signal overload.
         if (c.max_behind_ns >= std.time.ns_per_ms) {
@@ -784,6 +796,15 @@ pub const Dashboard = struct {
             try Dur.write(w, @floatFromInt(c.max_behind_ns / std.time.ns_per_us));
             try w.writeAll("\n");
         }
+    }
+
+    fn writeCalls(w: *Io.Writer, name: []const u8, s: workload.CallStats) !void {
+        try w.print("{s} {d} calls, p50 {d:.1}us p99 {d:.1}us", .{
+            name,
+            s.calls,
+            @as(f64, @floatFromInt(s.p50_ns)) / std.time.ns_per_us,
+            @as(f64, @floatFromInt(s.p99_ns)) / std.time.ns_per_us,
+        });
     }
 
     /// The `--latency` detailed percentile spectrum.
