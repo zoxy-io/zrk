@@ -6,6 +6,7 @@ const cli = @import("cli.zig");
 const connection = @import("connection.zig");
 const h3conn = @import("h3conn.zig");
 const runner = @import("runner.zig");
+const script_mod = @import("script.zig");
 const stats = @import("stats.zig");
 const report = @import("report.zig");
 const hdr = @import("hdr.zig");
@@ -47,6 +48,27 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
     }
+
+    // `--script`: loaded and checked before anything connects, so a script
+    // that does not parse is a usage error rather than a failed run. Before
+    // the HTTP/3 size check below, because a script without `request()`
+    // replaces the request that check measures.
+    var diagnostic: script_mod.Diagnostic = .{};
+    var script: ?*script_mod.Script = null;
+    if (cfg.script_path) |path| {
+        const source = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_script_bytes)) catch |err| {
+            try printScriptError(io, path, @errorName(err));
+            std.process.exit(2);
+        };
+        // Connections build their Lua states concurrently, from executor
+        // threads, so the allocator behind them has to be thread-safe.
+        script = script_mod.Script.load(std.heap.smp_allocator, io, &cfg, path, source, cfg.script_args, &diagnostic) catch |err| {
+            try printScriptError(io, path, diagnostic.message() orelse @errorName(err));
+            std.process.exit(2);
+        };
+        script.?.apply(&cfg);
+    }
+    defer if (script) |s| s.deinit();
 
     // `cli.parse` bounds an inline `--body` for `--http3`, but it cannot see a
     // body read from a file, nor the headers that share the same stream write.
@@ -123,7 +145,12 @@ pub fn main(init: std.process.Init) !void {
     if (watching) dash.stop_requested = &interrupt.flag;
 
     const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb, if (watching) &interrupt.flag else null) catch |err| {
-        try printRunError(io, err);
+        // A script's own failure has words for it; anything else is the run's.
+        if (diagnostic.message()) |message| {
+            try printScriptError(io, cfg.script_path.?, message);
+        } else {
+            try printRunError(io, err);
+        }
         std.process.exit(1);
     };
     var snapshot = result.snapshot;
@@ -316,6 +343,20 @@ fn readBody(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_body_bytes));
 }
 
+/// Scripts are code, not payloads: a megabyte is far past any real one.
+const max_script_bytes = 1024 * 1024;
+
+fn printScriptError(io: Io, path: []const u8, message: []const u8) !void {
+    var buf: [1536]u8 = undefined;
+    // A Lua message already starts with the file name; anything else gets one.
+    const named = std.mem.startsWith(u8, message, path);
+    const msg = (if (named)
+        std.fmt.bufPrint(&buf, "zrk: {s}\n", .{message})
+    else
+        std.fmt.bufPrint(&buf, "zrk: {s}: {s}\n", .{ path, message })) catch "zrk: the script failed\n";
+    try writeAll(io, .stderr(), msg);
+}
+
 fn printBodyError(io: Io, path: []const u8, err: anyerror) !void {
     var buf: [512]u8 = undefined;
     const src = if (std.mem.eql(u8, path, "-")) "stdin" else path;
@@ -492,6 +533,8 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.Http3WithHttp2 => "zrk: --http3 and --http2 are different transports; run them separately\n\n",
         error.Http3WithoutTls => "zrk: --http3 needs an https:// URL; QUIC has no cleartext mode\n\n",
         error.Http3BodyTooLarge => "zrk: the request is too large for --http3; its headers and --body must fit one QUIC stream write\n\n",
+        error.ScriptViaStreams => "zrk: -s is --streams here; run a wrk script with --script FILE\n\n",
+        error.UnexpectedArgument => "zrk: unexpected argument after the URL; only a --script takes arguments there\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);

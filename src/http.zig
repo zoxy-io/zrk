@@ -35,12 +35,17 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
 pub fn writeRequest(w: *Io.Writer, cfg: *const cli.Config, request: *const workload.Request) Io.Writer.Error!void {
     try w.print("{s} {s} HTTP/1.1\r\n", .{ request.method, request.target });
 
-    // Host header: include the port only when it is non-default.
-    const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
-    if (cfg.url.port == default_port) {
-        try w.print("Host: {s}\r\n", .{cfg.url.host});
-    } else {
-        try w.print("Host: {s}:{d}\r\n", .{ cfg.url.host, cfg.url.port });
+    // Host header: include the port only when it is non-default. A request
+    // naming its own `Host` — a virtual host behind the address dialled —
+    // replaces this one rather than following it: two `Host` lines are a
+    // request RFC 9112 §3.2 tells a server to reject with a 400.
+    if (hostOverride(request) == null) {
+        const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
+        if (cfg.url.port == default_port) {
+            try w.print("Host: {s}\r\n", .{cfg.url.host});
+        } else {
+            try w.print("Host: {s}:{d}\r\n", .{ cfg.url.host, cfg.url.port });
+        }
     }
 
     // Sensible defaults, each skipped when the user supplies the same header
@@ -114,9 +119,13 @@ pub fn buildRequestFields(
 
     // §8.3.1: `:authority` replaces `Host`, and carries the port only when it
     // is not the scheme's default — the same rule `buildRequest` applies to
-    // `Host`, so every transport addresses the same origin.
+    // `Host`, so every transport addresses the same origin. A request naming
+    // its own `Host` names the authority instead, and the field itself is
+    // dropped: §8.3.1 has a client use `:authority` rather than `Host`.
     const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
-    const authority = if (cfg.url.port == default_port)
+    const authority = if (hostOverride(request)) |host|
+        host
+    else if (cfg.url.port == default_port)
         try scratch.dupe(u8, cfg.url.host)
     else
         try std.fmt.allocPrint(scratch, "{s}:{d}", .{ cfg.url.host, cfg.url.port });
@@ -125,6 +134,7 @@ pub fn buildRequestFields(
     var has_ua = false;
     var has_cl = false;
     for (request.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
         if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
         if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
         // §8.2.1 requires field names to be lowercase on the wire. `-H` takes
@@ -251,6 +261,14 @@ fn validateRequestFields(fields: []const Field) !void {
         validator.field(&one) catch return error.InvalidRequestHeader;
     }
     validator.finish() catch return error.InvalidRequestHeader;
+}
+
+/// The request's own `Host`, when it names one (the first, if several).
+fn hostOverride(request: *const workload.Request) ?[]const u8 {
+    for (request.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "host")) return h.value;
+    }
+    return null;
 }
 
 /// Methods whose semantics anticipate request content (RFC 9110 §9.3), for
@@ -729,4 +747,26 @@ test "a header value that would split a request is refused" {
     var cfg: cli.Config = .{ .headers = &.{.{ .name = "X-Evil", .value = "a\r\nx-injected: 1" }} };
     cfg.url = .{ .scheme = .http, .host = "example.com", .port = 80, .target = "/" };
     try std.testing.expectError(error.InvalidRequestHeader, buildRequestBlock(allocator, &cfg));
+}
+
+test "a request's own Host replaces the default on every transport" {
+    const allocator = std.testing.allocator;
+    var cfg: cli.Config = .{ .headers = &.{.{ .name = "Host", .value = "vhost.test" }} };
+    cfg.url = .{ .scheme = .http, .host = "10.0.0.1", .port = 8080, .target = "/" };
+
+    const h1 = try buildRequest(allocator, &cfg);
+    defer allocator.free(h1);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h1, "Host:"));
+    try std.testing.expect(std.mem.indexOf(u8, h1, "Host: vhost.test\r\n") != null);
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const fixed: workload.Fixed = .init(&cfg);
+    const fields = try buildRequestFields(arena.allocator(), &cfg, &fixed.request);
+    var authority: ?[]const u8 = null;
+    for (fields) |f| {
+        try std.testing.expect(!std.mem.eql(u8, f.name, "host"));
+        if (std.mem.eql(u8, f.name, ":authority")) authority = f.value;
+    }
+    try std.testing.expectEqualStrings("vhost.test", authority.?);
 }

@@ -122,6 +122,10 @@ What the contract guarantees, and what it asks of an implementation:
 - **Failure.** An error from `open` or `next` stops every connection, and
   `runner.run` returns that error instead of a `Report`.
 
+`zrk.script.Script` is the `--script` implementation, built on this
+interface: `Script.load` checks a wrk script, and `apply` puts it into effect
+on a `Config`, as its fixed request or as its workload.
+
 `zrk.workload.Fixed` is the fixed request as a `Workload`. A run with no
 workload does not go through it; it replays prebuilt bytes, and its throughput
 is unaffected by any of this.

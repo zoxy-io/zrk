@@ -60,7 +60,7 @@ zig build test            # run the unit + integration tests
 ```
 zrk — constant-throughput HTTP load generator
 
-Usage: zrk [options] <url>
+Usage: zrk [options] <url> [script args...]
 
 Options:
   -t, --threads     <N>     Total number of threads to execute load (default 2)
@@ -88,6 +88,9 @@ Options:
   -m, --method      <M>     HTTP method                    (default GET)
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
                             (@- = stdin, @@x = a literal "@x")
+      --script    <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
+                            and init(args)/request() hooks shape each
+                            request. Arguments after <url> go to init
       --timeout     <T>     Wire timeout per attempt, from the actual
                             send (default 2s); does not bound CO latency
       --deadline    <T>     Max coordinated-omission latency, from the
@@ -156,6 +159,9 @@ zrk -c20 -d1m -R500 --latency https://api.example.com/health
 zrk -c10 -R100 -m POST -b '{"ping":1}' \
     -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
 
+# A wrk script: a fresh user id on every request, ids 1..1000 (see "Scripting")
+zrk -c50 -R2000 -d30s --script users.lua http://127.0.0.1:8080/ /user/ 1000
+
 # HTTP/3 over QUIC (experimental — see "HTTP/3" below for what that costs you)
 zrk --http3 -k -c10 -R500 -d30s https://127.0.0.1:4433/
 
@@ -174,6 +180,52 @@ zrk -c50 -R1000 -d20s --format json -o result.json \
 zrk -c50 -R1000 -d5m --timeseries - http://127.0.0.1:8080/ \
   | jplot achieved_rate+target_rate latency_us.p50+latency_us.p90+latency_us.p99 error_rate
 ```
+
+### Scripting
+
+`--script FILE` runs a [wrk](https://github.com/wg/wrk) Lua script, so scripts
+written for wrk and wrk2 carry over. The interpreter is LuaJIT, as in wrk:
+Lua 5.1 with `bit`, `unpack` and the standard libraries.
+
+```lua
+-- users.lua: a different path on every request, so no cache can answer it
+local base, max
+function init(args)            -- args[0] is the URL, args[1..] what follows it
+  base, max = args[1] or "/user/", tonumber(args[2] or "1000")
+end
+function request()
+  return wrk.format("GET", base .. math.random(1, max))
+end
+```
+
+What carries over from wrk:
+
+- **The `wrk` table.** `scheme`, `host`, `port`, `method`, `path`, `headers`,
+  `body`, and `wrk.format(method, path, headers, body)`. `-m`, `-H` and `-b`
+  set the starting values.
+- **`init(args)`.** Runs once per thread at startup. Arguments after the URL
+  reach it, and `--` passes ones that start with a dash.
+- **`request()`.** Runs once per request, with one Lua state per `-t` thread
+  shared by that thread's connections, as in wrk.
+
+What is different:
+
+- **A script without `request()` costs nothing per request.** It only edits
+  `wrk.method`, `wrk.path`, `wrk.headers` or `wrk.body`, so its request
+  becomes the fixed one, exactly as if `-m`, `-H` and `-b` had described it.
+- **Scripts work over `--http2` and `--http3`.** zrk reads the text that
+  `request()` returns back into a method, path, headers and body, then sends
+  it on whichever transport the run speaks. A `Host` header the script sets
+  becomes the request's authority.
+- **One request per `request()` call.** wrk's trick of returning several
+  requests back to back to pipeline them is refused. `--streams` is zrk's
+  way to keep several requests in flight.
+- **The script's time is not the server's.** `request()` runs before the
+  pacing wait, and before the clock starts in `--closed` mode.
+- **`setup`, `delay`, `response` and `done` are not supported yet.** A script
+  that defines one is refused at startup rather than run without it.
+
+A Lua error stops the run, and zrk reports the file and line.
 
 ### HTTP/3
 
@@ -249,3 +301,8 @@ soak now runs 296,866 requests at 14.8k req/s where it previously managed
 ## License
 
 [MIT](LICENSE)
+
+zrk binaries statically link [LuaJIT](https://luajit.org/) for `--script`,
+which is MIT-licensed, Copyright (C) 2005-2026 Mike Pall. Its build script
+adapts [ziglua](https://github.com/natecraddock/ziglua)'s, MIT-licensed,
+Copyright (c) 2022 Nathan Craddock.

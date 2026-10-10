@@ -185,6 +185,14 @@ pub const Config = struct {
     /// above remain validated even when the workload replaces them.
     workload: ?workload.Workload = null,
 
+    /// `--script`: a wrk script, loaded by `main.zig` into `script.Script`,
+    /// which then sets either the fixed request or `workload`.
+    script_path: ?[]const u8 = null,
+    /// What the script's `init(args)` receives: the URL as typed, then the
+    /// arguments after it — wrk's `args`, `args[0]` included. Empty without
+    /// `--script`.
+    script_args: []const []const u8 = &.{},
+
     /// True when `--timeseries -` handed stdout to the NDJSON stream, so it can
     /// be piped straight into a live plotter. stdout then belongs to the rows:
     /// the live dashboard is suppressed and the final report goes to `--output`
@@ -219,6 +227,8 @@ pub const ParseError = error{
     Http3WithHttp2,
     Http3WithoutTls,
     Http3BodyTooLarge,
+    ScriptViaStreams,
+    UnexpectedArgument,
     OutOfMemory,
 };
 
@@ -243,7 +253,7 @@ pub const Parsed = union(enum) {
 pub const usage =
     \\zrk — constant-throughput HTTP load generator
     \\
-    \\Usage: zrk [options] <url>
+    \\Usage: zrk [options] <url> [script args...]
     \\
     \\Options:
     \\  -t, --threads     <N>     Total number of threads to execute load (default 2)
@@ -271,6 +281,9 @@ pub const usage =
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
     \\                            (@- = stdin, @@x = a literal "@x")
+    \\      --script    <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
+    \\                            and init(args)/request() hooks shape each
+    \\                            request. Arguments after <url> go to init
     \\      --timeout     <T>     Wire timeout per attempt, from the actual
     \\                            send (default 2s); does not bound CO latency
     \\      --deadline    <T>     Max coordinated-omission latency, from the
@@ -325,6 +338,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     var cfg: Config = .{};
     var url_arg: ?[]const u8 = null;
     var headers: std.ArrayList(Header) = .empty;
+    // Positionals after the URL, for a script's `init(args)`.
+    var extra: std.ArrayList([]const u8) = .empty;
 
     // Expand wrk-style attached short options (`-t2`) into separate tokens so
     // the main loop only has to deal with `-t 2`.
@@ -345,6 +360,15 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     while (i < tokens.len) : (i += 1) {
         const arg = tokens[i];
         if (arg.len == 0) continue;
+
+        // Everything after `--` is positional, so a script argument can
+        // start with a dash.
+        if (eq(arg, "--")) {
+            for (tokens[i + 1 ..]) |rest| {
+                if (url_arg == null) url_arg = rest else try extra.append(arena, rest);
+            }
+            break;
+        }
 
         if (eq(arg, "-h") or eq(arg, "--help")) return .help;
         if (eq(arg, "--version")) return .version;
@@ -384,7 +408,15 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         } else if (eq(arg, "-t") or eq(arg, "--threads")) {
             cfg.threads = try parseU8(try nextValue(tokens, &i));
         } else if (eq(arg, "-s") or eq(arg, "--streams")) {
-            cfg.streams = try parseU32(try nextValue(tokens, &i));
+            const v = try nextValue(tokens, &i);
+            cfg.streams = parseU32(v) catch |err| {
+                // wrk's `-s` is its script. Here it is `--streams`, which wrk
+                // never had, so a script path in its place is a habit to name.
+                if (std.mem.endsWith(u8, v, ".lua")) return error.ScriptViaStreams;
+                return err;
+            };
+        } else if (eq(arg, "--script")) {
+            cfg.script_path = try nextValue(tokens, &i);
         } else if (eq(arg, "-c") or eq(arg, "--connections")) {
             cfg.connections = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-d") or eq(arg, "--duration")) {
@@ -423,9 +455,11 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             try headers.append(arena, try parseHeader(try nextValue(tokens, &i)));
         } else if (arg[0] == '-' and arg.len > 1) {
             return error.UnknownFlag;
-        } else {
-            // Positional: the target URL (last one wins).
+        } else if (url_arg == null) {
             url_arg = arg;
+        } else {
+            // wrk's script arguments follow the URL.
+            try extra.append(arena, arg);
         }
     }
 
@@ -469,6 +503,17 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
+
+    // Only a script reads them; without one, a second positional is a
+    // mistake to report rather than an argument to drop.
+    if (cfg.script_path != null) {
+        const script_args = try arena.alloc([]const u8, extra.items.len + 1);
+        script_args[0] = raw_url;
+        @memcpy(script_args[1..], extra.items);
+        cfg.script_args = script_args;
+    } else if (extra.items.len > 0) {
+        return error.UnexpectedArgument;
+    }
 
     if (cfg.http3) {
         // QUIC has no cleartext mode: RFC 9114 §3.1 reaches an origin over TLS
@@ -1073,4 +1118,28 @@ test "the README's usage block is the real help text" {
     const documented = std.mem.trimEnd(u8, rest[0..end], "\n");
 
     try std.testing.expectEqualStrings(std.mem.trimEnd(u8, usage, "\n"), documented);
+}
+
+test "--script takes the arguments after the URL, wrk-style" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const plain = (try parse(a, &[_][]const u8{ "--script", "s.lua", "http://x/" })).config;
+    try testing.expectEqualStrings("s.lua", plain.script_path.?);
+    try testing.expectEqual(@as(usize, 1), plain.script_args.len);
+    try testing.expectEqualStrings("http://x/", plain.script_args[0]);
+
+    // After the URL, and after `--` — which is how an argument starting with
+    // a dash gets through.
+    const with = (try parse(a, &[_][]const u8{ "--script", "s.lua", "http://x/", "a", "-c", "5", "--", "-b" })).config;
+    try testing.expectEqual(@as(u32, 5), with.connections);
+    try testing.expectEqual(@as(usize, 3), with.script_args.len);
+    try testing.expectEqualStrings("a", with.script_args[1]);
+    try testing.expectEqualStrings("-b", with.script_args[2]);
+
+    try testing.expectError(error.UnexpectedArgument, parse(a, &[_][]const u8{ "http://x/", "a" }));
+    // wrk's `-s` habit, named rather than reported as a bad number.
+    try testing.expectError(error.ScriptViaStreams, parse(a, &[_][]const u8{ "-s", "post.lua", "http://x/" }));
+    try testing.expectError(error.InvalidNumber, parse(a, &[_][]const u8{ "-s", "x", "http://x/" }));
 }
