@@ -274,6 +274,11 @@ pub const Timing = struct {
         lock: std.atomic.Mutex = .unlocked,
         next: hdr.Histogram,
         response: hdr.Histogram,
+        /// Exact sums, kept beside the histograms: a histogram clamps what
+        /// exceeds its range, and a total built from it would quietly
+        /// undercount a call that blocked for longer.
+        next_total_ns: u64 = 0,
+        response_total_ns: u64 = 0,
 
         fn of(shard: *Shard, kind: Kind) *hdr.Histogram {
             return switch (kind) {
@@ -281,12 +286,20 @@ pub const Timing = struct {
                 .response => &shard.response,
             };
         }
+
+        fn total(shard: *Shard, kind: Kind) *u64 {
+            return switch (kind) {
+                .next => &shard.next_total_ns,
+                .response => &shard.response_total_ns,
+            };
+        }
     };
 
-    /// 1 ns to 10 s at two significant figures: calls are microseconds, and
-    /// a percent of resolution is plenty for a cost.
+    /// 1 ns to an hour at two significant figures: calls are microseconds,
+    /// a percent of resolution is plenty for a cost, and an hour is past any
+    /// call a run could survive. Totals do not depend on it; see `Shard`.
     fn newHistogram(gpa: Allocator) !hdr.Histogram {
-        return hdr.Histogram.init(gpa, 1, 10 * std.time.ns_per_s, 2);
+        return hdr.Histogram.init(gpa, 1, 3600 * std.time.ns_per_s, 2);
     }
 
     pub fn init(gpa: Allocator, shards: u32) !Timing {
@@ -320,6 +333,7 @@ pub const Timing = struct {
         while (!shard.lock.tryLock()) std.atomic.spinLoopHint();
         defer shard.lock.unlock();
         shard.of(kind).record(@max(ns, 1));
+        shard.total(kind).* +|= ns;
     }
 
     /// Every shard merged, once the fleet is joined.
@@ -329,8 +343,12 @@ pub const Timing = struct {
         var summary: TimingSummary = .{};
         inline for (.{ Kind.next, Kind.response }) |kind| {
             merged.reset();
-            for (t.shards) |*shard| merged.add(shard.of(kind));
-            @field(summary, @tagName(kind)) = .of(&merged);
+            var total: u64 = 0;
+            for (t.shards) |*shard| {
+                merged.add(shard.of(kind));
+                total +|= shard.total(kind).*;
+            }
+            @field(summary, @tagName(kind)) = .of(&merged, total);
         }
         return summary;
     }
@@ -345,14 +363,13 @@ pub const CallStats = struct {
     p99_ns: u64 = 0,
     max_ns: u64 = 0,
 
-    fn of(h: *const hdr.Histogram) CallStats {
+    fn of(h: *const hdr.Histogram, total_ns: u64) CallStats {
         const calls = h.count();
         if (calls == 0) return .{};
-        const mean = h.mean();
         return .{
             .calls = calls,
-            .total_ns = @intFromFloat(mean * @as(f64, @floatFromInt(calls))),
-            .mean_ns = mean,
+            .total_ns = total_ns,
+            .mean_ns = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(calls)),
             .p50_ns = h.valueAtPercentile(50),
             .p99_ns = h.valueAtPercentile(99),
             .max_ns = h.max(),
@@ -806,8 +823,9 @@ test "Timing records each call into its connection's shard, and merges them" {
     const summary = try timing.summarize(testing.allocator);
     try testing.expectEqual(@as(u64, 3), summary.next.calls);
     try testing.expectEqual(@as(u64, 1), summary.response.calls);
-    try testing.expectApproxEqRel(@as(f64, 2000), summary.next.mean_ns, 0.02);
-    try testing.expectApproxEqRel(@as(f64, 6000), @as(f64, @floatFromInt(summary.next.total_ns)), 0.02);
+    // Totals and means are exact, not read back off the histogram.
+    try testing.expectEqual(@as(f64, 2000), summary.next.mean_ns);
+    try testing.expectEqual(@as(u64, 6000), summary.next.total_ns);
     try testing.expectApproxEqRel(@as(f64, 3000), @as(f64, @floatFromInt(summary.next.max_ns)), 0.02);
 }
 
@@ -829,4 +847,13 @@ test "a generator with timing records its workload calls, and only those" {
     _ = try g.at(0); // held: no call, nothing timed
     _ = try g.at(1);
     try testing.expectEqual(@as(u64, 2), timing.shards[0].next.count());
+}
+
+test "a call longer than the histogram's range still counts in full" {
+    var timing = try Timing.init(testing.allocator, 1);
+    defer timing.deinit(testing.allocator);
+    const two_hours: u64 = 2 * 3600 * std.time.ns_per_s;
+    timing.record(0, .next, two_hours);
+    const summary = try timing.summarize(testing.allocator);
+    try testing.expectEqual(two_hours, summary.next.total_ns);
 }

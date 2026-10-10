@@ -780,15 +780,15 @@ pub const Dashboard = struct {
         }
         // What a script cost the client, so a slow script is told apart from
         // a slow server. Only for runs that had one.
-        if (run.workload) |timing| {
+        // Only the kinds of call that happened: a script without
+        // `request()` makes none, and "0 calls, p50 0us" would read as free.
+        if (run.workload) |timing| if (timing.next.calls + timing.response.calls > 0) {
             try w.writeAll("  script: ");
-            try writeCalls(w, "request()", timing.next);
-            if (timing.response.calls > 0) {
-                try w.writeAll(", ");
-                try writeCalls(w, "response()", timing.response);
-            }
+            if (timing.next.calls > 0) try writeCalls(w, "request()", timing.next);
+            if (timing.next.calls > 0 and timing.response.calls > 0) try w.writeAll(", ");
+            if (timing.response.calls > 0) try writeCalls(w, "response()", timing.response);
             try w.print("  ·  {d:.2}% of client thread time\n", .{report.workloadShare(run, self.cfg.threads) * 100});
-        }
+        };
         // Peak schedule lag is the backlog gauge; sub-millisecond lag is normal
         // jitter, so only report it once it's large enough to signal overload.
         if (c.max_behind_ns >= std.time.ns_per_ms) {

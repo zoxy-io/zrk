@@ -94,8 +94,10 @@ pub const Run = struct {
 };
 
 /// The share of the client's thread time a workload's calls took: their total
-/// over `elapsed × threads`. Wall time, so a call that waited for a lock
-/// counts its wait.
+/// over `elapsed × threads`. For a script, that total is Lua time measured
+/// inside each thread state's lock, so the share cannot exceed 1. For a
+/// library workload zrk times from outside, it is wall time including any
+/// wait inside the calls, and can.
 pub fn workloadShare(run: Run, threads: u8) f64 {
     const timing = run.workload orelse return 0;
     const capacity = run.elapsed_s * @as(f64, @floatFromInt(@max(threads, 1))) * std.time.ns_per_s;
