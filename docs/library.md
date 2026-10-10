@@ -110,7 +110,9 @@ What the contract guarantees, and what it asks of an implementation:
 - **Threads.** Connections call concurrently from different threads, and the
   runtime moves a connection between threads as it steals work. State behind
   `ptr` is shared and is yours to synchronise; state returned by `open` is
-  touched by one connection only, one call at a time.
+  touched by one connection only. Its calls do not overlap, with one
+  exception: on a multiplexed HTTP/2 connection, `response` can run while
+  `next` does (see Responses below).
 - **Lifetimes.** Slices in a returned `Request` must stay valid until the next
   `next` or `close` on the same connection state.
 - **Timing.** `next` runs ahead of the send where the schedule allows, before

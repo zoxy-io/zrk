@@ -309,8 +309,8 @@ soak now runs 296,866 requests at 14.8k req/s where it previously managed
 | code | meaning |
 |------|---------|
 | 0 | run completed; any configured gates passed |
-| 1 | the run failed to start or complete, no request completed, or a `--script` failed (see the message on stderr). Any response counts as completed, a 5xx included: gate on those with `--max-error-rate` |
-| 2 | bad arguments, or a `--body` or `--script` file that could not be read or loaded |
+| 1 | the run failed to start or complete, no request completed, or a `--script`'s `request()`, `response()` or `done()` raised an error (see the message on stderr). Any response counts as completed, a 5xx included: gate on those with `--max-error-rate` |
+| 2 | bad arguments, a `--body` file that could not be read, or a `--script` that could not be read or loaded, or whose `setup()` or `init()` raised an error |
 | 3 | run completed but a `--slo-p99` / `--max-error-rate` gate was breached |
 | 130 | interrupted by SIGINT (`Ctrl-C`); a partial report was still written |
 | 143 | interrupted by SIGTERM; a partial report was still written |

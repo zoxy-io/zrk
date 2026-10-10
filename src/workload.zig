@@ -48,7 +48,9 @@ pub const Request = struct {
 /// executors, so a connection may move threads between two of its own calls.
 /// Shared state behind `ptr` is the implementation's to synchronise. State a
 /// connection keeps for itself belongs in what `open` returns, which only that
-/// connection ever touches — never two calls at once.
+/// connection ever touches, and never in two calls at once — except that on a
+/// multiplexed HTTP/2 connection `response` can run while `next` does; see
+/// `VTable.response`.
 pub const Workload = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
