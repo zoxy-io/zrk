@@ -67,6 +67,8 @@ pub extern fn lua_pushnumber(L: *State, n: Number) void;
 pub extern fn lua_pushlightuserdata(L: *State, p: *anyopaque) void;
 pub extern fn lua_next(L: *State, index: c_int) c_int;
 pub extern fn lua_error(L: *State) c_int;
+pub extern fn lua_concat(L: *State, n: c_int) void;
+pub extern fn luaL_where(L: *State, level: c_int) void;
 
 pub extern fn lua_createtable(L: *State, narr: c_int, nrec: c_int) void;
 pub extern fn lua_getfield(L: *State, index: c_int, key: [*:0]const u8) void;
@@ -86,12 +88,16 @@ pub fn absIndex(L: *State, index: c_int) c_int {
     return if (index > 0 or index <= registry_index) index else lua_gettop(L) + index + 1;
 }
 
-/// Raise `message` as a Lua error from a C function. Does not return: the
+/// Raise `message` as a Lua error from a C function, prefixed with the
+/// calling script's `file:line:` as `luaL_error` does. Does not return: the
 /// error unwinds to the enclosing `lua_pcall`, skipping the C frames between
 /// (build/luajit.zig builds without external unwinding), so a caller must
 /// hold nothing that needs releasing.
 pub fn raise(L: *State, message: []const u8) noreturn {
+    // Level 1: the Lua function that called this C function.
+    luaL_where(L, 1);
     pushString(L, message);
+    lua_concat(L, 2);
     _ = lua_error(L);
     unreachable;
 }

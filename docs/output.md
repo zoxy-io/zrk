@@ -66,7 +66,9 @@ more key. So does a library run with a `Workload`. Runs without one have no
   does not is timed by zrk from outside its calls, as wall time that counts
   any wait inside them, and then `thread_share` can exceed 1.
 
-The text report prints the same as one line, under the latency percentiles:
+The text report prints the same as one line, under the latency percentiles. It
+names only the kinds of call that happened, and is left out when neither did,
+as for a script whose only hook is `setup()`:
 
 ```
   script: request() 1604 calls, p50 6.6us p99 67.3us, response() 1600 calls, p50 5.5us p99 46.7us  ·  0.74% of client thread time
