@@ -192,6 +192,23 @@ pub const Incoming = union(enum) {
     idle,
 };
 
+/// Sees a response as it is read, for a caller that keeps it.
+///
+/// `field` gets each regular field of a response's header section as HPACK
+/// decodes it — the only moment the fields exist, since the decoder's dynamic
+/// table makes a block decodable exactly once, in order. Not pseudo fields,
+/// and not trailer sections. `data` gets each DATA frame's payload. Both are
+/// called from inside `receive`, before the event they belong to is returned,
+/// with arguments borrowed for the call.
+///
+/// Null by default, and then reading is exactly what it was: zrk keeps a
+/// response only for a workload that asked for it.
+pub const Observer = struct {
+    ctx: *anyopaque,
+    field: *const fn (ctx: *anyopaque, stream: u31, name: []const u8, value: []const u8) void,
+    data: *const fn (ctx: *anyopaque, stream: u31, payload: []const u8) void,
+};
+
 /// An answer the peer is owed, deferred to whoever owns the writer.
 pub const Reply = union(enum) {
     settings_ack,
@@ -257,6 +274,9 @@ pub const Session = struct {
     /// `peer_initial_window` these give its send window; see `bodyWindow`.
     body_credit: i64 = 0,
     body_sent: i64 = 0,
+
+    /// See `Observer`.
+    observer: ?Observer = null,
 
     /// Field-block assembly and HPACK decoding, both connection-scoped.
     ///
@@ -625,7 +645,13 @@ pub const Session = struct {
             .fragment => return .idle,
             .block => |complete| return .{ .headers = .{
                 .stream = header.stream_identifier,
-                .status = try decodeStatus(&session.decoder, &session.field_buffer, complete.fragment),
+                .status = try decodeStatus(
+                    &session.decoder,
+                    &session.field_buffer,
+                    complete.fragment,
+                    session.observer,
+                    header.stream_identifier,
+                ),
                 .bytes = complete.fragment.len,
                 .end_stream = complete.end_stream,
             } },
@@ -638,6 +664,7 @@ pub const Session = struct {
                 // reader — so the only flow control left is giving the
                 // connection window back before the budget runs out.
                 session.window_debt +|= @intCast(data.data.len);
+                if (session.observer) |o| o.data(o.ctx, header.stream_identifier, data.data);
                 return .{ .data = .{
                     .stream = header.stream_identifier,
                     .bytes = data.data.len,
@@ -857,7 +884,13 @@ fn finish(status: ?u16, bytes: u64) Error!httpmod.Response {
 /// 9113 section 8.2, and a load generator that reported a 200 for a response
 /// carrying a CR in a header value would be reporting a success the target
 /// should have been failed for.
-fn decodeStatus(decoder: *hpack.Decoder, buffer: []u8, block: []const u8) Error!?u16 {
+fn decodeStatus(
+    decoder: *hpack.Decoder,
+    buffer: []u8,
+    block: []const u8,
+    observer: ?Observer,
+    stream: u31,
+) Error!?u16 {
     var validator: h2.fields.MessageValidator = .init(.{
         .kind = .response,
         // The floor of section 8.2.1 rather than RFC 9110's full grammar. zrk
@@ -872,7 +905,15 @@ fn decodeStatus(decoder: *hpack.Decoder, buffer: []u8, block: []const u8) Error!
     var iterator = decoder.iterate(buffer, block);
     while (iterator.next() catch return error.Protocol) |field| {
         validator.field(&field) catch return error.Protocol;
-        if (!std.mem.eql(u8, field.name, ":status")) continue;
+        if (!std.mem.eql(u8, field.name, ":status")) {
+            // Pseudo fields come first (section 8.3), so a regular field after
+            // `:status` is the response's; with no `:status` before it, the
+            // block is a trailer section, which the observer does not see.
+            if (status != null and field.name.len > 0 and field.name[0] != ':') {
+                if (observer) |o| o.field(o.ctx, stream, field.name, field.value);
+            }
+            continue;
+        }
         if (status != null) return error.Protocol;
         status = std.fmt.parseInt(u16, field.value, 10) catch return error.Protocol;
     }

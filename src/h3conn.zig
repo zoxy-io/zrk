@@ -320,6 +320,10 @@ pub const State = struct {
     retry: [requests_max]Retry = undefined,
     retry_len: usize = 0,
 
+    /// Responses, kept for a workload's `response` hook, one capture per
+    /// slot. Null — and nothing kept — for every other run.
+    collector: ?*conn.Collector = null,
+
     datagram: [Connection.datagram_octets]u8 = undefined,
     incoming: [receive_octets]u8 = undefined,
     /// zrk's trust decision, held here rather than on `begin`'s frame because
@@ -430,6 +434,19 @@ pub fn run(p: *conn.Params) void {
         break :blk &generator_storage;
     } else null;
     defer if (generator) |g| g.close();
+
+    var collector_storage: conn.Collector = undefined;
+    if (generator) |g| if (g.wantsResponses()) {
+        collector_storage = conn.Collector.init(g, requests_max) catch |err| {
+            conn.failWorkload(p, err);
+            return;
+        };
+        state.collector = &collector_storage;
+    };
+    defer if (state.collector) |c| {
+        c.deinit();
+        state.collector = null;
+    };
 
     while (!p.stop.load(.monotonic) and conn.now(io).nanoseconds < p.end.nanoseconds) {
         serve(p, state, generator, &anchor, &send_index);
@@ -1081,6 +1098,7 @@ fn issue(
             .retried = retrying,
             .seq = seq,
         };
+        if (state.collector) |c| c.captures[slotIndex(state, slot)].reset();
     }
 }
 
@@ -1282,11 +1300,13 @@ fn apply(p: *conn.Params, state: *State, event: h3.http3.Event) bool {
             const slot = slotFor(state, value.stream) orelse return true;
             slot.bytes += value.section.len;
             if (value.trailers) return true;
-            slot.status = statusOf(state, value.section);
+            const capture = if (state.collector) |c| &c.captures[slotIndex(state, slot)] else null;
+            slot.status = statusOf(state, value.section, capture);
         },
         .data => |value| {
             const slot = slotFor(state, value.stream) orelse return true;
             slot.bytes += value.payload.len;
+            if (state.collector) |c| c.captures[slotIndex(state, slot)].bodyBytes(c.gpa, value.payload);
         },
         .finished => |id| {
             const slot = slotFor(state, id) orelse return true;
@@ -1300,20 +1320,31 @@ fn apply(p: *conn.Params, state: *State, event: h3.http3.Event) bool {
 ///
 /// Decoded rather than trusted: `Http3` hands the section over encoded because
 /// the buffer a decode needs is many times the section's size and belongs to
-/// the caller. Only `:status` is kept — zrk deliberately retains no header
-/// content, on any transport.
-fn statusOf(state: *State, section: []const u8) ?u16 {
+/// the caller. Only `:status` is kept — unless `capture` is given, for a
+/// workload's `response` hook, which then gets the regular fields too.
+fn statusOf(state: *State, section: []const u8, capture: ?*workload.Capture) ?u16 {
     var iterator = h3.qpack.field_line.iterate(
         section,
         &state.fields,
         field_section_octets_max,
     ) catch return null;
+    var status: ?u16 = null;
     // Bounded by the section, which `Http3` bounded by the advertised maximum.
-    while (iterator.next() catch return null) |field| {
-        if (!std.mem.eql(u8, field.name, ":status")) continue;
-        return std.fmt.parseInt(u16, field.value, 10) catch null;
+    while (iterator.next() catch return status) |field| {
+        if (std.mem.eql(u8, field.name, ":status")) {
+            status = std.fmt.parseInt(u16, field.value, 10) catch null;
+            // Without a capture, `:status` is all there is to find.
+            if (capture == null) return status;
+            continue;
+        }
+        if (capture) |c| if (field.name.len > 0 and field.name[0] != ':')
+            c.field(state.collector.?.gpa, field.name, field.value);
     }
-    return null;
+    return status;
+}
+
+fn slotIndex(state: *const State, slot: *const Slot) usize {
+    return (@intFromPtr(slot) - @intFromPtr(&state.slots)) / @sizeOf(Slot);
 }
 
 /// A response that arrived whole: record it exactly as the serial path does.
@@ -1339,6 +1370,12 @@ fn complete(p: *conn.Params, state: *State, slot: *Slot) void {
     p.counters.recordStatus(slot.status orelse 0);
 
     conn.maybePublish(p, done.nanoseconds);
+    // After the latency is taken, so the hook's cost is not the server's.
+    if (state.collector) |c| {
+        const index = slotIndex(state, slot);
+        c.captures[index].status = slot.status orelse 0;
+        c.respond(slot.seq, index) catch |err| conn.failWorkload(p, err);
+    }
     release(state, slot);
 }
 

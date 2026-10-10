@@ -3,18 +3,25 @@
 //! The target is scripts written for wrk and wrk2 running unchanged, so the
 //! language is LuaJIT's — Lua 5.1 with `bit` and `unpack` — and the API is
 //! wrk's: a global `wrk` table (`scheme`, `host`, `port`, `method`, `path`,
-//! `headers`, `body`, `format`) and the hooks `init(args)` and `request()`.
+//! `headers`, `body`, `format`) and the hooks `setup(thread)`, `init(args)`,
+//! `request()`, `response(status, headers, body)` and
+//! `done(summary, latency, requests)`.
 //!
 //! What wrk's model becomes here:
 //!
-//! - **A script without `request()`** only edits `wrk.method`, `wrk.path`,
-//!   `wrk.headers` and `wrk.body`. That request never changes, so it becomes
-//!   the run's fixed request — replayed exactly like `-m`/`-H`/`-b`, with no
-//!   Lua on the path at all. Its `init(args)`, if any, runs once.
-//! - **A script with `request()`** gets one Lua state per `-t` thread, as in
-//!   wrk, shared by that thread's share of the connections — so a counter in
-//!   a script counts per thread, exactly as it does under wrk. Each state runs
-//!   the script, then `init(args)`, at startup; `request()` runs once per send.
+//! - **A static script** — no `request()`, `response()` or `setup()` — only
+//!   edits `wrk.method`, `wrk.path`, `wrk.headers` and `wrk.body`. That
+//!   request never changes, so it becomes the run's fixed request, replayed
+//!   exactly like `-m`/`-H`/`-b` with no Lua on the path at all. Its
+//!   `init(args)`, if any, runs once, and its `done`, if any, at the end.
+//! - **Any other script** gets one Lua state per `-t` thread, as in wrk,
+//!   shared by that thread's share of the connections — so a counter in a
+//!   script counts per thread, exactly as it does under wrk. At startup each
+//!   state runs the script; then `setup(thread)` runs in the main state once
+//!   per thread, and `init(args)` in each thread's state. `request()` runs
+//!   once per send, `response()` once per response, and `done()` in the main
+//!   state after the report. A script with `response()` but no `request()`
+//!   sends each thread's `wrk.format()`, built once.
 //!
 //!   A state is not tied to an executor thread, because zio moves connections
 //!   between threads: connection `i` uses state `i % threads`, under that
@@ -28,9 +35,22 @@
 //!   framed and validated like any other request. One request per call: wrk's
 //!   pipelining trick of returning several back to back is refused, as
 //!   `--streams` is zrk's answer to the question pipelining asks.
-//! - **`setup`, `delay`, `response` and `done`** are refused at startup rather
-//!   than silently skipped: a script that defines them depends on them, and a
-//!   run without them would measure something its author did not write.
+//! - **`response()`** gets what zrk otherwise never keeps: the header fields
+//!   (names as sent; lowercase over HTTP/2 and HTTP/3) and the body, still in
+//!   any content-encoding. Kept only for a script that defines it.
+//! - **`done()`** gets wrk's `summary` (with `errors.deadline` added), and
+//!   stats objects with `min`, `max`, `mean`, `stdev` and `:percentile(p)`.
+//!   `latency` is the coordinated-omission-corrected histogram in µs;
+//!   `requests` is requests per second over each `--interval`, where wrk's is
+//!   per thread per 100 ms.
+//! - **`setup(thread)`** gets wrk's thread object for `thread:get(name)` and
+//!   `thread:set(name, value)`; values cross states as copies, tables
+//!   included. `thread:stop()` raises an error. `thread.addr` is not
+//!   provided: the address it would take comes from `wrk.lookup`, which
+//!   raises an error too.
+//! - **`delay()`** is refused at startup: requests are paced by `-R`, or sent
+//!   back to back with `--closed`, and a script that defines it depends on a
+//!   pacing zrk does not do.
 //!
 //! `args` is wrk's too: `args[0]` is the URL as typed, then whatever followed
 //! it on the command line (`zrk --script s.lua http://host/ a b`). The CLI
@@ -43,6 +63,7 @@ const Io = std.Io;
 const cli = @import("cli.zig");
 const lua = @import("lua.zig");
 const wl = @import("workload.zig");
+const hdr = @import("hdr.zig");
 
 /// Defines `wrk.format` the way wrk does, so a script that builds requests
 /// with it — nearly all of them — produces the same text it does under wrk,
@@ -70,9 +91,6 @@ const prelude =
     \\wrk.lookup = unsupported("lookup")
     \\wrk.connect = unsupported("connect")
 ;
-
-/// wrk hooks zrk does not run. Each is refused when a script defines it.
-const unsupported_hooks = [_][:0]const u8{ "setup", "delay", "response", "done" };
 
 /// Why a script failed, in words, for the CLI to print. The first failure
 /// wins: once one connection's script has failed, the others are stopping for
@@ -107,28 +125,66 @@ pub const Script = struct {
     chunk_name: [:0]const u8,
     args: []const []const u8,
     diagnostic: *Diagnostic,
-    /// The state the script was checked in at startup. For a static script it
-    /// also owns the strings `static` borrows, so it lives as long as the
-    /// script does.
+    /// wrk's main state: where the script is checked, and where `setup` and
+    /// `done` run. For a static script its stack also holds the string
+    /// `static` borrows, so it lives as long as the script does.
     main: *lua.State,
-    /// The request a script without `request()` describes. Null when the
-    /// script generates requests.
+    /// The request a static script describes. Null for a running script.
     static: ?wl.Request = null,
     static_headers: std.ArrayList(wl.Header) = .empty,
-    /// The states a generating script runs in, one per thread; `main` is the
-    /// first. Empty for a static script.
+    /// The thread states a running script uses, one per `-t` thread. Empty
+    /// for a static script.
     pool: []Shared = &.{},
+    hooks: Hooks,
 
-    /// One Lua state, and the lock that makes it safe to share.
+    /// Which of wrk's hooks the script defines.
+    const Hooks = struct {
+        setup: bool,
+        request: bool,
+        response: bool,
+        done: bool,
+
+        fn of(L: *lua.State) Hooks {
+            return .{
+                .setup = isFunction(L, "setup"),
+                .request = isFunction(L, "request"),
+                .response = isFunction(L, "response"),
+                .done = isFunction(L, "done"),
+            };
+        }
+
+        /// A script that needs no Lua while the run is going: everything it
+        /// says is in the request it leaves in `wrk`. `setup` makes threads
+        /// distinguishable, so a script with it runs in thread states too.
+        fn static(hooks: Hooks) bool {
+            return !hooks.request and !hooks.response and !hooks.setup;
+        }
+    };
+
+    /// One thread's Lua state, and the lock that makes it safe to share
+    /// between the connections that use it.
     const Shared = struct {
         L: *lua.State,
         mutex: Io.Mutex = .init,
+        /// What this thread sends when the script has no `request()`: its
+        /// `wrk.format()` after `setup` and `init`, which can differ between
+        /// threads. Owned text, read without the lock, since it never changes.
+        fixed: ?wl.Request = null,
+        fixed_raw: std.ArrayList(u8) = .empty,
+        fixed_headers: std.ArrayList(wl.Header) = .empty,
+
+        fn deinit(shared: *Shared, gpa: Allocator) void {
+            lua.lua_close(shared.L);
+            shared.fixed_raw.deinit(gpa);
+            shared.fixed_headers.deinit(gpa);
+        }
     };
 
-    /// Load `source`, run it to check it, and work out which kind of script it
-    /// is; a generating script also gets its states, `init(args)` and all, so
-    /// every error a script can raise before its first request is raised
-    /// here. `gpa` is used from the connections' threads, so it must be
+    /// Load `source`, check it, and set it up the way wrk would before the
+    /// first request: a static script is reduced to its request; a running
+    /// script gets its thread states, each through `setup(thread)` and then
+    /// `init(args)`. So every error a script can raise before it sends is
+    /// raised here. `gpa` is used from the connections' threads, so it must be
     /// thread-safe. Errors describe themselves in `diagnostic`.
     pub fn load(
         gpa: Allocator,
@@ -152,32 +208,23 @@ pub const Script = struct {
             .args = args,
             .diagnostic = diagnostic,
             .main = undefined,
+            .hooks = undefined,
         };
         script.main = try script.newState();
         errdefer lua.lua_close(script.main);
-        const L = script.main;
+        const main = script.main;
 
-        for (unsupported_hooks) |hook| {
-            lua.getGlobal(L, hook);
-            const defined = lua.lua_type(L, -1) == .function;
-            lua.pop(L, 1);
-            if (defined) {
-                diagnostic.set("{s}: zrk does not run wrk's {s}() hook yet; remove it to run this script", .{ path, hook });
-                return error.ScriptUnsupported;
-            }
+        if (isFunction(main, "delay")) {
+            diagnostic.set("{s}: zrk does not run wrk's delay() hook: requests are paced by -R, or sent back to back with --closed", .{path});
+            return error.ScriptUnsupported;
         }
+        script.hooks = .of(main);
 
-        lua.getGlobal(L, "request");
-        const generates = lua.lua_type(L, -1) == .function;
-        lua.pop(L, 1);
-        if (!generates) {
-            try script.callInit(L);
+        if (script.hooks.static()) {
+            try script.callInit(main);
             // What the script left in `wrk`, as the request every send carries.
-            lua.getGlobal(L, "wrk");
-            lua.lua_getfield(L, -1, "format");
-            try script.call(L, 0, "wrk.format");
+            const raw = try script.format(main);
             // Left on the stack: `static` borrows this string.
-            const raw = lua.toString(L, -1) orelse unreachable;
             script.static = try script.parse(raw, &script.static_headers);
             return script;
         }
@@ -185,21 +232,33 @@ pub const Script = struct {
         const pool = try gpa.alloc(Shared, @max(cfg.threads, 1));
         var opened: usize = 0;
         errdefer {
-            // `main` is pool[0], and closed by the errdefer above.
-            for (pool[1..opened]) |shared| lua.lua_close(shared.L);
+            for (pool[0..opened]) |*shared| shared.deinit(gpa);
             gpa.free(pool);
         }
-        pool[0] = .{ .L = L };
-        opened = 1;
         while (opened < pool.len) : (opened += 1) pool[opened] = .{ .L = try script.newState() };
-        for (pool) |shared| try script.callInit(shared.L);
+
+        // wrk's order: every thread's `setup`, in the main state, then every
+        // thread's own `init`.
+        if (script.hooks.setup) for (pool) |*shared| {
+            lua.getGlobal(main, "setup");
+            pushThread(main, shared);
+            try script.call(main, 1, "setup()");
+            lua.lua_settop(main, 0);
+        };
+        for (pool) |*shared| {
+            try script.callInit(shared.L);
+            if (script.hooks.request) continue;
+            const raw = try script.format(shared.L);
+            try shared.fixed_raw.appendSlice(gpa, raw);
+            lua.lua_settop(shared.L, 0);
+            shared.fixed = try script.parse(shared.fixed_raw.items, &shared.fixed_headers);
+        }
         script.pool = pool;
         return script;
     }
 
     pub fn deinit(script: *Script) void {
-        // `main` is pool[0] when there is a pool.
-        for (script.pool[@min(script.pool.len, 1)..]) |shared| lua.lua_close(shared.L);
+        for (script.pool) |*shared| shared.deinit(script.gpa);
         script.gpa.free(script.pool);
         lua.lua_close(script.main);
         script.static_headers.deinit(script.gpa);
@@ -207,9 +266,9 @@ pub const Script = struct {
         script.gpa.destroy(script);
     }
 
-    /// Put the script into effect on `cfg`: as its fixed request when the
-    /// script has no `request()`, else as its workload. `cfg` must outlive
-    /// the script's use; for a static script its request borrows from it.
+    /// Put the script into effect on `cfg`: as its fixed request when it is
+    /// static, else as its workload. For a static script `cfg` then borrows
+    /// from the script, which must outlive the run.
     pub fn apply(script: *Script, cfg: *cli.Config) void {
         if (script.static) |request| {
             cfg.method = request.method;
@@ -222,14 +281,74 @@ pub const Script = struct {
     }
 
     pub fn workload(script: *Script) wl.Workload {
-        return .{ .ptr = script, .vtable = &vtable };
+        return .{
+            .ptr = script,
+            // Without `response()` the vtable has no hook, and zrk keeps no
+            // response for it.
+            .vtable = if (script.hooks.response) &vtable_responding else &vtable,
+        };
     }
 
     const vtable: wl.Workload.VTable = .{ .open = open, .next = next, .close = close };
+    const vtable_responding: wl.Workload.VTable = .{ .open = open, .next = next, .close = close, .response = respond };
 
-    /// A connection's share of a state, and its own copy of the current
-    /// request: the state is shared, so the string `request()` returned can
-    /// be collected the moment the lock is let go.
+    /// What a finished run hands `done(summary, latency, requests)`.
+    pub const Summary = struct {
+        duration_us: u64,
+        requests: u64,
+        bytes: u64,
+        errors: struct {
+            connect: u64,
+            read: u64,
+            write: u64,
+            /// Non-2xx/3xx responses, which wrk calls `status`.
+            status: u64,
+            timeout: u64,
+            /// `--deadline` misses, which wrk does not have.
+            deadline: u64,
+        },
+        /// The coordinated-omission-corrected latency histogram, in µs.
+        latency: *const hdr.Histogram,
+        /// Requests per second, one sample per `--interval` window. wrk's
+        /// `requests` is per thread per 100 ms; zrk's windows are the run's.
+        rates: []const f64,
+    };
+
+    /// Run `done(summary, latency, requests)` in the main state, when the
+    /// script defines it. After the run, with every connection joined.
+    pub fn done(script: *Script, summary: *const Summary) !void {
+        if (!script.hooks.done) return;
+        const L = script.main;
+        const top = lua.lua_gettop(L);
+        defer lua.lua_settop(L, top);
+
+        lua.getGlobal(L, "done");
+
+        lua.lua_createtable(L, 0, 5);
+        setNumber(L, "duration", summary.duration_us);
+        setNumber(L, "requests", summary.requests);
+        setNumber(L, "bytes", summary.bytes);
+        lua.lua_createtable(L, 0, 6);
+        inline for (.{ "connect", "read", "write", "status", "timeout", "deadline" }) |name| {
+            setNumber(L, name, @field(summary.errors, name));
+        }
+        lua.lua_setfield(L, -2, "errors");
+
+        var latency: Stats = .{ .histogram = summary.latency };
+        pushStats(L, &latency);
+
+        const sorted = try script.gpa.dupe(f64, summary.rates);
+        defer script.gpa.free(sorted);
+        std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+        var requests: Stats = .{ .samples = sorted };
+        pushStats(L, &requests);
+
+        try script.call(L, 3, "done()");
+    }
+
+    /// A connection's thread state, and its own copy of the current request:
+    /// the state is shared, so the string `request()` returned can be
+    /// collected the moment the lock is let go.
     const Connection = struct {
         shared: *Shared,
         raw: std.ArrayList(u8) = .empty,
@@ -247,6 +366,7 @@ pub const Script = struct {
         _ = seq;
         const script: *Script = @ptrCast(@alignCast(ptr));
         const conn: *Connection = @ptrCast(@alignCast(state));
+        if (conn.shared.fixed) |request| return request;
         {
             const shared = conn.shared;
             shared.mutex.lockUncancelable(script.io);
@@ -265,6 +385,31 @@ pub const Script = struct {
         return script.parse(conn.raw.items, &conn.headers);
     }
 
+    /// `response(status, headers, body)`, in the connection's thread state.
+    /// Touches only the shared state, under its lock — never `conn.raw`,
+    /// which the sender may be filling at the same moment.
+    fn respond(ptr: *anyopaque, state: *anyopaque, seq: u64, response: *const wl.Response) anyerror!void {
+        _ = seq;
+        const script: *Script = @ptrCast(@alignCast(ptr));
+        const conn: *Connection = @ptrCast(@alignCast(state));
+        const shared = conn.shared;
+        shared.mutex.lockUncancelable(script.io);
+        defer shared.mutex.unlock(script.io);
+        const L = shared.L;
+        defer lua.lua_settop(L, 0);
+
+        lua.getGlobal(L, "response");
+        lua.lua_pushinteger(L, response.status);
+        lua.lua_createtable(L, 0, @intCast(response.headers.len));
+        for (response.headers) |h| {
+            lua.pushString(L, h.name);
+            lua.pushString(L, h.value);
+            lua.lua_settable(L, -3);
+        }
+        lua.pushString(L, response.body);
+        try script.call(L, 3, "response()");
+    }
+
     fn close(ptr: *anyopaque, state: *anyopaque) void {
         const script: *Script = @ptrCast(@alignCast(ptr));
         const conn: *Connection = @ptrCast(@alignCast(state));
@@ -278,7 +423,7 @@ pub const Script = struct {
     }
 
     /// A state with the standard libraries, `wrk` and the script loaded and
-    /// run — everything short of `init`.
+    /// run — everything short of `setup` and `init`.
     fn newState(script: *Script) !*lua.State {
         const L = lua.luaL_newstate() orelse return error.OutOfMemory;
         errdefer lua.lua_close(L);
@@ -326,11 +471,8 @@ pub const Script = struct {
 
     /// `init(args)`, when the script defines it.
     fn callInit(script: *Script, L: *lua.State) !void {
+        if (!isFunction(L, "init")) return;
         lua.getGlobal(L, "init");
-        if (lua.lua_type(L, -1) != .function) {
-            lua.pop(L, 1);
-            return;
-        }
         lua.lua_createtable(L, @intCast(script.args.len), 0);
         for (script.args, 0..) |arg, i| {
             lua.pushString(L, arg);
@@ -338,6 +480,15 @@ pub const Script = struct {
         }
         try script.call(L, 1, "init()");
         lua.pop(L, 1);
+    }
+
+    /// `wrk.format()` with no arguments: the request `wrk` describes. The
+    /// string is left on the stack, which is what keeps it alive.
+    fn format(script: *Script, L: *lua.State) ![]const u8 {
+        lua.getGlobal(L, "wrk");
+        lua.lua_getfield(L, -1, "format");
+        try script.call(L, 0, "wrk.format");
+        return lua.toString(L, -1) orelse unreachable;
     }
 
     /// Call the function sitting below its `nargs` arguments at the top of
@@ -365,6 +516,181 @@ pub const Script = struct {
         };
     }
 };
+
+fn isFunction(L: *lua.State, name: [:0]const u8) bool {
+    lua.getGlobal(L, name);
+    defer lua.pop(L, 1);
+    return lua.lua_type(L, -1) == .function;
+}
+
+fn setNumber(L: *lua.State, key: [:0]const u8, value: anytype) void {
+    lua.lua_pushnumber(L, switch (@typeInfo(@TypeOf(value))) {
+        .float => value,
+        else => @floatFromInt(value),
+    });
+    lua.lua_setfield(L, -2, key);
+}
+
+/// wrk's thread object, as `setup(thread)` receives it: `thread:get(name)`
+/// and `thread:set(name, value)` read and write a global in that thread's
+/// state, copying the value across. `thread:stop()` raises an error, since
+/// zrk has no per-thread stop. `thread.addr` is absent: a script sets it
+/// from `wrk.lookup`, which raises an error first.
+fn pushThread(L: *lua.State, shared: *Script.Shared) void {
+    lua.lua_createtable(L, 0, 3);
+    inline for (.{ .{ "get", threadGet }, .{ "set", threadSet }, .{ "stop", threadStop } }) |method| {
+        lua.lua_pushlightuserdata(L, shared);
+        lua.lua_pushcclosure(L, method[1], 1);
+        lua.lua_setfield(L, -2, method[0]);
+    }
+}
+
+fn threadShared(L: *lua.State) *Script.Shared {
+    return @ptrCast(@alignCast(lua.lua_touserdata(L, lua.upvalueIndex(1)).?));
+}
+
+/// The name argument of `thread:get`/`thread:set`, NUL-terminated as every
+/// Lua string is.
+fn globalName(L: *lua.State) [*:0]const u8 {
+    if (lua.lua_type(L, 2) != .string) lua.raise(L, "thread:get/set: the name must be a string");
+    var len: usize = 0;
+    return @ptrCast(lua.lua_tolstring(L, 2, &len).?);
+}
+
+fn threadGet(state: ?*lua.State) callconv(.c) c_int {
+    const L = state.?;
+    const target = threadShared(L).L;
+    lua.getGlobal(target, globalName(L));
+    defer lua.pop(target, 1);
+    copyValue(target, -1, L, 0);
+    return 1;
+}
+
+fn threadSet(state: ?*lua.State) callconv(.c) c_int {
+    const L = state.?;
+    const target = threadShared(L).L;
+    const name = globalName(L);
+    copyValue(L, 3, target, 0);
+    lua.setGlobal(target, name);
+    return 0;
+}
+
+fn threadStop(state: ?*lua.State) callconv(.c) c_int {
+    lua.raise(state.?, "thread:stop() is not supported by zrk");
+}
+
+/// Push onto `to` a copy of the value at `index` in `from`: nil, booleans,
+/// numbers, strings, and tables of those, as wrk copies between states. A
+/// function or userdata cannot cross, and raises in `from` — which is the
+/// state whose script asked for the copy.
+fn copyValue(from: *lua.State, index: c_int, to: *lua.State, depth: u32) void {
+    const at = lua.absIndex(from, index);
+    switch (lua.lua_type(from, at)) {
+        .nil, .none => lua.lua_pushnil(to),
+        .boolean => lua.lua_pushboolean(to, lua.lua_toboolean(from, at)),
+        .number => lua.lua_pushnumber(to, lua.lua_tonumber(from, at)),
+        .string => lua.pushString(to, lua.toString(from, at).?),
+        .table => {
+            // Deep enough for any table a script means to pass, shallow
+            // enough that a cycle ends in an error rather than a crash.
+            if (depth >= 32) lua.raise(from, "thread:get/set: table nested too deeply (or a cycle)");
+            lua.lua_createtable(to, 0, 0);
+            lua.lua_pushnil(from);
+            while (lua.lua_next(from, at) != 0) {
+                copyValue(from, -2, to, depth + 1);
+                copyValue(from, -1, to, depth + 1);
+                lua.lua_settable(to, -3);
+                lua.pop(from, 1);
+            }
+        },
+        else => lua.raise(from, "thread:get/set: only nil, booleans, numbers, strings and tables cross threads"),
+    }
+}
+
+/// The source behind one of wrk's stats objects in `done`.
+const Stats = union(enum) {
+    histogram: *const hdr.Histogram,
+    /// Sorted ascending.
+    samples: []const f64,
+
+    fn min(s: Stats) f64 {
+        return switch (s) {
+            .histogram => |h| @floatFromInt(h.min()),
+            .samples => |x| if (x.len == 0) 0 else x[0],
+        };
+    }
+
+    fn max(s: Stats) f64 {
+        return switch (s) {
+            .histogram => |h| @floatFromInt(h.max()),
+            .samples => |x| if (x.len == 0) 0 else x[x.len - 1],
+        };
+    }
+
+    fn mean(s: Stats) f64 {
+        return switch (s) {
+            .histogram => |h| h.mean(),
+            .samples => |x| blk: {
+                if (x.len == 0) break :blk 0;
+                var sum: f64 = 0;
+                for (x) |v| sum += v;
+                break :blk sum / @as(f64, @floatFromInt(x.len));
+            },
+        };
+    }
+
+    fn stdev(s: Stats) f64 {
+        return switch (s) {
+            .histogram => |h| h.stdDev(),
+            .samples => |x| blk: {
+                if (x.len < 2) break :blk 0;
+                const m = s.mean();
+                var sum: f64 = 0;
+                for (x) |v| sum += (v - m) * (v - m);
+                break :blk @sqrt(sum / @as(f64, @floatFromInt(x.len - 1)));
+            },
+        };
+    }
+
+    /// `p` in percent, 0 to 100, as wrk takes it.
+    fn percentile(s: Stats, p: f64) f64 {
+        const clamped = std.math.clamp(p, 0, 100);
+        return switch (s) {
+            .histogram => |h| @floatFromInt(h.valueAtPercentile(clamped)),
+            .samples => |x| blk: {
+                if (x.len == 0) break :blk 0;
+                // Nearest rank.
+                const rank = @ceil(clamped / 100 * @as(f64, @floatFromInt(x.len)));
+                const i: usize = @intFromFloat(@max(rank, 1) - 1);
+                break :blk x[@min(i, x.len - 1)];
+            },
+        };
+    }
+};
+
+/// One of wrk's stats objects: `min`, `max`, `mean` and `stdev` as fields, and
+/// `:percentile(p)`. Valid for the `done` call it is made for.
+fn pushStats(L: *lua.State, stats: *Stats) void {
+    lua.lua_createtable(L, 0, 5);
+    setNumber(L, "min", stats.min());
+    setNumber(L, "max", stats.max());
+    setNumber(L, "mean", stats.mean());
+    setNumber(L, "stdev", stats.stdev());
+    lua.lua_pushlightuserdata(L, stats);
+    lua.lua_pushcclosure(L, statsPercentile, 1);
+    lua.lua_setfield(L, -2, "percentile");
+}
+
+fn statsPercentile(state: ?*lua.State) callconv(.c) c_int {
+    const L = state.?;
+    const stats: *const Stats = @ptrCast(@alignCast(lua.lua_touserdata(L, lua.upvalueIndex(1)).?));
+    // `latency:percentile(99)` passes the table first; `latency.percentile(99)`
+    // does not.
+    const arg: c_int = if (lua.lua_type(L, 1) == .table) 2 else 1;
+    if (lua.lua_type(L, arg) != .number) lua.raise(L, "percentile(p): p must be a number from 0 to 100");
+    lua.lua_pushnumber(L, stats.percentile(lua.lua_tonumber(L, arg)));
+    return 1;
+}
 
 fn setString(L: *lua.State, key: [:0]const u8, value: []const u8) void {
     lua.pushString(L, value);
@@ -546,8 +872,14 @@ test "script failures say what and where" {
     }
     {
         var diag: Diagnostic = .{};
-        try testing.expectError(error.ScriptUnsupported, Script.load(testing.allocator, testing.io, &cfg, "r.lua", "function response() end", &.{}, &diag));
-        try testing.expect(std.mem.indexOf(u8, diag.message().?, "response()") != null);
+        try testing.expectError(error.ScriptUnsupported, Script.load(testing.allocator, testing.io, &cfg, "d.lua", "function delay() return 10 end", &.{}, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message().?, "delay()") != null);
+    }
+    {
+        // A function cannot cross between states, as under wrk.
+        var diag: Diagnostic = .{};
+        try testing.expectError(error.ScriptFailed, Script.load(testing.allocator, testing.io, &cfg, "s.lua", "function setup(t) t:set('f', print) end function request() return wrk.format() end", &.{}, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message().?, "only nil, booleans") != null);
     }
     {
         var diag: Diagnostic = .{};
@@ -568,4 +900,124 @@ test "script failures say what and where" {
         defer w.close(conn);
         try testing.expectError(error.PipelinedRequests, w.next(conn, 0));
     }
+}
+
+/// A global out of a Lua state, as a string, for the tests to read back.
+fn globalString(L: *lua.State, name: [:0]const u8) ?[]const u8 {
+    lua.getGlobal(L, name);
+    defer lua.pop(L, 1);
+    return lua.toString(L, -1);
+}
+
+test "setup, response and done run as under wrk" {
+    var cfg = testConfig();
+    cfg.threads = 2;
+    var diag: Diagnostic = .{};
+    const source =
+        \\local threads = {}
+        \\function setup(thread)
+        \\  table.insert(threads, thread)
+        \\  thread:set("id", #threads)
+        \\  thread:set("tags", { a = 1, b = { "x" } })
+        \\end
+        \\function init(args) responses, bytes, typed = 0, 0, 0 end
+        \\function request() return wrk.format(nil, "/thread/" .. id .. "/" .. tags.b[1]) end
+        \\function response(status, headers, body)
+        \\  if status == 200 then responses = responses + 1 end
+        \\  bytes = bytes + #body
+        \\  if headers["content-type"] == "text/plain" then typed = typed + 1 end
+        \\end
+        \\function done(summary, latency, requests)
+        \\  local r, b, t = 0, 0, 0
+        \\  for _, thread in ipairs(threads) do
+        \\    r = r + thread:get("responses")
+        \\    b = b + thread:get("bytes")
+        \\    t = t + thread:get("typed")
+        \\  end
+        \\  result = string.format("%d %d %d|%d %d %d %d|%d %d %d|%d %d",
+        \\    r, b, t,
+        \\    summary.requests, summary.duration, summary.errors.status, summary.errors.deadline,
+        \\    latency.min, latency.max, latency:percentile(50),
+        \\    requests.max, requests:percentile(50))
+        \\end
+    ;
+    const script = try Script.load(testing.allocator, testing.io, &cfg, "hooks.lua", source, &.{test_url}, &diag);
+    defer script.deinit();
+    script.apply(&cfg);
+    const w = cfg.workload.?;
+    try testing.expect(w.vtable.response != null);
+
+    // setup ran once per thread, in order, and its values crossed over.
+    const a = try w.open(0);
+    defer w.close(a);
+    const b = try w.open(1);
+    defer w.close(b);
+    try testing.expectEqualStrings("/thread/1/x", (try w.next(a, 0)).target);
+    try testing.expectEqualStrings("/thread/2/x", (try w.next(b, 0)).target);
+
+    const headers = [_]wl.Header{.{ .name = "content-type", .value = "text/plain" }};
+    const ok: wl.Response = .{ .status = 200, .headers = &headers, .body = "hello" };
+    const missing: wl.Response = .{ .status = 404, .headers = &.{}, .body = "" };
+    try w.vtable.response.?(w.ptr, a, 0, &ok);
+    try w.vtable.response.?(w.ptr, a, 1, &ok);
+    try w.vtable.response.?(w.ptr, b, 0, &missing);
+
+    var latency = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer latency.deinit();
+    for ([_]u64{ 100, 200, 300 }) |v| latency.record(v);
+    try script.done(&.{
+        .duration_us = 2_000_000,
+        .requests = 3,
+        .bytes = 10,
+        .errors = .{ .connect = 0, .read = 0, .write = 0, .status = 1, .timeout = 0, .deadline = 0 },
+        .latency = &latency,
+        .rates = &.{ 30, 10, 20 },
+    });
+    try testing.expectEqualStrings("2 10 2|3 2000000 1 0|100 300 200|30 20", globalString(script.main, "result").?);
+}
+
+test "a script with response() and no request() sends each thread's fixed request" {
+    var cfg = testConfig();
+    var diag: Diagnostic = .{};
+    const script = try Script.load(testing.allocator, testing.io, &cfg, "count.lua",
+        \\wrk.method = "PUT"
+        \\function response(status) n = (n or 0) + 1 end
+    , &.{test_url}, &diag);
+    defer script.deinit();
+    script.apply(&cfg);
+    const w = cfg.workload.?;
+    const conn = try w.open(0);
+    defer w.close(conn);
+    const first = try w.next(conn, 0);
+    try testing.expectEqualStrings("PUT", first.method);
+    // The same request, from the same memory: nothing is regenerated.
+    try testing.expectEqual(first.target.ptr, (try w.next(conn, 1)).target.ptr);
+}
+
+test "a static script still gets done()" {
+    var cfg = testConfig();
+    var diag: Diagnostic = .{};
+    const script = try Script.load(testing.allocator, testing.io, &cfg, "report.lua",
+        \\wrk.method = "POST"
+        \\function done(summary) seen = summary.requests end
+    , &.{test_url}, &diag);
+    defer script.deinit();
+    script.apply(&cfg);
+    try testing.expect(cfg.workload == null);
+    try testing.expectEqualStrings("POST", cfg.method);
+
+    var latency = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer latency.deinit();
+    try script.done(&.{
+        .duration_us = 1,
+        .requests = 7,
+        .bytes = 0,
+        .errors = .{ .connect = 0, .read = 0, .write = 0, .status = 0, .timeout = 0, .deadline = 0 },
+        .latency = &latency,
+        .rates = &.{},
+    });
+    try testing.expectEqualStrings("7", globalString(script.main, "seen").?);
+    // The fixed request still borrows from the main state's stack, which
+    // `done` left as it found it.
+    try testing.expectEqualStrings("POST", cfg.method);
 }

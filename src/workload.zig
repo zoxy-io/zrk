@@ -79,6 +79,20 @@ pub const Workload = struct {
         next: *const fn (ptr: *anyopaque, state: *anyopaque, seq: u64) anyerror!Request,
         /// Once per connection, when it is done for the run.
         close: *const fn (ptr: *anyopaque, state: *anyopaque) void,
+        /// Optional: every completed response, for the request `seq` named.
+        ///
+        /// Null costs nothing — zrk then keeps no header or body of any
+        /// response, as without a workload. Set, every response's header
+        /// fields (trailers excluded) and body are collected for it, which
+        /// is a copy per response: do not set it for a workload that ignores
+        /// what it is given.
+        ///
+        /// Runs after the response's latency is recorded, so its cost is not
+        /// the server's. On a multiplexed HTTP/2 connection it runs on the
+        /// receiver while the sender may be in `next` on the same `state`:
+        /// what the two share is the implementation's to synchronise. The
+        /// `Response` is borrowed for the call. An error fails the run.
+        response: ?*const fn (ptr: *anyopaque, state: *anyopaque, seq: u64, response: *const Response) anyerror!void = null,
     };
 
     pub fn open(w: Workload, connection: u32) anyerror!*anyopaque {
@@ -91,6 +105,78 @@ pub const Workload = struct {
 
     pub fn close(w: Workload, state: *anyopaque) void {
         w.vtable.close(w.ptr, state);
+    }
+};
+
+/// A completed response, as `Workload.VTable.response` receives it. Header
+/// names are as the server sent them (lowercase over HTTP/2 and HTTP/3).
+pub const Response = struct {
+    status: u16,
+    headers: []const Header,
+    body: []const u8,
+};
+
+/// One response being collected for `Workload.VTable.response`, reused from
+/// one response to the next so the steady state allocates nothing.
+///
+/// Header text is appended into one buffer and indexed by offsets, and turned
+/// into slices only in `view`, once nothing will be appended — a slice taken
+/// earlier would dangle the moment the buffer grew.
+pub const Capture = struct {
+    status: u16 = 0,
+    text: std.ArrayList(u8) = .empty,
+    spans: std.ArrayList(Span) = .empty,
+    body: std.ArrayList(u8) = .empty,
+    headers: std.ArrayList(Header) = .empty,
+    /// An append ran out of memory somewhere a caller could not be told —
+    /// a decoder callback — and `view` reports it.
+    failed: bool = false,
+
+    const Span = struct { name: u32, name_len: u32, value_len: u32 };
+
+    pub fn reset(c: *Capture) void {
+        c.status = 0;
+        c.text.clearRetainingCapacity();
+        c.spans.clearRetainingCapacity();
+        c.body.clearRetainingCapacity();
+        c.failed = false;
+    }
+
+    pub fn deinit(c: *Capture, gpa: Allocator) void {
+        c.text.deinit(gpa);
+        c.spans.deinit(gpa);
+        c.body.deinit(gpa);
+        c.headers.deinit(gpa);
+        c.* = undefined;
+    }
+
+    pub fn field(c: *Capture, gpa: Allocator, name: []const u8, value: []const u8) void {
+        const at: u32 = @intCast(c.text.items.len);
+        c.text.appendSlice(gpa, name) catch return c.fail();
+        c.text.appendSlice(gpa, value) catch return c.fail();
+        c.spans.append(gpa, .{ .name = at, .name_len = @intCast(name.len), .value_len = @intCast(value.len) }) catch return c.fail();
+    }
+
+    pub fn bodyBytes(c: *Capture, gpa: Allocator, bytes: []const u8) void {
+        c.body.appendSlice(gpa, bytes) catch c.fail();
+    }
+
+    fn fail(c: *Capture) void {
+        c.failed = true;
+    }
+
+    /// The response collected so far, borrowed from this capture until it is
+    /// reset or appended to.
+    pub fn view(c: *Capture, gpa: Allocator) !Response {
+        if (c.failed) return error.OutOfMemory;
+        c.headers.clearRetainingCapacity();
+        try c.headers.ensureTotalCapacity(gpa, c.spans.items.len);
+        for (c.spans.items) |span| {
+            const name = c.text.items[span.name..][0..span.name_len];
+            const value = c.text.items[span.name + span.name_len ..][0..span.value_len];
+            c.headers.appendAssumeCapacity(.{ .name = name, .value = value });
+        }
+        return .{ .status = c.status, .headers = c.headers.items, .body = c.body.items };
     }
 };
 
@@ -214,6 +300,22 @@ pub const Generator = struct {
             .state = state,
             .arena = .init(dynamic.allocator),
         };
+    }
+
+    /// Whether the workload takes responses, and so whether they are worth
+    /// collecting at all.
+    pub fn wantsResponses(g: *const Generator) bool {
+        return g.dynamic.workload.vtable.response != null;
+    }
+
+    /// Hand the response collected in `capture`, to the request `seq` named,
+    /// to the workload. Touches only the workload and `capture`, never the
+    /// request this generator holds, so a multiplexed connection's receiver
+    /// may call it while its sender is in `at`.
+    pub fn respond(g: *const Generator, seq: u64, capture: *Capture) anyerror!void {
+        const respond_fn = g.dynamic.workload.vtable.response orelse return;
+        const response = try capture.view(g.dynamic.allocator);
+        try respond_fn(g.dynamic.workload.ptr, g.state, seq, &response);
     }
 
     pub fn close(g: *Generator) void {
@@ -433,4 +535,27 @@ test "Failure keeps the first error" {
     failure.record(error.First);
     failure.record(error.Second);
     try testing.expectEqual(@as(?anyerror, error.First), failure.get());
+}
+
+test "Capture keeps fields stable across growth and reuses its memory" {
+    var c: Capture = .{};
+    defer c.deinit(testing.allocator);
+    c.status = 200;
+    // Enough fields to force the text buffer to grow several times: a slice
+    // taken before the last append would point into freed memory.
+    var name_buf: [16]u8 = undefined;
+    for (0..64) |i| c.field(testing.allocator, try std.fmt.bufPrint(&name_buf, "x-h{d}", .{i}), "value");
+    c.bodyBytes(testing.allocator, "hel");
+    c.bodyBytes(testing.allocator, "lo");
+    const r = try c.view(testing.allocator);
+    try testing.expectEqual(@as(usize, 64), r.headers.len);
+    try testing.expectEqualStrings("x-h63", r.headers[63].name);
+    try testing.expectEqualStrings("value", r.headers[63].value);
+    try testing.expectEqualStrings("hello", r.body);
+
+    const capacity = c.text.capacity;
+    c.reset();
+    c.field(testing.allocator, "a", "b");
+    try testing.expectEqual(capacity, c.text.capacity);
+    try testing.expectEqual(@as(usize, 1), (try c.view(testing.allocator)).headers.len);
 }
