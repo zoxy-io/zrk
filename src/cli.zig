@@ -281,7 +281,7 @@ pub const usage =
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
     \\                            (@- = stdin, @@x = a literal "@x")
-    \\      --script    <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
+    \\      --script      <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
     \\                            and init(args)/request() hooks shape each
     \\                            request. Arguments after <url> go to init
     \\      --timeout     <T>     Wire timeout per attempt, from the actual

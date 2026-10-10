@@ -88,7 +88,7 @@ Options:
   -m, --method      <M>     HTTP method                    (default GET)
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
                             (@- = stdin, @@x = a literal "@x")
-      --script    <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
+      --script      <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
                             and init(args)/request() hooks shape each
                             request. Arguments after <url> go to init
       --timeout     <T>     Wire timeout per attempt, from the actual
@@ -332,6 +332,8 @@ soak now runs 296,866 requests at 14.8k req/s where it previously managed
 [MIT](LICENSE)
 
 zrk binaries statically link [LuaJIT](https://luajit.org/) for `--script`,
-which is MIT-licensed, Copyright (C) 2005-2026 Mike Pall. Its build script
+which is MIT-licensed, Copyright (C) 2005-2026 Mike Pall. LuaJIT includes code
+from Lua 5.1/5.2, MIT-licensed, Copyright (C) 1994-2012 Lua.org, PUC-Rio, and
+from dlmalloc, written by Doug Lea and released to the public domain. Its build script
 adapts [ziglua](https://github.com/natecraddock/ziglua)'s, MIT-licensed,
 Copyright (c) 2022 Nathan Craddock.

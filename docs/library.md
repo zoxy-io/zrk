@@ -67,7 +67,7 @@ on the request bytes.
 
 ```zig
 const Numbered = struct {
-    const State = struct { path: [32]u8 = undefined };
+    const State = struct { connection: u32, path: [48]u8 = undefined };
 
     fn workload(self: *Numbered) zrk.Workload {
         return .{ .ptr = self, .vtable = &.{ .open = open, .next = next, .close = close } };
@@ -75,14 +75,17 @@ const Numbered = struct {
 
     // Once per connection. What it returns is that connection's alone.
     fn open(_: *anyopaque, connection: u32) anyerror!*anyopaque {
-        _ = connection;
-        return try std.heap.smp_allocator.create(State);
+        const s = try std.heap.smp_allocator.create(State);
+        s.* = .{ .connection = connection };
+        return s;
     }
 
-    // Once per send. `seq` is the connection's position in its schedule.
+    // Once per send. `seq` is the connection's position in its schedule,
+    // counting from 0 on every connection, so the connection's index goes in
+    // the path too: every request names a different user.
     fn next(_: *anyopaque, state: *anyopaque, seq: u64) anyerror!zrk.workload.Request {
         const s: *State = @ptrCast(@alignCast(state));
-        return .{ .target = try std.fmt.bufPrint(&s.path, "/user/{d}", .{seq}) };
+        return .{ .target = try std.fmt.bufPrint(&s.path, "/user/{d}-{d}", .{ s.connection, seq }) };
     }
 
     fn close(_: *anyopaque, state: *anyopaque) void {
