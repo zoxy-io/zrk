@@ -6,8 +6,8 @@
     .dependencies = .{
         // The runtime. Connections run as coroutines on zio's event loop.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
-            .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.19.1#4daa0c0a9522a37c4d28e3dcec2515cc955abe71",
+            .hash = "zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn",
         },
         // The HTTP/2 frame codec and HPACK, shared with zoxy. See build.zig
         // for why zrk builds it with `assertions = false`.
