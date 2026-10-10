@@ -88,7 +88,7 @@ Options:
   -m, --method      <M>     HTTP method                    (default GET)
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
                             (@- = stdin, @@x = a literal "@x")
-      --script    <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
+      --script      <FILE>  Run a wrk Lua script (LuaJIT): its wrk table
                             and init(args)/request() hooks shape each
                             request. Arguments after <url> go to init
       --timeout     <T>     Wire timeout per attempt, from the actual
@@ -159,8 +159,8 @@ zrk -c20 -d1m -R500 --latency https://api.example.com/health
 zrk -c10 -R100 -m POST -b '{"ping":1}' \
     -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
 
-# A wrk script: a fresh user id on every request, ids 1..1000 (see "Scripting")
-zrk -c50 -R2000 -d30s --script users.lua http://127.0.0.1:8080/ /user/ 1000
+# A wrk script: a different path on every request (see "Scripting")
+zrk -c50 -R2000 -d30s --script users.lua http://127.0.0.1:8080/ /user/
 
 # HTTP/3 over QUIC (experimental — see "HTTP/3" below for what that costs you)
 zrk --http3 -k -c10 -R500 -d30s https://127.0.0.1:4433/
@@ -188,23 +188,36 @@ written for wrk and wrk2 carry over. The interpreter is LuaJIT, as in wrk:
 Lua 5.1 with `bit`, `unpack` and the standard libraries.
 
 ```lua
--- users.lua: a different path on every request, so no cache can answer it
-local base, max
+-- users.lua: a different path on every request, so no cache keyed on the
+-- path can answer one
+local threads = 0
+function setup(thread)         -- once per thread, before init
+  threads = threads + 1
+  thread:set("id", threads)
+end
 function init(args)            -- args[0] is the URL, args[1..] what follows it
-  base, max = args[1] or "/user/", tonumber(args[2] or "1000")
+  base, n = args[1] or "/user/", 0
 end
 function request()
-  return wrk.format("GET", base .. math.random(1, max))
+  n = n + 1
+  return wrk.format("GET", base .. id .. "-" .. n)
 end
 ```
+
+A per-thread counter rather than `math.random`: LuaJIT seeds every state
+alike, as it does in wrk, so unseeded random ids repeat across threads. Seed
+from something per-thread, such as an id handed out in `setup`, if a script
+needs random values.
 
 What carries over from wrk:
 
 - **The `wrk` table.** `scheme`, `host`, `port`, `method`, `path`, `headers`,
   `body`, and `wrk.format(method, path, headers, body)`. `-m`, `-H` and `-b`
   set the starting values.
-- **`init(args)`.** Runs once per thread at startup. Arguments after the URL
-  reach it, and `--` passes ones that start with a dash.
+- **`init(args)`.** Runs once per thread at startup, or once in all for a
+  script without `request()`, `response()` or `setup()`, which has no thread
+  states (see below). Arguments after the URL reach it, and `--` passes ones
+  that start with a dash.
 - **`request()`.** Runs once per request, with one Lua state per `-t` thread
   shared by that thread's connections, as in wrk.
 - **`response(status, headers, body)`.** Runs once per response, in the same
@@ -296,8 +309,8 @@ soak now runs 296,866 requests at 14.8k req/s where it previously managed
 | code | meaning |
 |------|---------|
 | 0 | run completed; any configured gates passed |
-| 1 | the run failed to start or complete, or completed without a single successful request (see the message on stderr) |
-| 2 | bad arguments, or a `--body` file that could not be read |
+| 1 | the run failed to start or complete, no request completed, or a `--script`'s `request()`, `response()` or `done()` raised an error (see the message on stderr). Any response counts as completed, a 5xx included: gate on those with `--max-error-rate` |
+| 2 | bad arguments, a `--body` file that could not be read, or a `--script` that could not be read or loaded, or whose `setup()` or `init()` raised an error |
 | 3 | run completed but a `--slo-p99` / `--max-error-rate` gate was breached |
 | 130 | interrupted by SIGINT (`Ctrl-C`); a partial report was still written |
 | 143 | interrupted by SIGTERM; a partial report was still written |
@@ -319,6 +332,8 @@ soak now runs 296,866 requests at 14.8k req/s where it previously managed
 [MIT](LICENSE)
 
 zrk binaries statically link [LuaJIT](https://luajit.org/) for `--script`,
-which is MIT-licensed, Copyright (C) 2005-2026 Mike Pall. Its build script
+which is MIT-licensed, Copyright (C) 2005-2026 Mike Pall. LuaJIT includes code
+from Lua 5.1/5.2, MIT-licensed, Copyright (C) 1994-2012 Lua.org, PUC-Rio, and
+from dlmalloc, written by Doug Lea and released to the public domain. Its build script
 adapts [ziglua](https://github.com/natecraddock/ziglua)'s, MIT-licensed,
 Copyright (c) 2022 Nathan Craddock.

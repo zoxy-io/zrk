@@ -972,6 +972,8 @@ test "script failures say what and where" {
         var diag: Diagnostic = .{};
         try testing.expectError(error.ScriptFailed, Script.load(testing.allocator, testing.io, &cfg, "s.lua", "function setup(t) t:set('f', print) end function request() return wrk.format() end", &.{}, &diag));
         try testing.expect(std.mem.indexOf(u8, diag.message().?, "only nil, booleans") != null);
+        // Raised from zrk's C function, and still located in the script.
+        try testing.expect(std.mem.indexOf(u8, diag.message().?, "s.lua:1: thread:get/set") != null);
     }
     {
         // Reading a function out of a thread is an error in the reader's
