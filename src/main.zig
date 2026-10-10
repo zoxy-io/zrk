@@ -173,6 +173,7 @@ pub fn main(init: std.process.Init) !void {
         .end_bytes_per_sec = result.end_bytes_per_sec,
         .end_window_s = result.end_window_s,
         .end_window_at_s = result.end_window_at_s,
+        .workload = result.workload,
     };
 
     if (json) {

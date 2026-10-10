@@ -228,9 +228,11 @@ What is different:
 - **One request per `request()` call.** wrk's trick of returning several
   requests back to back to pipeline them is refused. `--streams` is zrk's
   way to keep several requests in flight.
-- **The script's time is not the server's.** `request()` runs before the
-  pacing wait, and before the clock starts in `--closed` mode. `response()`
-  runs after the latency is recorded.
+- **The script's time is not the server's, and it is reported.** `request()`
+  runs before the pacing wait, and before the clock starts in `--closed`
+  mode. `response()` runs after the latency is recorded. The report shows
+  what both cost and their share of the client's threads; see
+  [output.md](docs/output.md#workload-what-a-script-cost).
 - **`done`'s `requests` is per `--interval`.** wrk samples requests per second
   per thread every 100 ms; zrk samples the whole run once per `--interval`.
   `summary.errors` gains `deadline` for `--deadline` misses.

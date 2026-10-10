@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const cli = @import("cli.zig");
 const httpmod = @import("http.zig");
 const h3conn = @import("h3conn.zig");
+const hdr = @import("hdr.zig");
 
 pub const Header = cli.Header;
 
@@ -93,6 +94,17 @@ pub const Workload = struct {
         /// what the two share is the implementation's to synchronise. The
         /// `Response` is borrowed for the call. An error fails the run.
         response: ?*const fn (ptr: *anyopaque, state: *anyopaque, seq: u64, response: *const Response) anyerror!void = null,
+        /// Optional: what the workload's own calls cost, measured by the
+        /// workload, for the report. Covers the calls since the previous
+        /// call, and starts counting again. The runner calls it before the
+        /// fleet launches, discarding the result — so a run that failed or
+        /// was canceled leaves nothing behind — and after it is joined.
+        ///
+        /// Null, zrk times `next` and `response` from outside, which counts
+        /// any wait inside them. A workload whose calls wait on shared state
+        /// — a script, for its thread's Lua state — measures inside that wait
+        /// and reports here, and zrk then times nothing itself.
+        timing: ?*const fn (ptr: *anyopaque, gpa: Allocator) anyerror!TimingSummary = null,
     };
 
     pub fn open(w: Workload, connection: u32) anyerror!*anyopaque {
@@ -236,6 +248,151 @@ pub const Dynamic = struct {
     /// connections allocate from it concurrently, on different threads.
     allocator: Allocator,
     failure: Failure = .{},
+    /// Where the time spent in the workload's calls is recorded, and the
+    /// clock it is read with. Both null: nothing is timed. The runner sets
+    /// them, so a run reports what its workload cost.
+    timing: ?*Timing = null,
+    io: ?std.Io = null,
+};
+
+/// The time a workload's calls take, for the report: one histogram of `next`
+/// and one of `response`, in nanoseconds.
+///
+/// Sharded, one shard per `-t` thread, because a histogram per connection is
+/// tens of kilobytes and `-c 1000` would spend megabytes on a diagnostic.
+/// Connection `i` records into shard `i % shards` under a spin lock: a record
+/// is a few nanoseconds against calls of microseconds, so it is rarely
+/// contended.
+///
+/// Used two ways: by `Generator`, timing calls from outside for a workload
+/// that does not report its own (`VTable.timing`), where a call's time is
+/// wall time and includes any wait inside it; and by a workload that does,
+/// recording only what it chooses to count.
+pub const Timing = struct {
+    shards: []Shard,
+
+    pub const Kind = enum { next, response };
+
+    const Shard = struct {
+        lock: std.atomic.Mutex = .unlocked,
+        next: hdr.Histogram,
+        response: hdr.Histogram,
+        /// Exact sums, kept beside the histograms: a histogram clamps what
+        /// exceeds its range, and a total built from it would quietly
+        /// undercount a call that blocked for longer.
+        next_total_ns: u64 = 0,
+        response_total_ns: u64 = 0,
+
+        fn of(shard: *Shard, kind: Kind) *hdr.Histogram {
+            return switch (kind) {
+                .next => &shard.next,
+                .response => &shard.response,
+            };
+        }
+
+        fn total(shard: *Shard, kind: Kind) *u64 {
+            return switch (kind) {
+                .next => &shard.next_total_ns,
+                .response => &shard.response_total_ns,
+            };
+        }
+    };
+
+    /// 1 ns to an hour at two significant figures: calls are microseconds,
+    /// a percent of resolution is plenty for a cost, and an hour is past any
+    /// call a run could survive. Totals do not depend on it; see `Shard`.
+    fn newHistogram(gpa: Allocator) !hdr.Histogram {
+        return hdr.Histogram.init(gpa, 1, 3600 * std.time.ns_per_s, 2);
+    }
+
+    pub fn init(gpa: Allocator, shards: u32) !Timing {
+        const all = try gpa.alloc(Shard, @max(shards, 1));
+        var made: usize = 0;
+        errdefer {
+            for (all[0..made]) |*shard| {
+                shard.next.deinit();
+                shard.response.deinit();
+            }
+            gpa.free(all);
+        }
+        while (made < all.len) : (made += 1) {
+            var next = try newHistogram(gpa);
+            errdefer next.deinit();
+            all[made] = .{ .next = next, .response = try newHistogram(gpa) };
+        }
+        return .{ .shards = all };
+    }
+
+    pub fn deinit(t: *Timing, gpa: Allocator) void {
+        for (t.shards) |*shard| {
+            shard.next.deinit();
+            shard.response.deinit();
+        }
+        gpa.free(t.shards);
+    }
+
+    pub fn record(t: *Timing, connection: u32, kind: Kind, ns: u64) void {
+        const shard = &t.shards[connection % t.shards.len];
+        while (!shard.lock.tryLock()) std.atomic.spinLoopHint();
+        defer shard.lock.unlock();
+        shard.of(kind).record(@max(ns, 1));
+        shard.total(kind).* +|= ns;
+    }
+
+    /// Forget everything recorded, keeping the memory.
+    pub fn reset(t: *Timing) void {
+        for (t.shards) |*shard| {
+            shard.next.reset();
+            shard.response.reset();
+            shard.next_total_ns = 0;
+            shard.response_total_ns = 0;
+        }
+    }
+
+    /// Every shard merged, once the fleet is joined.
+    pub fn summarize(t: *Timing, gpa: Allocator) !TimingSummary {
+        var merged = try newHistogram(gpa);
+        defer merged.deinit();
+        var summary: TimingSummary = .{};
+        inline for (.{ Kind.next, Kind.response }) |kind| {
+            merged.reset();
+            var total: u64 = 0;
+            for (t.shards) |*shard| {
+                merged.add(shard.of(kind));
+                total +|= shard.total(kind).*;
+            }
+            @field(summary, @tagName(kind)) = .of(&merged, total);
+        }
+        return summary;
+    }
+};
+
+/// What `Timing` reports for one kind of call. Nanoseconds throughout.
+pub const CallStats = struct {
+    calls: u64 = 0,
+    total_ns: u64 = 0,
+    mean_ns: f64 = 0,
+    p50_ns: u64 = 0,
+    p99_ns: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn of(h: *const hdr.Histogram, total_ns: u64) CallStats {
+        const calls = h.count();
+        if (calls == 0) return .{};
+        return .{
+            .calls = calls,
+            .total_ns = total_ns,
+            .mean_ns = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(calls)),
+            .p50_ns = h.valueAtPercentile(50),
+            .p99_ns = h.valueAtPercentile(99),
+            .max_ns = h.max(),
+        };
+    }
+};
+
+pub const TimingSummary = struct {
+    next: CallStats = .{},
+    response: CallStats = .{},
 };
 
 /// The first error any connection's workload raised, for the runner to return
@@ -294,6 +451,8 @@ pub const Generator = struct {
     behind: Entry = .{},
     /// Field lists and lowered names, per encode.
     arena: std.heap.ArenaAllocator,
+    /// The connection's index, which picks its `Timing` shard.
+    connection: u32,
 
     /// One held request: its schedule position and its encoding, which owns
     /// every byte it points at.
@@ -319,7 +478,20 @@ pub const Generator = struct {
             .transport = transport,
             .state = state,
             .arena = .init(dynamic.allocator),
+            .connection = connection,
         };
+    }
+
+    /// The clock reading a timed call starts from, when calls are timed.
+    fn startTimer(g: *const Generator) ?std.Io.Timestamp {
+        if (g.dynamic.timing == null) return null;
+        return std.Io.Timestamp.now(g.dynamic.io orelse return null, .awake);
+    }
+
+    fn stopTimer(g: *const Generator, started: ?std.Io.Timestamp, kind: Timing.Kind) void {
+        const from = started orelse return;
+        const elapsed = from.durationTo(std.Io.Timestamp.now(g.dynamic.io.?, .awake));
+        g.dynamic.timing.?.record(g.connection, kind, @intCast(@max(elapsed.nanoseconds, 0)));
     }
 
     /// Whether the workload takes responses, and so whether they are worth
@@ -335,6 +507,8 @@ pub const Generator = struct {
     pub fn respond(g: *const Generator, seq: u64, capture: *Capture) anyerror!void {
         const respond_fn = g.dynamic.workload.vtable.response orelse return;
         const response = try capture.view(g.dynamic.allocator);
+        const started = g.startTimer();
+        defer g.stopTimer(started, .response);
         try respond_fn(g.dynamic.workload.ptr, g.state, seq, &response);
     }
 
@@ -357,7 +531,12 @@ pub const Generator = struct {
         // Whatever the entry held is about to be overwritten, so it is not
         // held any more — whether or not what replaces it encodes.
         entry.seq = null;
-        const request = try g.dynamic.workload.next(g.state, seq);
+        const request = blk: {
+            // The workload's own time only; encoding is zrk's.
+            const started = g.startTimer();
+            defer g.stopTimer(started, .next);
+            break :blk try g.dynamic.workload.next(g.state, seq);
+        };
         entry.wire = try g.encode(entry, &request);
         entry.seq = seq;
         return entry.wire;
@@ -644,4 +823,50 @@ test "an HTTP/3 request too large for a stream fails instead of being retried" {
     var g: Generator = try .open(&dynamic, .http3, 0);
     defer g.close();
     try testing.expectError(error.RequestTooLarge, g.at(0));
+}
+
+test "Timing records each call into its connection's shard, and merges them" {
+    var timing = try Timing.init(testing.allocator, 2);
+    defer timing.deinit(testing.allocator);
+    timing.record(0, .next, 1000);
+    timing.record(1, .next, 3000);
+    timing.record(2, .next, 2000);
+    timing.record(1, .response, 500);
+    try testing.expectEqual(@as(u64, 2), timing.shards[0].next.count());
+    const summary = try timing.summarize(testing.allocator);
+    try testing.expectEqual(@as(u64, 3), summary.next.calls);
+    try testing.expectEqual(@as(u64, 1), summary.response.calls);
+    // Totals and means are exact, not read back off the histogram.
+    try testing.expectEqual(@as(f64, 2000), summary.next.mean_ns);
+    try testing.expectEqual(@as(u64, 6000), summary.next.total_ns);
+    try testing.expectApproxEqRel(@as(f64, 3000), @as(f64, @floatFromInt(summary.next.max_ns)), 0.02);
+}
+
+test "a generator with timing records its workload calls, and only those" {
+    var cfg = testConfig(.http);
+    var numbered: Numbered = .{};
+    var timing = try Timing.init(testing.allocator, 1);
+    defer timing.deinit(testing.allocator);
+    var dynamic: Dynamic = .{
+        .workload = numbered.workload(),
+        .cfg = &cfg,
+        .allocator = testing.allocator,
+        .timing = &timing,
+        .io = testing.io,
+    };
+    var g: Generator = try .open(&dynamic, .http1, 0);
+    defer g.close();
+    _ = try g.at(0);
+    _ = try g.at(0); // held: no call, nothing timed
+    _ = try g.at(1);
+    try testing.expectEqual(@as(u64, 2), timing.shards[0].next.count());
+}
+
+test "a call longer than the histogram's range still counts in full" {
+    var timing = try Timing.init(testing.allocator, 1);
+    defer timing.deinit(testing.allocator);
+    const two_hours: u64 = 2 * 3600 * std.time.ns_per_s;
+    timing.record(0, .next, two_hours);
+    const summary = try timing.summarize(testing.allocator);
+    try testing.expectEqual(two_hours, summary.next.total_ns);
 }

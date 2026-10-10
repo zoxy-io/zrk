@@ -16,6 +16,7 @@ const cli = @import("cli.zig");
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 const stats = @import("stats.zig");
+const workload = @import("workload.zig");
 const report = @import("report.zig");
 
 /// Live latency spectrogram geometry. The waterfall keeps the last
@@ -777,6 +778,25 @@ pub const Dashboard = struct {
         if (c.deadline_errors > 0) {
             try w.print("  deadline misses: {d} (CO latency exceeded --deadline)\n", .{c.deadline_errors});
         }
+        // What a script cost the client, so a slow script is told apart from
+        // a slow server. Only for runs that had one.
+        // Only the kinds of call that happened: a script without
+        // `request()` makes none, and "0 calls, p50 0us" would read as free.
+        //
+        // Named for where the calls came from. A script's are its Lua hooks,
+        // timed inside its own lock; a library workload's are `next` and
+        // `response`, timed by zrk from outside as wall time, waits and all.
+        if (run.workload) |timing| if (timing.next.calls + timing.response.calls > 0) {
+            const script = self.cfg.script_path != null;
+            try w.writeAll(if (script) "  script: " else "  workload: ");
+            if (timing.next.calls > 0) try writeCalls(w, if (script) "request()" else "next()", timing.next);
+            if (timing.next.calls > 0 and timing.response.calls > 0) try w.writeAll(", ");
+            if (timing.response.calls > 0) try writeCalls(w, "response()", timing.response);
+            try w.print("  ·  {d:.2}% of client thread time{s}\n", .{
+                report.workloadShare(run, self.cfg.threads) * 100,
+                if (script) "" else " (wall time, waits included)",
+            });
+        };
         // Peak schedule lag is the backlog gauge; sub-millisecond lag is normal
         // jitter, so only report it once it's large enough to signal overload.
         if (c.max_behind_ns >= std.time.ns_per_ms) {
@@ -784,6 +804,15 @@ pub const Dashboard = struct {
             try Dur.write(w, @floatFromInt(c.max_behind_ns / std.time.ns_per_us));
             try w.writeAll("\n");
         }
+    }
+
+    fn writeCalls(w: *Io.Writer, name: []const u8, s: workload.CallStats) !void {
+        try w.print("{s} {d} calls, p50 {d:.1}us p99 {d:.1}us", .{
+            name,
+            s.calls,
+            @as(f64, @floatFromInt(s.p50_ns)) / std.time.ns_per_us,
+            @as(f64, @floatFromInt(s.p99_ns)) / std.time.ns_per_us,
+        });
     }
 
     /// The `--latency` detailed percentile spectrum.
@@ -1314,4 +1343,43 @@ test "writeFinalSummary surfaces deadline misses and peak schedule lag" {
 
     try testing.expect(std.mem.indexOf(u8, text, "deadline misses: 42") != null);
     try testing.expect(std.mem.indexOf(u8, text, "peak schedule lag: 250.00ms") != null);
+}
+
+test "the summary names a workload's calls by where they came from" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 10;
+
+    const timed: workload.TimingSummary = .{ .next = .{ .calls = 10, .total_ns = 10_000, .mean_ns = 1000, .p50_ns = 1000, .p99_ns = 2000, .max_ns = 2000 } };
+    const run: report.Run = .{ .elapsed_s = 1.0, .launched = 1, .workload = timed };
+
+    inline for (.{
+        .{ "zrk.lua", "  script: request() 10 calls", "(wall time" },
+        .{ null, "  workload: next() 10 calls", "request()" },
+    }) |case| {
+        var cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1:8080/") };
+        cfg.script_path = case[0];
+        var dash_buf: [1024]u8 = undefined;
+        var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+        var out = Io.Writer.Allocating.init(testing.allocator);
+        defer out.deinit();
+        try dash.writeFinalSummary(&out.writer, &snap, run);
+        try testing.expect(std.mem.indexOf(u8, out.written(), case[1]) != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), case[2]) == null);
+    }
+
+    // No calls at all — a script with no request() or response() — prints
+    // no line, rather than one that reads as free.
+    var cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1:8080/"), .script_path = "s.lua" };
+    var dash_buf: [1024]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try dash.writeFinalSummary(&out.writer, &snap, .{ .elapsed_s = 1.0, .launched = 1, .workload = .{} });
+    try testing.expect(std.mem.indexOf(u8, out.written(), "script:") == null);
 }

@@ -38,6 +38,40 @@ can store the raw histogram and later re-percentile it, diff two runs, or merge
 many runs into one aggregate — none of which the summarized percentiles allow.
 `zrk` can round-trip it too (`hdr.decodeBase64`), e.g. to merge prior runs.
 
+### `workload`: what a script cost
+
+A run whose `--script` defines `request()`, `response()` or `setup()` gets one
+more key. So does a library run with a `Workload`. Runs without one have no
+`workload` key at all.
+
+```json
+  "workload": {
+    "thread_share": 0.004967,
+    "next":     { "calls": 1604, "total_ms": 19.872, "mean_us": 12.389, "p50_us": 8.928, "p99_us": 57.984, "max_us": 346.111 },
+    "response": { "calls": 0, "total_ms": 0.000, "mean_us": 0.000, "p50_us": 0.000, "p99_us": 0.000, "max_us": 0.000 }
+  },
+```
+
+- **`next`** times `request()` calls. **`response`** times `response()` calls.
+  A script without `request()` sends a request built once per thread, which
+  is no call, so `next.calls` is 0.
+- **Only the Lua call is timed.** The clock runs inside the thread state's
+  lock, around the call alone. The wait for the lock is not the script's
+  cost, and neither is zrk reading the request it returned.
+- **`thread_share`** is the time in both kinds of call over
+  `duration_s × -t`: the fraction of the client's threads the script used.
+  Each thread state runs one call at a time, so it cannot exceed 1, and a
+  share near 1 means the script, not the server, limits the run.
+- **A library `Workload`** can report its own timing the same way. One that
+  does not is timed by zrk from outside its calls, as wall time that counts
+  any wait inside them, and then `thread_share` can exceed 1.
+
+The text report prints the same as one line, under the latency percentiles:
+
+```
+  script: request() 1604 calls, p50 6.6us p99 67.3us, response() 1600 calls, p50 5.5us p99 46.7us  ·  0.74% of client thread time
+```
+
 `achieved_rate` / `rate_ratio` tell you whether the client actually sustained
 the target load. **If `rate_ratio` is well below 1.0, the client was saturated
 (one request in flight per connection) and the latency numbers reflect client
