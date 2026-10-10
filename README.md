@@ -203,8 +203,10 @@ What carries over from wrk:
 - **The `wrk` table.** `scheme`, `host`, `port`, `method`, `path`, `headers`,
   `body`, and `wrk.format(method, path, headers, body)`. `-m`, `-H` and `-b`
   set the starting values.
-- **`init(args)`.** Runs once per thread at startup. Arguments after the URL
-  reach it, and `--` passes ones that start with a dash.
+- **`init(args)`.** Runs once per thread at startup, or once in all for a
+  script without `request()`, `response()` or `setup()`, which has no thread
+  states (see below). Arguments after the URL reach it, and `--` passes ones
+  that start with a dash.
 - **`request()`.** Runs once per request, with one Lua state per `-t` thread
   shared by that thread's connections, as in wrk.
 - **`response(status, headers, body)`.** Runs once per response, in the same
