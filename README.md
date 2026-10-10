@@ -159,8 +159,8 @@ zrk -c20 -d1m -R500 --latency https://api.example.com/health
 zrk -c10 -R100 -m POST -b '{"ping":1}' \
     -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
 
-# A wrk script: a fresh user id on every request, ids 1..1000 (see "Scripting")
-zrk -c50 -R2000 -d30s --script users.lua http://127.0.0.1:8080/ /user/ 1000
+# A wrk script: a different path on every request (see "Scripting")
+zrk -c50 -R2000 -d30s --script users.lua http://127.0.0.1:8080/ /user/
 
 # HTTP/3 over QUIC (experimental — see "HTTP/3" below for what that costs you)
 zrk --http3 -k -c10 -R500 -d30s https://127.0.0.1:4433/
@@ -188,15 +188,26 @@ written for wrk and wrk2 carry over. The interpreter is LuaJIT, as in wrk:
 Lua 5.1 with `bit`, `unpack` and the standard libraries.
 
 ```lua
--- users.lua: a different path on every request, so no cache can answer it
-local base, max
+-- users.lua: a different path on every request, so no cache keyed on the
+-- path can answer one
+local threads = 0
+function setup(thread)         -- once per thread, before init
+  threads = threads + 1
+  thread:set("id", threads)
+end
 function init(args)            -- args[0] is the URL, args[1..] what follows it
-  base, max = args[1] or "/user/", tonumber(args[2] or "1000")
+  base, n = args[1] or "/user/", 0
 end
 function request()
-  return wrk.format("GET", base .. math.random(1, max))
+  n = n + 1
+  return wrk.format("GET", base .. id .. "-" .. n)
 end
 ```
+
+A per-thread counter rather than `math.random`: LuaJIT seeds every state
+alike, as it does in wrk, so unseeded random ids repeat across threads. Seed
+from something per-thread, such as an id handed out in `setup`, if a script
+needs random values.
 
 What carries over from wrk:
 
