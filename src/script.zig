@@ -318,10 +318,15 @@ pub const Script = struct {
     const vtable: wl.Workload.VTable = .{ .open = open, .next = next, .close = close, .timing = reportTiming };
     const vtable_responding: wl.Workload.VTable = .{ .open = open, .next = next, .close = close, .response = respond, .timing = reportTiming };
 
+    /// This run's calls, and a clean slate for the next: a library caller
+    /// may run one script many times, and each report divides by its own
+    /// run's length.
     fn reportTiming(ptr: *anyopaque, gpa: Allocator) anyerror!wl.TimingSummary {
         const script: *Script = @ptrCast(@alignCast(ptr));
-        var timing = script.timing orelse return .{};
-        return timing.summarize(gpa);
+        const timing = if (script.timing) |*t| t else return .{};
+        const summary = try timing.summarize(gpa);
+        timing.reset();
+        return summary;
     }
 
     /// The clock around one Lua call, recorded into the state's shard.
@@ -1206,4 +1211,9 @@ test "a script reports its own Lua time, and only calls that ran Lua" {
     try testing.expectEqual(@as(u64, 3), timing.next.calls);
     try testing.expectEqual(@as(u64, 0), timing.response.calls);
     try testing.expect(timing.next.max_ns > 0);
+
+    // A second run of the same script reports its own calls, not both runs'.
+    _ = try g.next(a, 2);
+    const second = try g.vtable.timing.?(g.ptr, testing.allocator);
+    try testing.expectEqual(@as(u64, 1), second.next.calls);
 }

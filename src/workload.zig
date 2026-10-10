@@ -95,7 +95,9 @@ pub const Workload = struct {
         /// `Response` is borrowed for the call. An error fails the run.
         response: ?*const fn (ptr: *anyopaque, state: *anyopaque, seq: u64, response: *const Response) anyerror!void = null,
         /// Optional: what the workload's own calls cost, measured by the
-        /// workload, for the report. Called once, after the fleet is joined.
+        /// workload, for the report. Called once per run, after the fleet is
+        /// joined, and covers that run alone: a workload run more than once
+        /// starts counting again after reporting.
         ///
         /// Null, zrk times `next` and `response` from outside, which counts
         /// any wait inside them. A workload whose calls wait on shared state
@@ -334,6 +336,16 @@ pub const Timing = struct {
         defer shard.lock.unlock();
         shard.of(kind).record(@max(ns, 1));
         shard.total(kind).* +|= ns;
+    }
+
+    /// Forget everything recorded, keeping the memory.
+    pub fn reset(t: *Timing) void {
+        for (t.shards) |*shard| {
+            shard.next.reset();
+            shard.response.reset();
+            shard.next_total_ns = 0;
+            shard.response_total_ns = 0;
+        }
     }
 
     /// Every shard merged, once the fleet is joined.
