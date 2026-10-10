@@ -53,13 +53,18 @@ more key. So does a library run with a `Workload`. Runs without one have no
 ```
 
 - **`next`** times `request()` calls. **`response`** times `response()` calls.
-  A request held from an earlier call is not a call, so `calls` can be lower
-  than `requests`.
-- **`thread_share`** is the time in both kinds of call over `duration_s × -t`:
-  the fraction of the client's threads the script used. A share near 1 means
-  the script, not the server, is what limits the run.
-- **Times are wall time.** A call that waited for its thread's Lua state,
-  shared by that thread's connections, counts the wait.
+  A script without `request()` sends a request built once per thread, which
+  is no call, so `next.calls` is 0.
+- **Only the Lua call is timed.** The clock runs inside the thread state's
+  lock, around the call alone. The wait for the lock is not the script's
+  cost, and neither is zrk reading the request it returned.
+- **`thread_share`** is the time in both kinds of call over
+  `duration_s × -t`: the fraction of the client's threads the script used.
+  Each thread state runs one call at a time, so it cannot exceed 1, and a
+  share near 1 means the script, not the server, limits the run.
+- **A library `Workload`** can report its own timing the same way. One that
+  does not is timed by zrk from outside its calls, as wall time that counts
+  any wait inside them, and then `thread_share` can exceed 1.
 
 The text report prints the same as one line, under the latency percentiles:
 

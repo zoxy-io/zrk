@@ -128,13 +128,16 @@ pub fn run(
     var dynamic: workload.Dynamic = undefined;
     var timing: workload.Timing = undefined;
     const dynamic_ptr: ?*workload.Dynamic = if (cfg.workload) |w| blk: {
+        // zrk times the calls from outside only for a workload that does not
+        // report its own; see `workload.Workload.VTable.timing`.
+        const self_timed = w.vtable.timing != null;
         // One shard per executor thread; see `workload.Timing`.
-        timing = try .init(arena, cfg.threads);
+        if (!self_timed) timing = try .init(arena, cfg.threads);
         dynamic = .{
             .workload = w,
             .cfg = cfg,
             .allocator = std.heap.smp_allocator,
-            .timing = &timing,
+            .timing = if (self_timed) null else &timing,
             .io = io,
         };
         break :blk &dynamic;
@@ -341,7 +344,10 @@ pub fn run(
     // what was measured before it is not a result: the requests after it were
     // never sent. The fleet is joined, so nothing touches `dynamic` past here.
     if (dynamic_ptr) |d| if (d.failure.get()) |err| return err;
-    const workload_timing = if (dynamic_ptr != null) try timing.summarize(arena) else null;
+    const workload_timing: ?workload.TimingSummary = if (dynamic_ptr) |d|
+        if (d.workload.vtable.timing) |own| try own(d.workload.ptr, arena) else try timing.summarize(arena)
+    else
+        null;
 
     const elapsed = start.durationTo(Io.Timestamp.now(io, .awake));
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_s;

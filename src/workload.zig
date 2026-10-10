@@ -94,6 +94,14 @@ pub const Workload = struct {
         /// what the two share is the implementation's to synchronise. The
         /// `Response` is borrowed for the call. An error fails the run.
         response: ?*const fn (ptr: *anyopaque, state: *anyopaque, seq: u64, response: *const Response) anyerror!void = null,
+        /// Optional: what the workload's own calls cost, measured by the
+        /// workload, for the report. Called once, after the fleet is joined.
+        ///
+        /// Null, zrk times `next` and `response` from outside, which counts
+        /// any wait inside them. A workload whose calls wait on shared state
+        /// — a script, for its thread's Lua state — measures inside that wait
+        /// and reports here, and zrk then times nothing itself.
+        timing: ?*const fn (ptr: *anyopaque, gpa: Allocator) anyerror!TimingSummary = null,
     };
 
     pub fn open(w: Workload, connection: u32) anyerror!*anyopaque {
@@ -253,9 +261,10 @@ pub const Dynamic = struct {
 /// is a few nanoseconds against calls of microseconds, so it is rarely
 /// contended.
 ///
-/// A call's time is wall time, so it includes any wait inside the workload —
-/// for a script, the wait for its thread state's lock — which is a cost the
-/// connection paid all the same.
+/// Used two ways: by `Generator`, timing calls from outside for a workload
+/// that does not report its own (`VTable.timing`), where a call's time is
+/// wall time and includes any wait inside it; and by a workload that does,
+/// recording only what it chooses to count.
 pub const Timing = struct {
     shards: []Shard,
 

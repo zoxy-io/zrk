@@ -136,6 +136,12 @@ pub const Script = struct {
     /// for a static script.
     pool: []Shared = &.{},
     hooks: Hooks,
+    /// What `request()` and `response()` cost, one shard per thread state,
+    /// recorded inside each state's lock around the Lua call alone: not the
+    /// wait for the lock, which is not the script's cost, and not zrk's
+    /// parsing of what it returned. A state runs one call at a time, so the
+    /// time it records cannot exceed the run's.
+    timing: ?wl.Timing = null,
 
     /// Which of wrk's hooks the script defines.
     const Hooks = struct {
@@ -165,6 +171,8 @@ pub const Script = struct {
     /// between the connections that use it.
     const Shared = struct {
         L: *lua.State,
+        /// Its position in the pool, and so its `timing` shard.
+        index: u32 = 0,
         mutex: Io.Mutex = .init,
         /// What this thread sends when the script has no `request()`: its
         /// `wrk.format()` after `setup` and `init`, which can differ between
@@ -251,7 +259,7 @@ pub const Script = struct {
             for (pool[0..opened]) |*shared| shared.deinit(gpa);
             gpa.free(pool);
         }
-        while (opened < pool.len) : (opened += 1) pool[opened] = .{ .L = try script.newState() };
+        while (opened < pool.len) : (opened += 1) pool[opened] = .{ .L = try script.newState(), .index = @intCast(opened) };
 
         // wrk's order: every thread's `setup`, in the main state, then every
         // thread's own `init`.
@@ -269,11 +277,13 @@ pub const Script = struct {
             lua.lua_settop(shared.L, 0);
             shared.fixed = try script.parse(shared.fixed_raw.items, &shared.fixed_headers);
         }
+        script.timing = try .init(gpa, @intCast(pool.len));
         script.pool = pool;
         return script;
     }
 
     pub fn deinit(script: *Script) void {
+        if (script.timing) |*t| t.deinit(script.gpa);
         for (script.pool) |*shared| shared.deinit(script.gpa);
         script.gpa.free(script.pool);
         lua.lua_close(script.main);
@@ -305,8 +315,21 @@ pub const Script = struct {
         };
     }
 
-    const vtable: wl.Workload.VTable = .{ .open = open, .next = next, .close = close };
-    const vtable_responding: wl.Workload.VTable = .{ .open = open, .next = next, .close = close, .response = respond };
+    const vtable: wl.Workload.VTable = .{ .open = open, .next = next, .close = close, .timing = reportTiming };
+    const vtable_responding: wl.Workload.VTable = .{ .open = open, .next = next, .close = close, .response = respond, .timing = reportTiming };
+
+    fn reportTiming(ptr: *anyopaque, gpa: Allocator) anyerror!wl.TimingSummary {
+        const script: *Script = @ptrCast(@alignCast(ptr));
+        var timing = script.timing orelse return .{};
+        return timing.summarize(gpa);
+    }
+
+    /// The clock around one Lua call, recorded into the state's shard.
+    /// Called with the state's lock held.
+    fn timeCall(script: *Script, shared: *const Shared, kind: wl.Timing.Kind, started: Io.Timestamp) void {
+        const elapsed = started.durationTo(Io.Timestamp.now(script.io, .awake));
+        script.timing.?.record(shared.index, kind, @intCast(@max(elapsed.nanoseconds, 0)));
+    }
 
     /// What a finished run hands `done(summary, latency, requests)`.
     pub const Summary = struct {
@@ -389,8 +412,10 @@ pub const Script = struct {
             defer shared.mutex.unlock(script.io);
             const L = shared.L;
             defer lua.lua_settop(L, 0);
+            const started = Io.Timestamp.now(script.io, .awake);
             lua.getGlobal(L, "request");
             try script.call(L, 0, "request()");
+            script.timeCall(shared, .next, started);
             const raw = lua.toString(L, -1) orelse {
                 script.diagnostic.set("{s}: request() returned {s}, not a string", .{ script.fileName(), typeName(lua.lua_type(L, -1)) });
                 return error.ScriptFailed;
@@ -423,7 +448,11 @@ pub const Script = struct {
             lua.lua_settable(L, -3);
         }
         lua.pushString(L, response.body);
+        // From here: the headers table above is the script's input, built by
+        // zrk, the same as the request text `next` parses after its call.
+        const started = Io.Timestamp.now(script.io, .awake);
         try script.call(L, 3, "response()");
+        script.timeCall(shared, .response, started);
     }
 
     fn close(ptr: *anyopaque, state: *anyopaque) void {
@@ -1142,4 +1171,39 @@ test "a static script still gets done()" {
     // The fixed request still borrows from the main state's stack, which
     // `done` left as it found it.
     try testing.expectEqualStrings("POST", cfg.method);
+}
+
+test "a script reports its own Lua time, and only calls that ran Lua" {
+    var cfg = testConfig();
+    cfg.threads = 2;
+    var diag: Diagnostic = .{};
+    // No `request()`: each thread sends its fixed request, which is no call.
+    const fixed = try Script.load(testing.allocator, testing.io, &cfg, "r.lua", "function response() end", &.{test_url}, &diag);
+    defer fixed.deinit();
+    const w = fixed.workload();
+    // zrk does not time around a script; the script times itself.
+    try testing.expect(w.vtable.timing != null);
+    const conn = try w.open(0);
+    defer w.close(conn);
+    for (0..3) |seq| _ = try w.next(conn, seq);
+    const ok: wl.Response = .{ .status = 200, .headers = &.{}, .body = "" };
+    try w.vtable.response.?(w.ptr, conn, 0, &ok);
+    const fixed_timing = try w.vtable.timing.?(w.ptr, testing.allocator);
+    try testing.expectEqual(@as(u64, 0), fixed_timing.next.calls);
+    try testing.expectEqual(@as(u64, 1), fixed_timing.response.calls);
+
+    const generating = try Script.load(testing.allocator, testing.io, &cfg, "g.lua", "function request() return wrk.format() end", &.{test_url}, &diag);
+    defer generating.deinit();
+    const g = generating.workload();
+    const a = try g.open(0);
+    defer g.close(a);
+    const b = try g.open(1);
+    defer g.close(b);
+    _ = try g.next(a, 0);
+    _ = try g.next(a, 1);
+    _ = try g.next(b, 0);
+    const timing = try g.vtable.timing.?(g.ptr, testing.allocator);
+    try testing.expectEqual(@as(u64, 3), timing.next.calls);
+    try testing.expectEqual(@as(u64, 0), timing.response.calls);
+    try testing.expect(timing.next.max_ns > 0);
 }
