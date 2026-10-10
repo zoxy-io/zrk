@@ -285,12 +285,32 @@ pub const Generator = struct {
     dynamic: *Dynamic,
     transport: Transport,
     state: *anyopaque,
-    /// The encoded request. Grows to the largest request seen and stays there.
-    buffer: std.ArrayList(u8) = .empty,
-    /// Field lists and lowered names, per request.
+    /// The request generated furthest along the schedule: the one a sender
+    /// prepares ahead of its send time.
+    ahead: Entry = .{},
+    /// A request generated again behind `ahead` — a resend, after a peer
+    /// declined it. Kept apart so a resend never evicts the request already
+    /// prepared ahead of it, which would then have to be generated twice.
+    behind: Entry = .{},
+    /// Field lists and lowered names, per encode.
     arena: std.heap.ArenaAllocator,
-    seq: ?u64 = null,
-    wire: Wire = .{},
+
+    /// One held request: its schedule position and its encoding, which owns
+    /// every byte it points at.
+    const Entry = struct {
+        seq: ?u64 = null,
+        wire: Wire = .{},
+        /// The encoded request. Grows to the largest request seen and stays.
+        buffer: std.ArrayList(u8) = .empty,
+        /// HTTP/2's body, copied: the workload's own is valid only until its
+        /// next `next`, which the other entry's request may already be.
+        body: std.ArrayList(u8) = .empty,
+
+        fn deinit(entry: *Entry, gpa: Allocator) void {
+            entry.buffer.deinit(gpa);
+            entry.body.deinit(gpa);
+        }
+    };
 
     pub fn open(dynamic: *Dynamic, transport: Transport, connection: u32) anyerror!Generator {
         const state = try dynamic.workload.open(connection);
@@ -310,7 +330,7 @@ pub const Generator = struct {
 
     /// Hand the response collected in `capture`, to the request `seq` named,
     /// to the workload. Touches only the workload and `capture`, never the
-    /// request this generator holds, so a multiplexed connection's receiver
+    /// requests this generator holds, so a multiplexed connection's receiver
     /// may call it while its sender is in `at`.
     pub fn respond(g: *const Generator, seq: u64, capture: *Capture) anyerror!void {
         const respond_fn = g.dynamic.workload.vtable.response orelse return;
@@ -320,49 +340,60 @@ pub const Generator = struct {
 
     pub fn close(g: *Generator) void {
         g.dynamic.workload.close(g.state);
-        g.buffer.deinit(g.dynamic.allocator);
+        g.ahead.deinit(g.dynamic.allocator);
+        g.behind.deinit(g.dynamic.allocator);
         g.arena.deinit();
         g.* = undefined;
     }
 
-    /// The request for `seq`, generating and encoding it unless it is the one
-    /// already held. Valid until the next call that generates.
+    /// The request for `seq`, generating and encoding it unless it is one
+    /// already held. Valid until a call that generates into the same entry:
+    /// a request at or past the schedule's furthest point replaces `ahead`,
+    /// and a resend behind it replaces `behind`.
     pub fn at(g: *Generator, seq: u64) anyerror!Wire {
-        if (g.seq == seq) return g.wire;
-        // Whatever was held is about to be overwritten, so it is not held any
-        // more — whether or not what replaces it encodes.
-        g.seq = null;
+        if (g.ahead.seq == seq) return g.ahead.wire;
+        if (g.behind.seq == seq) return g.behind.wire;
+        const entry = if (g.ahead.seq) |furthest| (if (seq < furthest) &g.behind else &g.ahead) else &g.ahead;
+        // Whatever the entry held is about to be overwritten, so it is not
+        // held any more — whether or not what replaces it encodes.
+        entry.seq = null;
         const request = try g.dynamic.workload.next(g.state, seq);
-        g.wire = try g.encode(&request);
-        g.seq = seq;
-        return g.wire;
+        entry.wire = try g.encode(entry, &request);
+        entry.seq = seq;
+        return entry.wire;
     }
 
-    fn encode(g: *Generator, request: *const Request) !Wire {
+    fn encode(g: *Generator, entry: *Entry, request: *const Request) !Wire {
         const gpa = g.dynamic.allocator;
         const cfg = g.dynamic.cfg;
         const method: httpmod.RequestMethod = .of(request.method);
-        g.buffer.clearRetainingCapacity();
+        entry.buffer.clearRetainingCapacity();
         switch (g.transport) {
             .http1 => {
-                var out: std.Io.Writer.Allocating = .fromArrayList(gpa, &g.buffer);
-                defer g.buffer = out.toArrayList();
+                var out: std.Io.Writer.Allocating = .fromArrayList(gpa, &entry.buffer);
+                defer entry.buffer = out.toArrayList();
                 httpmod.writeRequest(&out.writer, cfg, request) catch return error.OutOfMemory;
                 return .{ .http1 = out.written(), .method = method };
             },
             .http2 => {
                 _ = g.arena.reset(.retain_capacity);
                 const fields = try httpmod.buildRequestFields(g.arena.allocator(), cfg, request);
-                const block = try httpmod.encodeRequestBlock(g.arena.allocator(), gpa, &g.buffer, fields);
-                return .{ .block = block, .body = request.body, .method = method };
+                const block = try httpmod.encodeRequestBlock(g.arena.allocator(), gpa, &entry.buffer, fields);
+                entry.body.clearRetainingCapacity();
+                try entry.body.appendSlice(gpa, request.body);
+                return .{ .block = block, .body = entry.body.items, .method = method };
             },
             .http3 => {
                 _ = g.arena.reset(.retain_capacity);
                 const fields = try httpmod.buildRequestFields(g.arena.allocator(), cfg, request);
-                try g.buffer.ensureTotalCapacity(gpa, h3conn.request_octets_max);
+                try entry.buffer.ensureTotalCapacity(gpa, h3conn.request_octets_max);
+                // Exactly the bound, not the capacity: an ArrayList grows past
+                // what it was asked for, and a request that fits the buffer
+                // but not a stream's send buffer is written short, reset and
+                // tried again on every pass — forever, never failing.
                 const frames = try h3conn.encodeRequest(
                     g.arena.allocator(),
-                    g.buffer.allocatedSlice(),
+                    entry.buffer.allocatedSlice()[0..h3conn.request_octets_max],
                     fields,
                     request.body,
                 );
@@ -434,7 +465,7 @@ const Numbered = struct {
     opened: std.atomic.Value(u32) = .init(0),
     closed: std.atomic.Value(u32) = .init(0),
 
-    const State = struct { path: [32]u8 = undefined };
+    const State = struct { path: [32]u8 = undefined, body: [32]u8 = undefined };
 
     fn workload(n: *Numbered) Workload {
         return .{ .ptr = n, .vtable = &.{ .open = open, .next = next, .close = close } };
@@ -452,7 +483,12 @@ const Numbered = struct {
         const s: *State = @ptrCast(@alignCast(state));
         _ = n.calls.fetchAdd(1, .monotonic);
         if (n.fail_at == seq) return error.ScriptFailed;
-        return .{ .target = try std.fmt.bufPrint(&s.path, "/n/{d}", .{seq}) };
+        return .{
+            .target = try std.fmt.bufPrint(&s.path, "/n/{d}", .{seq}),
+            // One buffer per state, rewritten by every call, as a workload's
+            // own memory is.
+            .body = try std.fmt.bufPrint(&s.body, "body {d}", .{seq}),
+        };
     }
 
     fn close(ptr: *anyopaque, state: *anyopaque) void {
@@ -558,4 +594,54 @@ test "Capture keeps fields stable across growth and reuses its memory" {
     c.field(testing.allocator, "a", "b");
     try testing.expectEqual(capacity, c.text.capacity);
     try testing.expectEqual(@as(usize, 1), (try c.view(testing.allocator)).headers.len);
+}
+
+test "a resend does not evict the request prepared ahead of it" {
+    var cfg = testConfig(.http);
+    cfg.method = "GET";
+    cfg.body = "";
+    var numbered: Numbered = .{};
+    var dynamic: Dynamic = .{ .workload = numbered.workload(), .cfg = &cfg, .allocator = testing.allocator };
+    var g: Generator = try .open(&dynamic, .http2, 0);
+    defer g.close();
+
+    // 5 is prepared ahead; 3 and then 4 are resent before it goes out.
+    const five = try g.at(5);
+    _ = try g.at(3);
+    _ = try g.at(4);
+    try testing.expectEqual(@as(u32, 3), numbered.calls.load(.monotonic));
+    // 5 is still held, as it was: the workload is not asked for it again.
+    const again = try g.at(5);
+    try testing.expectEqual(@as(u32, 3), numbered.calls.load(.monotonic));
+    try testing.expectEqualSlices(u8, five.block, again.block);
+    // And the body is the entry's own copy, not the workload's buffer, which
+    // the resends' `next` calls have rewritten since.
+    try testing.expectEqualStrings("body 5", again.body);
+}
+
+test "an HTTP/3 request too large for a stream fails instead of being retried" {
+    const Huge = struct {
+        var body: [h3conn.request_octets_max + 100]u8 = @splat('x');
+        fn open(ptr: *anyopaque, connection: u32) anyerror!*anyopaque {
+            _ = connection;
+            return ptr;
+        }
+        fn next(ptr: *anyopaque, state: *anyopaque, seq: u64) anyerror!Request {
+            _ = .{ ptr, state, seq };
+            return .{ .method = "POST", .body = &body };
+        }
+        fn close(ptr: *anyopaque, state: *anyopaque) void {
+            _ = .{ ptr, state };
+        }
+    };
+    var cfg = testConfig(.https);
+    var token: u8 = 0;
+    var dynamic: Dynamic = .{
+        .workload = .{ .ptr = &token, .vtable = &.{ .open = Huge.open, .next = Huge.next, .close = Huge.close } },
+        .cfg = &cfg,
+        .allocator = testing.allocator,
+    };
+    var g: Generator = try .open(&dynamic, .http3, 0);
+    defer g.close();
+    try testing.expectError(error.RequestTooLarge, g.at(0));
 }

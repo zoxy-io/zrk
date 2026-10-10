@@ -221,6 +221,7 @@ pub const Script = struct {
         script.hooks = .of(main);
 
         if (script.hooks.static()) {
+            errdefer script.static_headers.deinit(gpa);
             try script.callInit(main);
             // What the script left in `wrk`, as the request every send carries.
             const raw = try script.format(main);
@@ -488,7 +489,12 @@ pub const Script = struct {
         lua.getGlobal(L, "wrk");
         lua.lua_getfield(L, -1, "format");
         try script.call(L, 0, "wrk.format");
-        return lua.toString(L, -1) orelse unreachable;
+        // A script may replace `wrk.format`, and the replacement may return
+        // anything.
+        return lua.toString(L, -1) orelse {
+            script.diagnostic.set("{s}: wrk.format() returned {s}, not a string", .{ script.fileName(), typeName(lua.lua_type(L, -1)) });
+            return error.ScriptFailed;
+        };
     }
 
     /// Call the function sitting below its `nargs` arguments at the top of
@@ -561,8 +567,15 @@ fn threadGet(state: ?*lua.State) callconv(.c) c_int {
     const L = state.?;
     const target = threadShared(L).L;
     lua.getGlobal(target, globalName(L));
-    defer lua.pop(target, 1);
-    copyValue(target, -1, L, 0);
+    // Checked before anything is copied, and raised in `L`: the thread's
+    // state is idle, with no `lua_pcall` of its own to catch an error, and
+    // one raised there takes the process down.
+    if (uncopyable(target, -1, 0)) |message| {
+        lua.pop(target, 1);
+        lua.raise(L, message);
+    }
+    copyValue(target, -1, L);
+    lua.pop(target, 1);
     return 1;
 }
 
@@ -570,7 +583,8 @@ fn threadSet(state: ?*lua.State) callconv(.c) c_int {
     const L = state.?;
     const target = threadShared(L).L;
     const name = globalName(L);
-    copyValue(L, 3, target, 0);
+    if (uncopyable(L, 3, 0)) |message| lua.raise(L, message);
+    copyValue(L, 3, target);
     lua.setGlobal(target, name);
     return 0;
 }
@@ -579,31 +593,52 @@ fn threadStop(state: ?*lua.State) callconv(.c) c_int {
     lua.raise(state.?, "thread:stop() is not supported by zrk");
 }
 
-/// Push onto `to` a copy of the value at `index` in `from`: nil, booleans,
-/// numbers, strings, and tables of those, as wrk copies between states. A
-/// function or userdata cannot cross, and raises in `from` — which is the
-/// state whose script asked for the copy.
-fn copyValue(from: *lua.State, index: c_int, to: *lua.State, depth: u32) void {
+/// Why the value at `index` in `L` cannot cross to another state, or null
+/// when it can: nil, booleans, numbers, strings, and tables of those, as wrk
+/// copies between states. Raises nothing, so the caller raises in whichever
+/// state has a `lua_pcall` to catch it.
+fn uncopyable(L: *lua.State, index: c_int, depth: u32) ?[]const u8 {
+    const at = lua.absIndex(L, index);
+    switch (lua.lua_type(L, at)) {
+        .nil, .none, .boolean, .number, .string => return null,
+        .table => {
+            // Deep enough for any table a script means to pass, shallow
+            // enough that a cycle ends in an error rather than a crash.
+            if (depth >= 32) return "thread:get/set: table nested too deeply (or a cycle)";
+            lua.lua_pushnil(L);
+            while (lua.lua_next(L, at) != 0) {
+                const why = uncopyable(L, -2, depth + 1) orelse uncopyable(L, -1, depth + 1);
+                if (why) |message| {
+                    lua.pop(L, 2);
+                    return message;
+                }
+                lua.pop(L, 1);
+            }
+            return null;
+        },
+        else => return "thread:get/set: only nil, booleans, numbers, strings and tables cross threads",
+    }
+}
+
+/// Push onto `to` a copy of the value at `index` in `from`, which
+/// `uncopyable` has cleared.
+fn copyValue(from: *lua.State, index: c_int, to: *lua.State) void {
     const at = lua.absIndex(from, index);
     switch (lua.lua_type(from, at)) {
-        .nil, .none => lua.lua_pushnil(to),
         .boolean => lua.lua_pushboolean(to, lua.lua_toboolean(from, at)),
         .number => lua.lua_pushnumber(to, lua.lua_tonumber(from, at)),
         .string => lua.pushString(to, lua.toString(from, at).?),
         .table => {
-            // Deep enough for any table a script means to pass, shallow
-            // enough that a cycle ends in an error rather than a crash.
-            if (depth >= 32) lua.raise(from, "thread:get/set: table nested too deeply (or a cycle)");
             lua.lua_createtable(to, 0, 0);
             lua.lua_pushnil(from);
             while (lua.lua_next(from, at) != 0) {
-                copyValue(from, -2, to, depth + 1);
-                copyValue(from, -1, to, depth + 1);
+                copyValue(from, -2, to);
+                copyValue(from, -1, to);
                 lua.lua_settable(to, -3);
                 lua.pop(from, 1);
             }
         },
-        else => lua.raise(from, "thread:get/set: only nil, booleans, numbers, strings and tables cross threads"),
+        else => lua.lua_pushnil(to),
     }
 }
 
@@ -880,6 +915,43 @@ test "script failures say what and where" {
         var diag: Diagnostic = .{};
         try testing.expectError(error.ScriptFailed, Script.load(testing.allocator, testing.io, &cfg, "s.lua", "function setup(t) t:set('f', print) end function request() return wrk.format() end", &.{}, &diag));
         try testing.expect(std.mem.indexOf(u8, diag.message().?, "only nil, booleans") != null);
+    }
+    {
+        // Reading a function out of a thread is an error in the reader's
+        // script — the thread's own state has no handler, and an error raised
+        // there would end the process.
+        var diag: Diagnostic = .{};
+        const script = try Script.load(testing.allocator, testing.io, &cfg, "get.lua",
+            \\local threads = {}
+            \\function setup(t) table.insert(threads, t) end
+            \\function request() return wrk.format() end
+            \\function done() return threads[1]:get("wrk") end
+        , &.{test_url}, &diag);
+        defer script.deinit();
+        var latency = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+        defer latency.deinit();
+        try testing.expectError(error.ScriptFailed, script.done(&.{
+            .duration_us = 1,
+            .requests = 0,
+            .bytes = 0,
+            .errors = .{ .connect = 0, .read = 0, .write = 0, .status = 0, .timeout = 0, .deadline = 0 },
+            .latency = &latency,
+            .rates = &.{},
+        }));
+        try testing.expect(std.mem.indexOf(u8, diag.message().?, "only nil, booleans") != null);
+    }
+    {
+        var diag: Diagnostic = .{};
+        try testing.expectError(error.ScriptFailed, Script.load(testing.allocator, testing.io, &cfg, "f.lua", "function wrk.format() return nil end", &.{}, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message().?, "wrk.format() returned nil") != null);
+    }
+    {
+        // A static request that cannot be sent frees what it had parsed.
+        var diag: Diagnostic = .{};
+        try testing.expectError(error.ChunkedBody, Script.load(testing.allocator, testing.io, &cfg, "c.lua",
+            \\wrk.headers["X-A"] = "1"
+            \\wrk.headers["Transfer-Encoding"] = "chunked"
+        , &.{}, &diag));
     }
     {
         var diag: Diagnostic = .{};
