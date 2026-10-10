@@ -119,8 +119,14 @@ What the contract guarantees, and what it asks of an implementation:
   `--deadline` sheds a send, and repeats when an HTTP/2 or HTTP/3 peer
   declines a request unprocessed and zrk sends it again. A workload that
   derives its request from `seq` resends the same request.
-- **Failure.** An error from `open` or `next` stops every connection, and
-  `runner.run` returns that error instead of a `Report`.
+- **Failure.** An error from `open`, `next` or `response` stops every
+  connection, and `runner.run` returns that error instead of a `Report`.
+- **Responses.** `response` is optional. Leave it null and zrk keeps no
+  response header or body, as without a workload. Set it, and it receives
+  every completed response's status, header fields and body, after the
+  latency is recorded. On a multiplexed HTTP/2 connection it runs on the
+  receiver while the sender may be in `next` on the same connection state,
+  so state the two share needs a lock.
 
 `zrk.script.Script` is the `--script` implementation, built on this
 interface: `Script.load` checks a wrk script, and `apply` puts it into effect

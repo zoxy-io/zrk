@@ -344,7 +344,12 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     // Expand wrk-style attached short options (`-t2`) into separate tokens so
     // the main loop only has to deal with `-t 2`.
     var expanded: std.ArrayList([]const u8) = .empty;
-    for (args) |arg| {
+    for (args, 0..) |arg, index| {
+        // Past `--` every token is a script's, passed through as typed.
+        if (eq(arg, "--")) {
+            try expanded.appendSlice(arena, args[index..]);
+            break;
+        }
         if (arg.len > 2 and arg[0] == '-' and arg[1] != '-' and
             std.mem.indexOfScalar(u8, value_short_opts, arg[1]) != null)
         {
@@ -359,7 +364,12 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         const arg = tokens[i];
-        if (arg.len == 0) continue;
+        // An empty token is nothing before the URL; after it, it is a script
+        // argument, and dropping it would shift every argument behind it.
+        if (arg.len == 0) {
+            if (url_arg != null) try extra.append(arena, arg);
+            continue;
+        }
 
         // Everything after `--` is positional, so a script argument can
         // start with a dash.
@@ -511,8 +521,9 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         script_args[0] = raw_url;
         @memcpy(script_args[1..], extra.items);
         cfg.script_args = script_args;
-    } else if (extra.items.len > 0) {
-        return error.UnexpectedArgument;
+    } else {
+        // Empty ones were always ignored without a script, and still are.
+        for (extra.items) |arg| if (arg.len > 0) return error.UnexpectedArgument;
     }
 
     if (cfg.http3) {
@@ -1138,7 +1149,18 @@ test "--script takes the arguments after the URL, wrk-style" {
     try testing.expectEqualStrings("a", with.script_args[1]);
     try testing.expectEqualStrings("-b", with.script_args[2]);
 
+    // Past `--` nothing is split the way `-c5` is, and an empty argument
+    // keeps its place.
+    const raw = (try parse(a, &[_][]const u8{ "--script", "s.lua", "http://x/", "", "b", "--", "-c5", "" })).config;
+    try testing.expectEqual(@as(u32, 10), raw.connections);
+    try testing.expectEqual(@as(usize, 5), raw.script_args.len);
+    try testing.expectEqualStrings("", raw.script_args[1]);
+    try testing.expectEqualStrings("b", raw.script_args[2]);
+    try testing.expectEqualStrings("-c5", raw.script_args[3]);
+    try testing.expectEqualStrings("", raw.script_args[4]);
+
     try testing.expectError(error.UnexpectedArgument, parse(a, &[_][]const u8{ "http://x/", "a" }));
+    _ = try parse(a, &[_][]const u8{ "http://x/", "" });
     // wrk's `-s` habit, named rather than reported as a bad number.
     try testing.expectError(error.ScriptViaStreams, parse(a, &[_][]const u8{ "-s", "post.lua", "http://x/" }));
     try testing.expectError(error.InvalidNumber, parse(a, &[_][]const u8{ "-s", "x", "http://x/" }));

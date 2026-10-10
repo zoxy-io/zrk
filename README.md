@@ -207,12 +207,20 @@ What carries over from wrk:
   reach it, and `--` passes ones that start with a dash.
 - **`request()`.** Runs once per request, with one Lua state per `-t` thread
   shared by that thread's connections, as in wrk.
+- **`response(status, headers, body)`.** Runs once per response, in the same
+  state. zrk keeps response headers and bodies only for a script that
+  defines it.
+- **`setup(thread)` and `done(summary, latency, requests)`.** `setup` runs once
+  per thread before `init`, with `thread:get` and `thread:set` to reach that
+  thread's globals. `done` runs after the report, with wrk's summary and
+  stats objects, so `latency:percentile(99)` works as in wrk.
 
 What is different:
 
-- **A script without `request()` costs nothing per request.** It only edits
-  `wrk.method`, `wrk.path`, `wrk.headers` or `wrk.body`, so its request
-  becomes the fixed one, exactly as if `-m`, `-H` and `-b` had described it.
+- **A script without `request()`, `response()` or `setup()` costs nothing
+  per request.** It only edits `wrk.method`, `wrk.path`, `wrk.headers` or
+  `wrk.body`, so its request becomes the fixed one, exactly as if `-m`, `-H`
+  and `-b` had described it.
 - **Scripts work over `--http2` and `--http3`.** zrk reads the text that
   `request()` returns back into a method, path, headers and body, then sends
   it on whichever transport the run speaks. A `Host` header the script sets
@@ -221,9 +229,15 @@ What is different:
   requests back to back to pipeline them is refused. `--streams` is zrk's
   way to keep several requests in flight.
 - **The script's time is not the server's.** `request()` runs before the
-  pacing wait, and before the clock starts in `--closed` mode.
-- **`setup`, `delay`, `response` and `done` are not supported yet.** A script
-  that defines one is refused at startup rather than run without it.
+  pacing wait, and before the clock starts in `--closed` mode. `response()`
+  runs after the latency is recorded.
+- **`done`'s `requests` is per `--interval`.** wrk samples requests per second
+  per thread every 100 ms; zrk samples the whole run once per `--interval`.
+  `summary.errors` gains `deadline` for `--deadline` misses.
+- **`delay()` is refused.** `-R` paces requests, and `--closed` sends them back
+  to back, so a script that sets its own delay is refused at startup rather
+  than run without it. `thread:stop()` and `wrk.lookup` raise an error, and
+  `thread.addr` is not provided.
 
 A Lua error stops the run, and zrk reports the file and line.
 

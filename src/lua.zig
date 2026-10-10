@@ -59,12 +59,42 @@ pub extern fn lua_pushinteger(L: *State, n: Integer) void;
 pub extern fn lua_pushlstring(L: *State, s: [*]const u8, len: usize) void;
 pub extern fn lua_pushcclosure(L: *State, f: CFunction, n: c_int) void;
 pub extern fn lua_tolstring(L: *State, index: c_int, len: *usize) ?[*]const u8;
+pub extern fn lua_toboolean(L: *State, index: c_int) c_int;
+pub extern fn lua_tonumber(L: *State, index: c_int) Number;
+pub extern fn lua_touserdata(L: *State, index: c_int) ?*anyopaque;
+pub extern fn lua_pushboolean(L: *State, b: c_int) void;
+pub extern fn lua_pushnumber(L: *State, n: Number) void;
+pub extern fn lua_pushlightuserdata(L: *State, p: *anyopaque) void;
+pub extern fn lua_next(L: *State, index: c_int) c_int;
+pub extern fn lua_error(L: *State) c_int;
 
 pub extern fn lua_createtable(L: *State, narr: c_int, nrec: c_int) void;
 pub extern fn lua_getfield(L: *State, index: c_int, key: [*:0]const u8) void;
 pub extern fn lua_setfield(L: *State, index: c_int, key: [*:0]const u8) void;
 pub extern fn lua_settable(L: *State, index: c_int) void;
+pub extern fn lua_rawget(L: *State, index: c_int) void;
+pub extern fn lua_rawset(L: *State, index: c_int) void;
 pub extern fn lua_rawseti(L: *State, index: c_int, n: c_int) void;
+
+/// Where a C closure's upvalue `n` (1-based) sits on its stack.
+pub fn upvalueIndex(n: c_int) c_int {
+    return globals_index - n;
+}
+
+/// `index` made absolute, so it survives pushes. 5.1 has no `lua_absindex`.
+pub fn absIndex(L: *State, index: c_int) c_int {
+    return if (index > 0 or index <= registry_index) index else lua_gettop(L) + index + 1;
+}
+
+/// Raise `message` as a Lua error from a C function. Does not return: the
+/// error unwinds to the enclosing `lua_pcall`, skipping the C frames between
+/// (build/luajit.zig builds without external unwinding), so a caller must
+/// hold nothing that needs releasing.
+pub fn raise(L: *State, message: []const u8) noreturn {
+    pushString(L, message);
+    _ = lua_error(L);
+    unreachable;
+}
 
 pub fn pop(L: *State, n: c_int) void {
     lua_settop(L, -n - 1);

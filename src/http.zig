@@ -382,6 +382,56 @@ pub fn parseResponse(r: *Io.Reader, method: RequestMethod) ParseError!Response {
     };
 }
 
+/// `parseResponse`, keeping the response for a workload that asked for it:
+/// the status, every header field of the head (not a chunked body's
+/// trailers), and the body as it arrived — still in its content-encoding,
+/// since zrk decodes none. A separate function rather than a flag, so the run
+/// without a `response` hook keeps a path that retains nothing.
+pub fn parseResponseCapturing(
+    r: *Io.Reader,
+    method: RequestMethod,
+    gpa: std.mem.Allocator,
+    capture: *workload.Capture,
+) ParseError!Response {
+    const Collect = struct {
+        gpa: std.mem.Allocator,
+        capture: *workload.Capture,
+        /// zurl calls `on_header` for trailers too, after the head.
+        head_done: bool = false,
+
+        fn onHeader(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (!self.head_done) self.capture.field(self.gpa, name, value);
+        }
+    };
+    capture.reset();
+    var collect: Collect = .{ .gpa = gpa, .capture = capture };
+    var options = parse_options;
+    options.on_header = Collect.onHeader;
+    options.ctx = &collect;
+
+    const head = zurl.parser.parseHead(r, options) catch |err| return mapError(err);
+    collect.head_done = true;
+    capture.status = head.status;
+
+    var sink: Io.Writer.Allocating = .fromArrayList(gpa, &capture.body);
+    defer capture.body = sink.toArrayList();
+    const body = zurl.parser.streamBody(r, head, method.toStd(), &sink.writer, options) catch |err| switch (err) {
+        // The sink is memory; it can only fail for want of it.
+        error.WriteFailed => {
+            capture.failed = true;
+            return error.ReadFailed;
+        },
+        else => return mapError(err),
+    };
+
+    return .{
+        .status = head.status,
+        .bytes = head.head_len + body.wire_len,
+        .keep_alive = body.keep_alive,
+    };
+}
+
 /// How zrk reads a response, fixed for the whole run.
 const parse_options: zurl.HeadOptions = .{
     // zrk sends no `accept-encoding`, but an origin may compress anyway, and a
@@ -769,4 +819,30 @@ test "a request's own Host replaces the default on every transport" {
         if (std.mem.eql(u8, f.name, ":authority")) authority = f.value;
     }
     try std.testing.expectEqualStrings("vhost.test", authority.?);
+}
+
+test "parseResponseCapturing keeps the head's fields and the body, not trailers" {
+    const raw = "HTTP/1.1 201 Created\r\nX-A: 1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "3\r\nabc\r\n2\r\nde\r\n0\r\nX-Trailer: t\r\n\r\n" ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var r: Io.Reader = .fixed(raw);
+    var capture: workload.Capture = .{};
+    defer capture.deinit(std.testing.allocator);
+
+    const first = try parseResponseCapturing(&r, .other, std.testing.allocator, &capture);
+    var again: Io.Reader = .fixed(raw);
+    const plain = try parseResponse(&again, .other);
+    // Framing and accounting are exactly the non-capturing path's.
+    try std.testing.expectEqual(plain, first);
+    const view = try capture.view(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), view.status);
+    try std.testing.expectEqual(@as(usize, 2), view.headers.len);
+    try std.testing.expectEqualStrings("X-A", view.headers[0].name);
+    try std.testing.expectEqualStrings("abcde", view.body);
+
+    // The next response on the connection starts from a clean capture.
+    _ = try parseResponseCapturing(&r, .other, std.testing.allocator, &capture);
+    const second = try capture.view(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), second.headers.len);
+    try std.testing.expectEqualStrings("ok", second.body);
 }

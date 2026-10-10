@@ -251,6 +251,18 @@ pub fn run(p: *Params) void {
     } else null;
     defer if (generator) |g| g.close();
 
+    // Responses, kept only for a workload that asked for them.
+    var collector_storage: Collector = undefined;
+    const collector: ?*Collector = if (generator) |g| blk: {
+        if (!g.wantsResponses()) break :blk null;
+        collector_storage = Collector.init(g, if (p.http2) @min(p.streams, streams_max) else 1) catch |err| {
+            failWorkload(p, err);
+            return;
+        };
+        break :blk &collector_storage;
+    } else null;
+    defer if (collector) |c| c.deinit();
+
     var read_buf: [read_buffer_size]u8 = undefined;
     var write_buf: [write_buffer_size]u8 = undefined;
 
@@ -353,6 +365,8 @@ pub fn run(p: *Params) void {
         // that cannot complete that never carried a request, so it counts as a
         // connect error — the same as a TLS handshake that failed above.
         var h2_session: h2conn.Session = .init(app_reader, app_writer);
+        // The serial exchange's observer; `runMultiplexed` installs its own.
+        if (collector) |c| h2_session.observer = c.serialObserver();
         if (p.http2) {
             // Bounded by the wire timeout, for the same reason `connect` above
             // is: a peer that accepts the connection and then never sends its
@@ -390,7 +404,7 @@ pub fn run(p: *Params) void {
         // — are exactly what a second open stream breaks.
         if (p.http2 and p.streams > 1) {
             const opened_at = now(io);
-            runMultiplexed(p, io, &h2_session, generator, fixed, &anchor, &send_index, &retry);
+            runMultiplexed(p, io, &h2_session, generator, collector, fixed, &anchor, &send_index, &retry);
             stream.close(io);
             // A connection that ended before it opened a single stream — a
             // GOAWAY straight after SETTINGS, from a proxy draining, or a read
@@ -511,7 +525,7 @@ pub fn run(p: *Params) void {
                 co_binds,
             );
 
-            const work = performWork(&wire, app_reader, app_writer, if (p.http2) &h2_session else null);
+            const work = performWork(&wire, app_reader, app_writer, if (p.http2) &h2_session else null, collector);
             if (wd_active) wd.disarm();
             const timed_out = wd.fired.load(.acquire);
             const deadline_hit = timed_out and wd.fired_co.load(.acquire);
@@ -562,6 +576,13 @@ pub fn run(p: *Params) void {
 
                     maybePublish(p, done.nanoseconds);
 
+                    // After the latency is taken, so the hook's cost is not
+                    // the server's. `send_index` already moved past it.
+                    if (collector) |c| c.respond(send_index - 1, 0) catch |err| {
+                        failWorkload(p, err);
+                        return;
+                    };
+
                     // A timer may have fired in the same event batch as the
                     // response; the response still counts, but the socket is
                     // shut down so the connection is dead.
@@ -581,6 +602,50 @@ pub fn run(p: *Params) void {
         }
     }
 }
+
+/// A connection's responses, kept for a workload's `response` hook: one
+/// capture per request that can be in flight at once, and the HTTP/2
+/// observers that fill them. Exists only when the workload has the hook; every
+/// other run reads responses exactly as before, keeping nothing.
+pub const Collector = struct {
+    generator: *workload.Generator,
+    gpa: std.mem.Allocator,
+    /// Indexed like the multiplexed path's slots; the serial paths use 0.
+    captures: []workload.Capture,
+    /// The serial HTTP/2 exchange's stream. A frame for any other is a late
+    /// one from a stream already finished, and is not this response's.
+    stream: u31 = 0,
+
+    pub fn init(generator: *workload.Generator, depth: u32) !Collector {
+        const gpa = generator.dynamic.allocator;
+        const captures = try gpa.alloc(workload.Capture, @max(depth, 1));
+        @memset(captures, .{});
+        return .{ .generator = generator, .gpa = gpa, .captures = captures };
+    }
+
+    pub fn deinit(c: *Collector) void {
+        for (c.captures) |*capture| capture.deinit(c.gpa);
+        c.gpa.free(c.captures);
+    }
+
+    pub fn respond(c: *Collector, seq: u64, index: usize) !void {
+        try c.generator.respond(seq, &c.captures[index]);
+    }
+
+    fn serialObserver(c: *Collector) h2conn.Observer {
+        return .{ .ctx = c, .field = serialField, .data = serialData };
+    }
+
+    fn serialField(ctx: *anyopaque, stream: u31, name: []const u8, value: []const u8) void {
+        const c: *Collector = @ptrCast(@alignCast(ctx));
+        if (stream == c.stream) c.captures[0].field(c.gpa, name, value);
+    }
+
+    fn serialData(ctx: *anyopaque, stream: u31, payload: []const u8) void {
+        const c: *Collector = @ptrCast(@alignCast(ctx));
+        if (stream == c.stream) c.captures[0].bodyBytes(c.gpa, payload);
+    }
+};
 
 /// Result of one send+receive attempt.
 const WorkResult = union(enum) {
@@ -819,6 +884,9 @@ const Mux = struct {
     /// generated. Null for the fixed request, which is `fixed`.
     generator: ?*workload.Generator,
     fixed: workload.Wire,
+    /// The connection loop's; see `Collector`. Its captures are indexed by
+    /// slot, and touched only under `state`.
+    collector: ?*Collector = null,
 
     /// Guards `slots` and the three flags below — and `p.histogram` and
     /// `p.counters`, which stop being the sender's private property the moment
@@ -897,6 +965,7 @@ const Mux = struct {
             for (mux.slots) |*slot| {
                 if (slot.busy) continue;
                 slot.* = .{ .busy = true };
+                if (mux.collector) |c| c.captures[mux.slotIndex(slot)].reset();
                 mux.active += 1;
                 return slot;
             }
@@ -953,8 +1022,46 @@ const Mux = struct {
         p.counters.completed += 1;
         p.counters.bytes += slot.bytes;
         p.counters.recordStatus(status);
+        // Before the slot is released, which would let the sender reuse its
+        // capture. Under `state`, which is safe to hold across it: the hook
+        // may wait for a workload's own lock, but nothing holding that lock
+        // ever waits for `state` — the sender generates outside it.
+        if (mux.collector) |c| {
+            const index = mux.slotIndex(slot);
+            c.captures[index].status = status;
+            c.respond(slot.seq, index) catch |err| failWorkload(p, err);
+        }
         mux.release(slot);
         maybePublish(p, done.nanoseconds);
+    }
+
+    fn slotIndex(mux: *const Mux, slot: *const Slot) usize {
+        return (@intFromPtr(slot) - @intFromPtr(mux.slots.ptr)) / @sizeOf(Slot);
+    }
+
+    /// The observer the receiver's reads feed: each field and DATA payload
+    /// into the capture of the slot its stream belongs to. A frame for a
+    /// stream no slot holds is a late one, and is dropped.
+    fn observer(mux: *Mux) h2conn.Observer {
+        return .{ .ctx = mux, .field = observeField, .data = observeData };
+    }
+
+    fn observeField(ctx: *anyopaque, stream: u31, name: []const u8, value: []const u8) void {
+        const mux: *Mux = @ptrCast(@alignCast(ctx));
+        const c = mux.collector orelse return;
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        const slot = mux.find(stream) orelse return;
+        c.captures[mux.slotIndex(slot)].field(c.gpa, name, value);
+    }
+
+    fn observeData(ctx: *anyopaque, stream: u31, payload: []const u8) void {
+        const mux: *Mux = @ptrCast(@alignCast(ctx));
+        const c = mux.collector orelse return;
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        const slot = mux.find(stream) orelse return;
+        c.captures[mux.slotIndex(slot)].bodyBytes(c.gpa, payload);
     }
 
     /// The connection is finished. Every stream still open loses its request
@@ -1233,6 +1340,7 @@ fn runMultiplexed(
     io: Io,
     session: *h2conn.Session,
     generator: ?*workload.Generator,
+    collector: ?*Collector,
     fixed: workload.Wire,
     anchor: *?Io.Timestamp,
     send_index: *u64,
@@ -1255,7 +1363,10 @@ fn runMultiplexed(
         .retry = retry,
         .generator = generator,
         .fixed = fixed,
+        .collector = collector,
     };
+    // Replaces the serial observer `run` installed: frames go to slots here.
+    if (collector != null) session.observer = mux.observer();
 
     var group: Io.Group = .init;
     defer group.cancel(io);
@@ -1612,15 +1723,27 @@ fn performWork(
     app_reader: *Io.Reader,
     app_writer: *Io.Writer,
     session: ?*h2conn.Session,
+    collector: ?*Collector,
 ) WorkResult {
-    if (session) |active| return performWorkHttp2(wire, active);
+    if (session) |active| {
+        const c = collector orelse return performWorkHttp2(wire, active);
+        // The observer fills capture 0 from this stream's frames only.
+        c.captures[0].reset();
+        c.stream = active.peekStream();
+        const work = performWorkHttp2(wire, active);
+        if (work == .ok) c.captures[0].status = work.ok.status;
+        return work;
+    }
     app_writer.writeAll(wire.http1) catch return .write_failed;
     // One flush is enough: the TLS writer in `tls.zig` seals *and* writes the
     // records to the socket handle itself, where `std.crypto.tls` only
     // encrypted into the socket writer's buffer and needed a second flush
     // behind it.
     app_writer.flush() catch return .write_failed;
-    const resp = httpmod.parseResponse(app_reader, wire.method) catch return .read_failed;
+    const resp = if (collector) |c|
+        httpmod.parseResponseCapturing(app_reader, wire.method, c.gpa, &c.captures[0]) catch return .read_failed
+    else
+        httpmod.parseResponse(app_reader, wire.method) catch return .read_failed;
     return .{ .ok = resp };
 }
 
@@ -3397,5 +3520,100 @@ test "a workload's requests reach an HTTP/2 server one per send, serial and mult
         try testing.expect(log.len >= counters.completed and log.len <= counters.completed + streams);
         try log.expectDense();
         try testing.expectEqual(@as(u32, 1), seq_path.closed.load(.monotonic));
+    }
+}
+
+/// A workload that keeps every response it is handed, to check what the
+/// transports deliver. Shared across connections, so it locks.
+const Responses = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    count: u64 = 0,
+    /// Responses whose body was not "hi" or that lacked `header`.
+    wrong: u64 = 0,
+    /// Responses for a `seq` that had already been answered.
+    repeated: u64 = 0,
+    seen: std.DynamicBitSetUnmanaged = .{},
+    header: []const u8,
+
+    fn asWorkload(r: *Responses) workload.Workload {
+        return .{ .ptr = r, .vtable = &.{ .open = open, .next = next, .close = close, .response = response } };
+    }
+
+    fn open(ptr: *anyopaque, index: u32) anyerror!*anyopaque {
+        _ = index;
+        return ptr;
+    }
+
+    fn next(ptr: *anyopaque, state: *anyopaque, seq: u64) anyerror!workload.Request {
+        _ = .{ ptr, state, seq };
+        return .{};
+    }
+
+    fn close(ptr: *anyopaque, state: *anyopaque) void {
+        _ = .{ ptr, state };
+    }
+
+    fn response(ptr: *anyopaque, state: *anyopaque, seq: u64, r: *const workload.Response) anyerror!void {
+        _ = state;
+        const self: *Responses = @ptrCast(@alignCast(ptr));
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.count += 1;
+        var has_header = false;
+        for (r.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, self.header)) has_header = true;
+        }
+        if (r.status != 200 or !std.mem.eql(u8, r.body, "hi") or !has_header) self.wrong += 1;
+        if (seq >= self.seen.bit_length) try self.seen.resize(testing.allocator, seq + 1024, false);
+        if (self.seen.isSet(seq)) self.repeated += 1;
+        self.seen.set(seq);
+    }
+};
+
+test "a workload's response hook gets every response, on every TCP transport" {
+    // HTTP/1.1, HTTP/2 one stream at a time, and HTTP/2 four streams deep: the
+    // three paths that collect a response differently.
+    for ([_]struct { http2: bool, streams: u32 }{
+        .{ .http2 = false, .streams = 1 },
+        .{ .http2 = true, .streams = 1 },
+        .{ .http2 = true, .streams = 4 },
+    }) |shape| {
+        var rt = try zio.Runtime.init(testing.allocator, .{});
+        defer rt.deinit();
+        const io = rt.io();
+
+        const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var server = try bind_addr.listen(io, .{ .reuse_address = true });
+        const port = server.socket.address.getPort();
+        const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+        var group: Io.Group = .init;
+        if (shape.http2) group.async(io, h2Serve, .{ io, &server }) else group.async(io, testServe, .{ io, &server });
+
+        var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+        defer histogram.deinit();
+        var counters: Counters = .{};
+        var stop = std.atomic.Value(bool).init(false);
+
+        var cfg: cli.Config = .{ .http2 = shape.http2, .streams = shape.streams };
+        cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+        // `testServe` names its length; `h2Serve` sends a content-type.
+        var responses: Responses = .{ .header = if (shape.http2) "content-type" else "content-length" };
+        defer responses.seen.deinit(testing.allocator);
+        var dynamic: workload.Dynamic = .{ .workload = responses.asWorkload(), .cfg = &cfg, .allocator = testing.allocator };
+
+        const start = Io.Timestamp.now(io, .awake);
+        var params = muxParams(io, server_addr, &.{}, shape.streams, start.addDuration(Io.Duration.fromMilliseconds(200)), 50 * std.time.ns_per_ms, &stop, &histogram, &counters);
+        params.http2 = shape.http2;
+        params.dynamic = &dynamic;
+        run(&params);
+        group.await(io) catch {};
+        server.deinit(io);
+
+        try testing.expect(counters.completed > 10);
+        try testing.expectEqual(@as(?anyerror, null), dynamic.failure.get());
+        try testing.expectEqual(counters.completed, responses.count);
+        try testing.expectEqual(@as(u64, 0), responses.wrong);
+        try testing.expectEqual(@as(u64, 0), responses.repeated);
     }
 }

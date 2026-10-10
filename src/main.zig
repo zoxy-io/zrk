@@ -120,8 +120,18 @@ pub fn main(init: std.process.Init) !void {
         if (!ts_stdout) ts_file.close(io);
     };
 
-    var progress: Progress = .{ .io = io, .dash = if (json or ts_stdout) null else &dash, .ts = ts_ptr };
-    const active = progress.dash != null or progress.ts != null;
+    // `done(summary, latency, requests)` wants requests per second over time,
+    // which only the progress rows see.
+    var rates: std.ArrayList(f64) = .empty;
+    const wants_rates = if (script) |s| s.hooks.done else false;
+    var progress: Progress = .{
+        .io = io,
+        .dash = if (json or ts_stdout) null else &dash,
+        .ts = ts_ptr,
+        .rates = if (wants_rates) &rates else null,
+        .gpa = arena,
+    };
+    const active = progress.dash != null or progress.ts != null or progress.rates != null;
     const ctx: ?*anyopaque = if (active) @ptrCast(&progress) else null;
     const cb: ?runner.ProgressFn = if (active) onProgress else null;
 
@@ -182,6 +192,30 @@ pub fn main(init: std.process.Init) !void {
     // Optional HdrHistogram percentile distribution (.hgrm) export.
     if (cfg.hdr_path) |path| {
         try writeHdrFile(io, path, &snapshot.hist);
+    }
+
+    // wrk calls `done` after its report, interrupted or not.
+    if (script) |s| {
+        const c = snapshot.counters;
+        const summary: script_mod.Script.Summary = .{
+            .duration_us = @intFromFloat(result.elapsed_s * std.time.us_per_s),
+            .requests = c.completed,
+            .bytes = c.bytes,
+            .errors = .{
+                .connect = c.connect_errors,
+                .read = c.read_errors,
+                .write = c.write_errors,
+                .status = c.status_errors,
+                .timeout = c.timeouts,
+                .deadline = c.deadline_errors,
+            },
+            .latency = &snapshot.hist,
+            .rates = rates.items,
+        };
+        s.done(&summary) catch |err| {
+            try printScriptError(io, cfg.script_path.?, diagnostic.message() orelse @errorName(err));
+            std.process.exit(1);
+        };
     }
 
     // An interrupted run is not a result to gate on: it covers less than
@@ -428,6 +462,11 @@ const Progress = struct {
     /// wake — this callback fires up to 12.5x a second with a live dashboard.
     dash_failed: bool = false,
     ts_failed: bool = false,
+    /// Requests per second per row, for a script's `done`; null otherwise.
+    rates: ?*std.ArrayList(f64) = null,
+    gpa: std.mem.Allocator,
+    rows_completed: u64 = 0,
+    rows_elapsed_s: f64 = 0,
 };
 
 fn onProgress(
@@ -449,6 +488,16 @@ fn onProgress(
             p.dash_failed = true;
             warnSinkFailed(p.io, "dashboard", err);
         }
+    };
+    if (tick.row) if (p.rates) |rates| {
+        const window_s = elapsed_s - p.rows_elapsed_s;
+        if (window_s > 0) {
+            const completed = snapshot.counters.completed -| p.rows_completed;
+            // A sample lost to memory is a sample, not a reason to stop.
+            rates.append(p.gpa, @as(f64, @floatFromInt(completed)) / window_s) catch {};
+        }
+        p.rows_completed = snapshot.counters.completed;
+        p.rows_elapsed_s = elapsed_s;
     };
     if (tick.row) if (p.ts) |t| t.record(snapshot, elapsed_s) catch |err| {
         if (!p.ts_failed) {
