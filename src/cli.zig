@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 // is rather than restated here.
 const connection = @import("connection.zig");
 const h3conn = @import("h3conn.zig");
+const workload = @import("workload.zig");
 
 /// zrk version string, surfaced by `--version` and embedded in JSON reports.
 /// Single-sourced from build.zig.zon via the build's options module.
@@ -174,6 +175,15 @@ pub const Config = struct {
     max_error_rate: ?f64 = null,
 
     url: Url = undefined,
+
+    /// Generate every request instead of replaying the fixed one that `-m`,
+    /// `-H`, `-b` and `url.target` describe. Library only: the CLI never sets
+    /// it. Null keeps the replay path, untouched — see `workload.zig`.
+    ///
+    /// The run still uses `url` for where to connect and `disable_keepalive`
+    /// for how, and still builds the fixed request at startup, so the flags
+    /// above remain validated even when the workload replaces them.
+    workload: ?workload.Workload = null,
 
     /// True when `--timeseries -` handed stdout to the NDJSON stream, so it can
     /// be piped straight into a live plotter. stdout then belongs to the rows:

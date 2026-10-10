@@ -67,6 +67,7 @@ const conn = @import("connection.zig");
 const httpmod = @import("http.zig");
 const tlsmod = @import("tls.zig");
 const quic_tls = @import("quic_tls.zig");
+const workload = @import("workload.zig");
 
 /// Request streams this endpoint tracks at once, which is the ceiling on
 /// `--streams` for an HTTP/3 run.
@@ -270,6 +271,15 @@ const Slot = struct {
     /// the first. A second refusal is charged rather than retried, so a peer
     /// that declines everything is a run of errors and not a silent loop.
     retried: bool = false,
+    /// The schedule position the request was generated for, so a retry asks a
+    /// workload for the same request again. See `workload.Workload.VTable`.
+    seq: u64 = 0,
+};
+
+/// A declined request waiting to go out again. See `State.retry`.
+const Retry = struct {
+    scheduled: Io.Timestamp,
+    seq: u64,
 };
 
 /// Everything one connection needs that is too large for a coroutine stack.
@@ -307,7 +317,7 @@ pub const State = struct {
     /// Kept across reconnects — the next connection is where they are sent.
     /// Never more than the slot table: an entry only ever comes out of a busy
     /// slot, and `issue` fills a slot from here before it takes a new one.
-    retry: [requests_max]Io.Timestamp = undefined,
+    retry: [requests_max]Retry = undefined,
     retry_len: usize = 0,
 
     datagram: [Connection.datagram_octets]u8 = undefined,
@@ -347,28 +357,46 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
     defer scratch.deinit();
     const tmp = scratch.allocator();
 
-    const fields = try httpmod.buildRequestFields(tmp, cfg);
+    const fixed: workload.Fixed = .init(cfg);
+    const fields = try httpmod.buildRequestFields(tmp, cfg, &fixed.request);
+    const buffer = try tmp.alloc(u8, request_octets_max);
+    return allocator.dupe(u8, try encodeRequest(tmp, buffer, fields, cfg.body));
+}
+
+/// Encode one request's HEADERS frame, and a DATA frame for `body` when there
+/// is one, into `buffer`; returns the octets written, which borrow it.
+/// `scratch` holds the QPACK-typed copy of the field list.
+///
+/// The fixed request is this, once. A workload's are this per send, into a
+/// buffer each connection keeps (see `workload.Generator`). `buffer` past
+/// `request_octets_max` buys nothing: a stream's send buffer is that size, and
+/// `issue` refuses a request it cannot write whole.
+pub fn encodeRequest(
+    scratch: std.mem.Allocator,
+    buffer: []u8,
+    fields: []const httpmod.Field,
+    body: []const u8,
+) ![]const u8 {
     // Into h3's field type at the last moment; see `http.Field`.
-    const qpack_fields = try tmp.alloc(h3.qpack.Field, fields.len);
+    const qpack_fields = try scratch.alloc(h3.qpack.Field, fields.len);
     for (qpack_fields, fields) |*out, in| out.* = .{ .name = in.name, .value = in.value };
 
-    var buffer: [request_octets_max]u8 = undefined;
     // `writeHeaders` reads nothing off the instance — it is a method only
     // because the rest of the frame writers are — so a throwaway one encodes
     // the block that every real connection will replay.
     var encoder: Http3 = .init(.client);
-    var written = encoder.writeHeaders(&buffer, qpack_fields) catch return error.RequestTooLarge;
+    var written = encoder.writeHeaders(buffer, qpack_fields) catch return error.RequestTooLarge;
 
-    if (cfg.body.len > 0) {
-        const header = Http3.writeData(buffer[written..], cfg.body.len) catch
+    if (body.len > 0) {
+        const header = Http3.writeData(buffer[written..], body.len) catch
             return error.RequestTooLarge;
         written += header;
-        if (written + cfg.body.len > buffer.len) return error.RequestTooLarge;
-        @memcpy(buffer[written..][0..cfg.body.len], cfg.body);
-        written += cfg.body.len;
+        if (written + body.len > buffer.len) return error.RequestTooLarge;
+        @memcpy(buffer[written..][0..body.len], body);
+        written += body.len;
     }
 
-    return allocator.dupe(u8, buffer[0..written]);
+    return buffer[0..written];
 }
 
 /// Run one HTTP/3 connection until `end` (or `stop`). Never returns an error:
@@ -390,8 +418,21 @@ pub fn run(p: *conn.Params) void {
     var anchor: ?Io.Timestamp = null;
     var send_index: u64 = 0;
 
+    // A dynamic workload's requests, generated per send. Like `send_index`,
+    // it outlives every attempt, so a request generated before a reconnect is
+    // the one sent after it.
+    var generator_storage: workload.Generator = undefined;
+    const generator: ?*workload.Generator = if (p.dynamic) |dynamic| blk: {
+        generator_storage = workload.Generator.open(dynamic, .http3, p.index) catch |err| {
+            conn.failWorkload(p, err);
+            return;
+        };
+        break :blk &generator_storage;
+    } else null;
+    defer if (generator) |g| g.close();
+
     while (!p.stop.load(.monotonic) and conn.now(io).nanoseconds < p.end.nanoseconds) {
-        serve(p, state, &anchor, &send_index);
+        serve(p, state, generator, &anchor, &send_index);
         if (p.stop.load(.monotonic)) return;
         if (conn.now(io).nanoseconds >= p.end.nanoseconds) return;
         // A connection the peer retired with GOAWAY is replaced at once. The
@@ -406,7 +447,13 @@ pub fn run(p: *conn.Params) void {
 }
 
 /// One connection attempt: bind, handshake, serve requests, close.
-fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u64) void {
+fn serve(
+    p: *conn.Params,
+    state: *State,
+    generator: ?*workload.Generator,
+    anchor: *?Io.Timestamp,
+    send_index: *u64,
+) void {
     const io = p.io;
     // Before anything that can fail: `run` reads this to decide whether the
     // attempt ended in a GOAWAY, and a stale one would skip its backoff.
@@ -496,7 +543,7 @@ fn serve(p: *conn.Params, state: *State, anchor: *?Io.Timestamp, send_index: *u6
 
         if (state.connection.state == .established) {
             if (!state.http3_started and !startHttp3(p, state)) return;
-            issue(p, state, anchor, send_index);
+            issue(p, state, generator, anchor, send_index);
         }
 
         expire(p, state);
@@ -911,6 +958,7 @@ fn startHttp3(p: *conn.Params, state: *State) bool {
 fn issue(
     p: *conn.Params,
     state: *State,
+    generator: ?*workload.Generator,
     anchor: *?Io.Timestamp,
     send_index: *u64,
 ) void {
@@ -930,20 +978,30 @@ fn issue(
         // named. What is still waiting goes out on the next connection.
         if (state.goaway != null) return;
 
-        const t = conn.now(io);
-        if (t.nanoseconds >= p.end.nanoseconds) return;
-
         // A request the peer declined goes first, at the time it was scheduled
         // for — it is older than anything the schedule has due, and it is not
         // a new request, so it does not advance `send_index`.
         const retrying = state.retry_len > 0;
+        const seq = if (retrying) state.retry[0].seq else send_index.*;
+
+        // Generated before the clock is read, so that its cost is never part
+        // of a latency: a send that is not due yet returns below, and comes
+        // back to find this request already held; a closed-loop send reads its
+        // `scheduled` time after it.
+        const request = if (generator) |g| (g.at(seq) catch |err| {
+            conn.failWorkload(p, err);
+            return;
+        }).http3 else p.h3_request;
+
+        const t = conn.now(io);
+        if (t.nanoseconds >= p.end.nanoseconds) return;
 
         // Closed loop has no schedule to solve: the send is intended for
         // whenever a stream frees, which degenerately zeroes the pacing wait,
         // the deadline check and the coordinated-omission correction, leaving
         // genuine round-trip latency.
         if (anchor.* == null) anchor.* = t;
-        const scheduled = if (retrying) state.retry[0] else if (p.schedule == .closed) t else blk: {
+        const scheduled = if (retrying) state.retry[0].scheduled else if (p.schedule == .closed) t else blk: {
             const offset = p.schedule.offsetNs(send_index.*, p.phase);
             break :blk anchor.*.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
         };
@@ -966,7 +1024,7 @@ fn issue(
         }
 
         const id = state.next_stream;
-        const written = state.connection.write(id, p.h3_request, true) catch |err| switch (err) {
+        const written = state.connection.write(id, request, true) catch |err| switch (err) {
             // Backpressure, not a failure. The stream table is full of streams
             // that have finished and are waiting their turn to retire (see
             // `streams_max`), or the peer's connection-level window is spent.
@@ -981,7 +1039,7 @@ fn issue(
                 return;
             },
         };
-        if (written != p.h3_request.len) {
+        if (written != request.len) {
             // The stream send buffer could not take the whole request. A fresh
             // stream's buffer is empty and `cli.zig` bounds `--body` against
             // it, so this is unreachable for a well-formed run — and a
@@ -1021,6 +1079,7 @@ fn issue(
             .deadline_ns = if (co_binds) co_deadline_ns else wire_deadline_ns,
             .deadline_co = co_binds,
             .retried = retrying,
+            .seq = seq,
         };
     }
 }
@@ -1033,7 +1092,7 @@ fn advance(state: *State, send_index: *u64, retrying: bool) void {
         return;
     }
     std.mem.copyForwards(
-        Io.Timestamp,
+        Retry,
         state.retry[0 .. state.retry_len - 1],
         state.retry[1..state.retry_len],
     );
@@ -1053,10 +1112,10 @@ fn requeue(p: *conn.Params, state: *State, slot: *Slot) void {
     // In scheduled order, which is not the slot table's: a GOAWAY hands its
     // requests over in whatever order the table holds them.
     var at = state.retry_len;
-    while (at > 0 and state.retry[at - 1].nanoseconds > slot.scheduled.nanoseconds) : (at -= 1) {
+    while (at > 0 and state.retry[at - 1].scheduled.nanoseconds > slot.scheduled.nanoseconds) : (at -= 1) {
         state.retry[at] = state.retry[at - 1];
     }
-    state.retry[at] = slot.scheduled;
+    state.retry[at] = .{ .scheduled = slot.scheduled, .seq = slot.seq };
     state.retry_len += 1;
     release(state, slot);
 }
@@ -1835,8 +1894,8 @@ test "a GOAWAY retries what the peer never processed and leaves the rest to fini
     // the time they were due rather than the time of the retry.
     try testing.expectEqual(@as(u64, 0), f.counters.read_errors);
     try testing.expectEqual(@as(usize, 2), f.state.retry_len);
-    try testing.expectEqual(@as(i96, 200), f.state.retry[0].nanoseconds);
-    try testing.expectEqual(@as(i96, 300), f.state.retry[1].nanoseconds);
+    try testing.expectEqual(@as(i96, 200), f.state.retry[0].scheduled.nanoseconds);
+    try testing.expectEqual(@as(i96, 300), f.state.retry[1].scheduled.nanoseconds);
 }
 
 test "a GOAWAY naming anything but a client request stream is a connection error" {
@@ -1911,13 +1970,13 @@ test "retries go out oldest first and do not advance the schedule" {
     // Handed over out of order, as a GOAWAY walking the slot table would.
     requeue(&f.params, f.state, f.inFlight(4, 200));
     requeue(&f.params, f.state, f.inFlight(0, 100));
-    try testing.expectEqual(@as(i96, 100), f.state.retry[0].nanoseconds);
+    try testing.expectEqual(@as(i96, 100), f.state.retry[0].scheduled.nanoseconds);
 
     var send_index: u64 = 7;
     advance(f.state, &send_index, true);
     try testing.expectEqual(@as(u64, 7), send_index);
     try testing.expectEqual(@as(usize, 1), f.state.retry_len);
-    try testing.expectEqual(@as(i96, 200), f.state.retry[0].nanoseconds);
+    try testing.expectEqual(@as(i96, 200), f.state.retry[0].scheduled.nanoseconds);
 
     advance(f.state, &send_index, false);
     try testing.expectEqual(@as(u64, 8), send_index);
