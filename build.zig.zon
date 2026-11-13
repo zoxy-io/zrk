@@ -26,8 +26,8 @@
         // the TLS it does carry is std's, not a second libcrypto. Its one
         // transitive pin, hparse, is std-only too.
         .zurl = .{
-            .url = "git+https://github.com/zoxy-io/zurl#447455173bc19546f2450c17fe2400cae7621ea9",
-            .hash = "zurl-0.0.2--VALCsF8BQCik_DZKL8GUIRgOrV-otAdOMe82gQU6Qs6",
+            .url = "git+https://github.com/zoxy-io/zurl#41a3637f7227f208f503295125e1119f91c9851a",
+            .hash = "zurl-0.0.2--VALCsF8BQDs0vOh8b6HYkJHXz0sg6P3sVL34bWgpnD6",
         },
         // TLS 1.3, and the libcrypto under it — one dependency, one module,
         // with no system OpenSSL involved. build.zig has the build-side
