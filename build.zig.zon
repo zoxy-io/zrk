@@ -12,8 +12,8 @@
         // The HTTP/2 frame codec and HPACK, shared with zoxy. See build.zig
         // for why zrk builds it with `assertions = false`.
         .h2 = .{
-            .url = "git+https://github.com/zoxy-io/h2#ce82b9a886435d8fdd53e1a8cfbe72ed918fb53e",
-            .hash = "h2-0.0.0--ngLtzZFBgCrbAucjP1hgw2-vJ2K12mf-04oR-EdzitD",
+            .url = "git+https://github.com/zoxy-io/h2#6ef0d254941ebad95de66f65ac430fd7b97f723d",
+            .hash = "h2-0.0.0--ngLt3paAwAQ-uHQ-iI5k5VsIYc3EGztzQF-c2OBj1Z_",
         },
         // A std.Io-native HTTP/1.1 client. zrk imports one layer of it, the
         // response parser, which owns framing — chunked, bodyless statuses,
@@ -26,8 +26,8 @@
         // the TLS it does carry is std's, not a second libcrypto. Its one
         // transitive pin, hparse, is std-only too.
         .zurl = .{
-            .url = "git+https://github.com/zoxy-io/zurl#4ecb1768985425d4f09b317f23f203983ef87d96",
-            .hash = "zurl-0.0.0--VALCi1dBQA6i4gkVVX11IV13I784dueJYYAzyZZTBPz",
+            .url = "git+https://github.com/zoxy-io/zurl#447455173bc19546f2450c17fe2400cae7621ea9",
+            .hash = "zurl-0.0.2--VALCsF8BQCik_DZKL8GUIRgOrV-otAdOMe82gQU6Qs6",
         },
         // TLS 1.3, and the libcrypto under it — one dependency, one module,
         // with no system OpenSSL involved. build.zig has the build-side
@@ -46,8 +46,8 @@
         // it every HTTPS connection to a Go server (Caddy, Traefik, net/http)
         // failed on its first read.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#9a9448014596c16f7b5c5b5c3ce2a9919f799e47",
-            .hash = "zssl-0.0.1-5ocyiLfSEAC7WHwl8JhFXEiYfNXzPxTtDfGeuUspoqtQ",
+            .url = "git+https://github.com/zoxy-io/zssl#827c7e5002aef45cc2a14f99200bdf288f4a0f0c",
+            .hash = "zssl-0.0.1-5ocyiJXbEACoixJ3negjZSa8wikXraZUW4VPpKKa_5bO",
         },
         // QUIC, QPACK and HTTP/3 — sans-I/O, like h2 and zssl. It opens no
         // socket, reads no clock, draws no entropy and runs no TLS handshake:
@@ -60,8 +60,8 @@
         // past thirty-two packets. `src/h3conn.zig` has the diagnosis.
         //
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#3accaf4b8d35d299315927296c0bc49b5f5ffc3a",
-            .hash = "h3-0.0.0-RBkp8tYDFwAKtZHosUA5okrC2lg9y6gFkh4BZvmtvZSI",
+            .url = "git+https://github.com/zoxy-io/h3#8c55579794a170e7639ee644c634717c7076b1e5",
+            .hash = "h3-0.0.0-RBkp8pBfFwBQa2xrGOJMBwrtMfzLfONSfNoU3NWiVCKy",
         },
         // LuaJIT 2.1, for `--script`: what wrk links, so wrk scripts — Lua 5.1
         // plus `bit` and `unpack` — run unchanged. Built from source by
