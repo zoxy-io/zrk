@@ -58,7 +58,7 @@ pub fn build(
         .name = "minilua",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
             .sanitize_c = .off,
         }),
@@ -109,7 +109,7 @@ pub fn build(
         .name = "buildvm",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
             .sanitize_c = .off,
         }),

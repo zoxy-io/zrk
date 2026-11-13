@@ -22,9 +22,14 @@ fn nativeLibcGuard(b: *std.Build, target: std.Build.ResolvedTarget) ?*std.Build.
     // Only native builds probe this machine; a cross target uses the libc Zig
     // ships for it.
     if (!target.query.isNative()) return null;
+    // Everything below reads the environment, and Zig's configuration cache
+    // keys on neither it nor PATH. Left pure, a configuration made with
+    // ZIG_LIBC set would be replayed after it was unset, guard and all
+    // missing. `findProgram` poisons on its own, but only if it is reached.
+    b.graph.poisonCache();
     // An explicit libc description answers the same question `cc` would.
     if (b.graph.environ_map.get("ZIG_LIBC") != null) return null;
-    if (b.findProgram(&.{ "cc", "gcc", "clang" }, &.{})) |_| return null else |_| {}
+    if (b.findProgram(.{ .names = &.{ "cc", "gcc", "clang" } }) != null) return null;
 
     return &b.addFail(
         \\no C compiler on PATH, so Zig cannot detect this machine's libc.
@@ -198,9 +203,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // `zig build bench`: the histogram publish/aggregate microbenchmark.
     // Always ReleaseFast so the numbers mean something.
@@ -209,7 +212,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "zrk", .module = mod },
             },

@@ -146,7 +146,7 @@ is unaffected by any of this.
 `runner.run` takes a `std.Io` instance as a plain parameter, so any conforming
 `std.Io` implementation can be passed in. In practice, zrk dials each
 connection with a connect timeout (`address.connect(io, .{ .timeout = ... })`),
-and Zig 0.16's default `std.Io.Threaded` backend hasn't implemented
+and Zig 0.17's default `std.Io.Threaded` backend hasn't implemented
 connect-with-timeout yet (it's a TODO panic there). [zio](https://github.com/lalinsky/zio)
 does implement it, which is why zio is a hard dependency of the `zrk` package
 itself (see `build.zig.zon`) and the runtime zrk's own CLI constructs at

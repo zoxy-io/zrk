@@ -503,7 +503,7 @@ pub const Session = struct {
     /// instead.
     pub fn resetStream(session: *Session, stream: u31) Error!void {
         var payload: [4]u8 = undefined;
-        std.mem.writeInt(u32, &payload, @intFromEnum(frame.ErrorCode.cancel), .big);
+        std.mem.writeInt(u32, &payload, @backingInt(frame.ErrorCode.cancel), .big);
         try session.writeFrame(.rst_stream, 0, stream, &payload);
         session.writer.flush() catch return error.Io;
     }
@@ -731,7 +731,7 @@ pub const Session = struct {
         };
         comptime std.debug.assert(entries.len <= settings_entries_max);
         for (entries) |entry| {
-            std.mem.writeInt(u16, payload[used..][0..2], @intFromEnum(entry[0]), .big);
+            std.mem.writeInt(u16, payload[used..][0..2], @backingInt(entry[0]), .big);
             std.mem.writeInt(u32, payload[used + 2 ..][0..4], entry[1], .big);
             used += 6;
         }
@@ -1250,7 +1250,7 @@ test "GOAWAY stops new streams, and refuses the ones past its last" {
     var used: usize = 0;
     used += renderFrame(wire[used..], .settings, 0, 0, &.{});
     // Last-stream-id 0, error code 0: a graceful shutdown that took nothing.
-    used += renderFrame(wire[used..], .goaway, 0, 0, &[_]u8{0} ** 8);
+    used += renderFrame(wire[used..], .goaway, 0, 0, &@as([8]u8, @splat(0)));
 
     var reader: Io.Reader = .fixed(wire[0..used]);
     var out: [4096]u8 = undefined;

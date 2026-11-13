@@ -460,7 +460,7 @@ pub const Dashboard = struct {
         // Select which fit by ascending `keep` priority (visible width = label +
         // space + value; color codes add no columns; segments joined by 3 spaces),
         // then render the survivors in display order so the line never wraps.
-        var show = [_]bool{false} ** pctls.len;
+        var show: [pctls.len]bool = @splat(false);
         var used: usize = 0;
         var shown: usize = 0;
         for (0..pctls.len) |prio| {

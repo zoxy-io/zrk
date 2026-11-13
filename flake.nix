@@ -28,7 +28,7 @@
         in
         pkgs.mkShell {
           packages = with pkgs; [
-            zig_0_16
+            zig_0_17
             zls
           ] ++ (if pkgs.stdenv.hostPlatform.isLinux then [ pkgs.kcov ] else []);
         }

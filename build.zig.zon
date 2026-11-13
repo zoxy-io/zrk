@@ -2,12 +2,12 @@
     .name = .zrk,
     .version = "3.0.0",
     .fingerprint = 0x614e97303b45a75a, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // The runtime. Connections run as coroutines on zio's event loop.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.19.1#4daa0c0a9522a37c4d28e3dcec2515cc955abe71",
-            .hash = "zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#c0a6b5877c9bbc71d2d2c0b3374ce7fa61a4ec12",
+            .hash = "zio-0.20.1-xHbVVI0wLwDgE2dXWDCWH0UfCQYEhnBYHs1Td12oAGeR",
         },
         // The HTTP/2 frame codec and HPACK, shared with zoxy. See build.zig
         // for why zrk builds it with `assertions = false`.
