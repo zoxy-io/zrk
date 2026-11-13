@@ -134,10 +134,16 @@ const group_x25519: u16 = 0x001d;
 
 /// RFC 8446 section 4.1.3: the `Random` a server sends to mean
 /// HelloRetryRequest. Recognised so that the failure names itself.
-const hello_retry_request_random: [32]u8 = [16]u8{
+///
+/// It is SHA-256 of "HelloRetryRequest", and a test holds it to that: the
+/// second half was once sixteen zero octets, which no server sends, and the
+/// test that feeds a retry through `read` built its retry from this same
+/// constant, so it kept passing while every real retry went unrecognised.
+const hello_retry_request_random: [32]u8 = .{
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02,
-    0x1e, 0x65, 0xb8, 0x91,
-} ++ @as([16]u8, @splat(0));
+    0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e,
+    0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+};
 
 pub const Error = error{
     /// A message, extension or length field that does not parse, or a length
@@ -1148,6 +1154,14 @@ test "a partial handshake message is left for the next call" {
     try testing.expectEqual(@as(usize, 0), try client.read(.initial, &partial));
     // And a header that is itself incomplete.
     try testing.expectEqual(@as(usize, 0), try client.read(.initial, partial[0..3]));
+}
+
+test "the HelloRetryRequest random is RFC 8446's, not a copy of itself" {
+    // Derived from its definition rather than compared with a second
+    // literal, because a mistyped constant is exactly what this guards.
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash("HelloRetryRequest", &digest, .{});
+    try testing.expectEqualSlices(u8, &digest, &hello_retry_request_random);
 }
 
 test "a HelloRetryRequest is refused by name rather than parsed as a ServerHello" {
