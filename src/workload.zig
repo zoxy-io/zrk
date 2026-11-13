@@ -403,7 +403,7 @@ pub const TimingSummary = struct {
 pub const Failure = struct {
     code: std.atomic.Value(Code) = .init(0),
 
-    const Code = std.meta.Int(.unsigned, @bitSizeOf(anyerror));
+    const Code = @Int(.unsigned, @bitSizeOf(anyerror));
 
     pub fn record(failure: *Failure, err: anyerror) void {
         _ = failure.code.cmpxchgStrong(0, @intFromError(err), .acq_rel, .monotonic);

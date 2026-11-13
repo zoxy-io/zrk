@@ -51,7 +51,7 @@ pub const Counters = struct {
     max_behind_ns: u64 = 0,
     /// Completed responses bucketed by status class, indexed by status/100
     /// (so [1]=1xx .. [5]=5xx; index 0 is unused). Sums to `completed`.
-    status_class: [6]u64 = [_]u64{0} ** 6,
+    status_class: [6]u64 = @splat(0),
     /// Why the first connection that could not be established failed — a
     /// refused port, a certificate, a handshake that never finished. Kept so a
     /// run in which nothing succeeded can say why, instead of reporting a bare

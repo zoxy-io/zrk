@@ -270,8 +270,7 @@ pub const State = struct {
     fn fillRecords(self: *State) RecordError!void {
         const room = self.records.writable();
         var data: [1][]u8 = .{room};
-        const n = self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &data) catch
-            return error.TransportFailed;
+        const n = self.stream.read(self.io, &data) catch return error.TransportFailed;
         if (n == 0) return error.PeerClosed;
         self.records.advance(n);
     }
@@ -290,13 +289,11 @@ pub const State = struct {
         var rest = bytes;
         while (rest.len != 0) {
             const data: [1][]const u8 = .{rest};
-            const n = self.io.vtable.netWrite(
-                self.io.userdata,
-                self.stream.socket.handle,
-                "",
-                &data,
-                1,
-            ) catch return error.TransportFailed;
+            const result = self.io.operate(.{ .net_write = .{
+                .socket_handle = self.stream.socket.handle,
+                .data = &data,
+            } }) catch return error.TransportFailed;
+            const n = result.net_write catch return error.TransportFailed;
             rest = rest[n..];
         }
     }

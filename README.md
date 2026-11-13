@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml)
 
-A constant-throughput HTTP load generator — a Zig 0.16 rewrite of
+A constant-throughput HTTP load generator — a Zig 0.17 rewrite of
 [wrk2](https://github.com/giltene/wrk2) with a live in-terminal dashboard.
 
 - **Corrected for coordinated omission.** Latency is measured from the time a
@@ -47,7 +47,7 @@ Linux and macOS, x86_64 and aarch64. Windows binaries were dropped after v1.4.3
 
 ### Build from source
 
-Requires Zig 0.16.
+Requires Zig 0.17.
 
 ```sh
 zig build                 # produces zig-out/bin/zrk

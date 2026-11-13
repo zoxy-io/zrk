@@ -134,10 +134,16 @@ const group_x25519: u16 = 0x001d;
 
 /// RFC 8446 section 4.1.3: the `Random` a server sends to mean
 /// HelloRetryRequest. Recognised so that the failure names itself.
+///
+/// It is SHA-256 of "HelloRetryRequest", and a test holds it to that: the
+/// second half was once sixteen zero octets, which no server sends, and the
+/// test that feeds a retry through `read` built its retry from this same
+/// constant, so it kept passing while every real retry went unrecognised.
 const hello_retry_request_random: [32]u8 = .{
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02,
-    0x1e, 0x65, 0xb8, 0x91,
-} ++ .{0} ** 16;
+    0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e,
+    0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+};
 
 pub const Error = error{
     /// A message, extension or length field that does not parse, or a length
@@ -195,7 +201,7 @@ const leaf_key_octets: usize = 600;
 
 /// RFC 8446 section 4.4.3: what a server's `CertificateVerify` signs, ahead of
 /// the transcript hash.
-const certificate_verify_context = [_]u8{0x20} ** 64 ++ "TLS 1.3, server CertificateVerify" ++ [_]u8{0};
+const certificate_verify_context = @as([64]u8, @splat(0x20)) ++ "TLS 1.3, server CertificateVerify" ++ [_]u8{0};
 
 /// A traffic secret to hand to `Connection.installSecret`, held until the
 /// caller drains it. An array rather than an event queue with slices in it:
@@ -308,10 +314,7 @@ pub const Client = struct {
     pub fn init(options: Options) Client {
         return .{
             .random = options.random,
-            // X25519 accepts any 32 octets as a private key: it clamps, and
-            // the only failure `generateDeterministic` reports is an identity
-            // element, which a seed cannot produce.
-            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed) catch unreachable,
+            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed),
             .server_name = options.server_name,
             .alpn = options.alpn,
             .chain_verifier = options.chain_verifier,
@@ -327,7 +330,7 @@ pub const Client = struct {
     pub fn clientHello(self: *Client, buffer: []u8) Error![]const u8 {
         var out: Writer = .{ .buffer = buffer };
 
-        try out.byte(@intFromEnum(MessageType.client_hello));
+        try out.byte(@backingInt(MessageType.client_hello));
         const body = try out.beginLength(3);
         {
             // `legacy_version` is 1.2 on the wire for every TLS 1.3 hello; the
@@ -339,7 +342,7 @@ pub const Client = struct {
             try out.byte(0);
 
             const suites = try out.beginLength(2);
-            for (self.offer) |one| try out.int(u16, @intFromEnum(one));
+            for (self.offer) |one| try out.int(u16, @backingInt(one));
             try out.endLength(suites);
 
             // One compression method, `null`. TLS 1.3 permits nothing else.
@@ -359,7 +362,7 @@ pub const Client = struct {
 
     fn writeExtensions(self: *Client, out: *Writer) Error!void {
         // server_name: a list of one, of type `host_name`.
-        try out.int(u16, @intFromEnum(Extension.server_name));
+        try out.int(u16, @backingInt(Extension.server_name));
         var extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -372,7 +375,7 @@ pub const Client = struct {
         try out.endLength(extension);
 
         // supported_groups: X25519 alone. See the module comment on HRR.
-        try out.int(u16, @intFromEnum(Extension.supported_groups));
+        try out.int(u16, @backingInt(Extension.supported_groups));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -385,7 +388,7 @@ pub const Client = struct {
         // verifies a signature, its contents only have to be wide enough that
         // no server refuses for lack of an algorithm it holds a certificate
         // for. These are the five the runner's servers use between them.
-        try out.int(u16, @intFromEnum(Extension.signature_algorithms));
+        try out.int(u16, @backingInt(Extension.signature_algorithms));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -400,7 +403,7 @@ pub const Client = struct {
 
         // ALPN. RFC 9001 section 8.1 requires one over QUIC, and the runner
         // decides which by test case.
-        try out.int(u16, @intFromEnum(Extension.alpn));
+        try out.int(u16, @backingInt(Extension.alpn));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -412,7 +415,7 @@ pub const Client = struct {
         try out.endLength(extension);
 
         // supported_versions: 1.3 alone.
-        try out.int(u16, @intFromEnum(Extension.supported_versions));
+        try out.int(u16, @backingInt(Extension.supported_versions));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(1);
@@ -422,7 +425,7 @@ pub const Client = struct {
         try out.endLength(extension);
 
         // key_share, so the handshake finishes in one round trip.
-        try out.int(u16, @intFromEnum(Extension.key_share));
+        try out.int(u16, @backingInt(Extension.key_share));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -437,7 +440,7 @@ pub const Client = struct {
         // quic_transport_parameters, whose body the caller built with
         // `transport_parameters.encode`. This is the extension docs/DESIGN.md
         // section 4 says is assembled on this side of the seam.
-        try out.int(u16, @intFromEnum(Extension.quic_transport_parameters));
+        try out.int(u16, @backingInt(Extension.quic_transport_parameters));
         extension = try out.beginLength(2);
         try out.bytes(self.transport_parameters);
         try out.endLength(extension);
@@ -466,7 +469,7 @@ pub const Client = struct {
     /// One message, header included. `body` below is the message without it.
     fn message(self: *Client, level: Level, whole: []const u8) Error!void {
         std.debug.assert(whole.len >= 4);
-        const kind: MessageType = @enumFromInt(whole[0]);
+        const kind: MessageType = @fromBackingInt(@intCast(whole[0]));
         const body = whole[4..];
 
         switch (kind) {
@@ -549,7 +552,7 @@ pub const Client = struct {
 
         const suite = try in.int(u16);
         self.suite = for (self.offer) |one| {
-            if (@intFromEnum(one) == suite) break one;
+            if (@backingInt(one) == suite) break one;
         } else return error.Unsupported;
 
         if (try in.byte() != 0) return error.Unsupported; // compression
@@ -560,7 +563,7 @@ pub const Client = struct {
         // Bounded by the extensions block: `extension` consumes its own length
         // every iteration.
         while (!extensions.done()) {
-            const id: Extension = @enumFromInt(try extensions.int(u16));
+            const id: Extension = @fromBackingInt(@intCast(try extensions.int(u16)));
             const value = try extensions.lengthPrefixed(2);
             switch (id) {
                 .supported_versions => {
@@ -590,7 +593,7 @@ pub const Client = struct {
         var extensions: Reader = .{ .buffer = try (Reader{ .buffer = body }).lengthPrefixedOf(2) };
         // Bounded by the block, as in `serverHello`.
         while (!extensions.done()) {
-            const id: Extension = @enumFromInt(try extensions.int(u16));
+            const id: Extension = @fromBackingInt(@intCast(try extensions.int(u16)));
             const value = try extensions.lengthPrefixed(2);
             if (id != .quic_transport_parameters) continue;
             if (value.len > self.peer_parameters.len) return error.TooLarge;
@@ -618,7 +621,7 @@ pub const Client = struct {
     fn writeFinished(self: *Client) void {
         var verify: [Hmac.mac_length]u8 = undefined;
         self.finishedData(&self.client_handshake_traffic, &verify);
-        self.finished[0] = @intFromEnum(MessageType.finished);
+        self.finished[0] = @backingInt(MessageType.finished);
         writeInt(u24, self.finished[1..4], @intCast(verify.len));
         @memcpy(self.finished[4..][0..verify.len], &verify);
         self.finished_len = @intCast(4 + verify.len);
@@ -1100,7 +1103,7 @@ test "the ClientHello parses as one handshake message of the length it declares"
     });
     const hello = try client.clientHello(&buffer);
 
-    try testing.expectEqual(@as(u8, @intFromEnum(MessageType.client_hello)), hello[0]);
+    try testing.expectEqual(@as(u8, @backingInt(MessageType.client_hello)), hello[0]);
     try testing.expectEqual(hello.len - 4, readInt(u24, hello[1..4]));
     try testing.expectEqual(@as(u16, 0x0303), readInt(u16, hello[4..6]));
     // The session ID is empty, which RFC 9001 section 8.4 requires over QUIC.
@@ -1153,6 +1156,14 @@ test "a partial handshake message is left for the next call" {
     try testing.expectEqual(@as(usize, 0), try client.read(.initial, partial[0..3]));
 }
 
+test "the HelloRetryRequest random is RFC 8446's, not a copy of itself" {
+    // Derived from its definition rather than compared with a second
+    // literal, because a mistyped constant is exactly what this guards.
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash("HelloRetryRequest", &digest, .{});
+    try testing.expectEqualSlices(u8, &digest, &hello_retry_request_random);
+}
+
 test "a HelloRetryRequest is refused by name rather than parsed as a ServerHello" {
     var client: Client = .init(.{
         .server_name = "server4",
@@ -1163,7 +1174,7 @@ test "a HelloRetryRequest is refused by name rather than parsed as a ServerHello
         .key_seed = @splat(1),
     });
     var message: [4 + 2 + 32 + 1]u8 = @splat(0);
-    message[0] = @intFromEnum(MessageType.server_hello);
+    message[0] = @backingInt(MessageType.server_hello);
     writeInt(u24, message[1..4], message.len - 4);
     writeInt(u16, message[4..6], 0x0303);
     @memcpy(message[6..38], &hello_retry_request_random);
@@ -1247,7 +1258,7 @@ fn verifyRsaPss(
                 components.modulus,
             ) catch return error.BadSignature;
             const parsed = rsa.PSSSignature.fromBytes(modulus_octets, signature);
-            rsa.PSSSignature.concatVerify(modulus_octets, parsed, parts, public, H) catch
+            rsa.PSSSignature.concatVerify(modulus_octets, &parsed, parts, public, H) catch
                 return error.BadSignature;
         },
         else => return error.BadSignature,

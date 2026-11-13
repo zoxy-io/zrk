@@ -130,7 +130,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       # Zig cross-compiles every target from this one Linux runner, using the
-      # exact Zig 0.16 the flake pins.
+      # exact Zig 0.17 the flake pins.
       - uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |

@@ -1870,7 +1870,7 @@ const Fixture = struct {
         };
         self.rt = try zio.Runtime.init(testing.allocator, .{});
         self.state.init();
-        const ids = [_]u8{0x5a} ** (2 * connection_id_octets);
+        const ids: [2 * connection_id_octets]u8 = @splat(0x5a);
         self.state.connection = .init(.{
             .side = .client,
             .original_destination = try quic.ConnectionId.init(ids[0..connection_id_octets]),
