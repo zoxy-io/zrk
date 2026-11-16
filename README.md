@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml)
 
-A constant-throughput HTTP load generator — a Zig 0.17 rewrite of
+A constant/linear throughput HTTP load generator — a Zig 0.17 rewrite of
 [wrk2](https://github.com/giltene/wrk2) with a live in-terminal dashboard.
 
 - **Corrected for coordinated omission.** Latency is measured from the time a
