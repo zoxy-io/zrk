@@ -258,9 +258,8 @@ pub const Histogram = struct {
     /// Spelled as an explicit SIMD loop because LLVM does not auto-vectorize the
     /// scalar form: it unrolls it 8x but keeps every add on a 64-bit GPR, which
     /// leaves memory bandwidth unused (~14.6 GB/s measured, against ~20 GB/s for
-    /// the vector form). That gap is worth spelling out here because merging the
-    /// fleet is zrk's single largest CPU consumer at high `-c` — at `-c10000` one
-    /// pass streams ~740MiB through this loop.
+    /// the vector form). Sharding now bounds the fleet's merge work by thread
+    /// count; the same loop also merges exported histograms.
     ///
     /// Lane count follows the target rather than this machine: release binaries
     /// are cross-compiled to *baseline* CPUs, so `suggestVectorLength` resolves

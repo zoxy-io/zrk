@@ -1,13 +1,14 @@
-//! Ownership and aggregation of per-connection statistics.
+//! Ownership and aggregation of sharded statistics.
 //!
-//! Each connection writes only to its own live histogram/counters (no locking
-//! on the hot path). Once per dashboard interval a connection publishes a copy
-//! into a mutex-guarded snapshot slot; the dashboard reads those snapshots. The
-//! final report aggregates the live histograms directly after all connections
-//! have stopped, so no locking is needed there.
+//! Connections share one histogram and counter set per shard, guarded by a
+//! short spin lock because zio can move a coroutine between executor threads.
+//! Responses update their latency and counters under the same lock, so a live
+//! snapshot sees matching samples and completions. Histogram storage and merge
+//! work scale with threads rather than connections.
 //!
-//! Reading those snapshots costs O(connections), so `Sweeper` runs it on a
-//! dedicated thread rather than on an executor — see its doc comment.
+//! `Sweeper` reads the shards on a dedicated thread, keeping merges off the
+//! executor threads that serve the connections. The final report reads them
+//! without locking after all connections have stopped.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,12 +21,9 @@ const tlsmod = @import("tls.zig");
 
 /// Latency histogram configuration: 1µs .. 60s at 3 significant figures.
 ///
-/// The ceiling is a memory decision, not a resolution one: `counts_len` grows
-/// by `sub_bucket_half_count` (1024 u64 = 8KiB) per power-of-two of range, and
-/// every connection owns two of these histograms (live + snapshot slot). A 1h
-/// ceiling cost 184KiB each — 3.8GB of resident memory at `-c10000`. 60s brings
-/// that to 136KiB, and the buckets above it only ever held latencies that no
-/// longer describe a system anyone is still measuring.
+/// Each shard owns one 136KiB histogram. The range and precision stay the same
+/// regardless of connection count: one million connections on sixteen threads
+/// still need only sixteen of these, plus the fixed reporting histograms.
 ///
 /// Values above the ceiling are clamped into the top bucket, never dropped
 /// (see `hdr.recordCount`), so a run that blows past 60s still reports every
@@ -51,14 +49,26 @@ pub const Snapshot = struct {
     }
 };
 
-/// Owns all per-connection state and hands out `connection.Params`.
+/// Shared by a subset of the fleet's connections. The lock protects the whole
+/// statistics update, including its counters, and never spans I/O. Align it to
+/// keep different shards' locks off the same cache line.
+pub const Shard = struct {
+    mutex: std.atomic.Mutex align(std.atomic.cache_line) = .unlocked,
+    hist: hdr.Histogram,
+    counters: connection.Counters = .{},
+
+    fn lock(self: *Shard) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+};
+
+/// Owns shared statistics and per-connection transport state, and hands out
+/// `connection.Params`. Connections are assigned to shards by index, so their
+/// statistics remain safe when the runtime migrates them between executors.
 pub const Fleet = struct {
     allocator: Allocator,
     n: u32,
-    live_hist: []hdr.Histogram,
-    live_counters: []connection.Counters,
-    snap_hist: []hdr.Histogram,
-    publish: []connection.Publish,
+    shards: []Shard,
     params: []connection.Params,
     /// Per-connection TLS state, allocated only for HTTPS targets.
     tls_state: ?[]tlsmod.State,
@@ -71,18 +81,20 @@ pub const Fleet = struct {
     pub fn init(
         allocator: Allocator,
         n: u32,
-        publish_interval_ns: u64,
+        /// Normally `cfg.threads`; clamped to 1..max(n, 1).
+        requested_shards: u32,
         enable_tls: bool,
         enable_h3: bool,
     ) !Fleet {
-        const live_hist = try allocator.alloc(hdr.Histogram, n);
-        errdefer allocator.free(live_hist);
-        const live_counters = try allocator.alloc(connection.Counters, n);
-        errdefer allocator.free(live_counters);
-        const snap_hist = try allocator.alloc(hdr.Histogram, n);
-        errdefer allocator.free(snap_hist);
-        const publish = try allocator.alloc(connection.Publish, n);
-        errdefer allocator.free(publish);
+        const shard_count = @min(@max(requested_shards, 1), @max(n, 1));
+        const shards = try allocator.alloc(Shard, shard_count);
+        errdefer allocator.free(shards);
+        var shards_inited: usize = 0;
+        errdefer for (shards[0..shards_inited]) |*shard| shard.hist.deinit();
+        for (shards) |*shard| {
+            shard.* = .{ .hist = try newHistogram(allocator) };
+            shards_inited += 1;
+        }
         const params = try allocator.alloc(connection.Params, n);
         errdefer allocator.free(params);
         const tls_state: ?[]tlsmod.State = if (enable_tls) try allocator.alloc(tlsmod.State, n) else null;
@@ -97,30 +109,10 @@ pub const Fleet = struct {
         // nothing may read a field before this runs.
         if (h3_state) |hs| for (hs) |*state| state.init();
 
-        var live_inited: usize = 0;
-        errdefer for (live_hist[0..live_inited]) |*h| h.deinit();
-        for (live_hist) |*h| {
-            h.* = try newHistogram(allocator);
-            live_inited += 1;
-        }
-        var snap_inited: usize = 0;
-        errdefer for (snap_hist[0..snap_inited]) |*h| h.deinit();
-        for (snap_hist) |*h| {
-            h.* = try newHistogram(allocator);
-            snap_inited += 1;
-        }
-        @memset(live_counters, .{});
-        for (publish, snap_hist) |*p, *sh| {
-            p.* = .{ .hist = sh, .interval_ns = publish_interval_ns };
-        }
-
         return .{
             .allocator = allocator,
             .n = n,
-            .live_hist = live_hist,
-            .live_counters = live_counters,
-            .snap_hist = snap_hist,
-            .publish = publish,
+            .shards = shards,
             .params = params,
             .tls_state = tls_state,
             .h3_state = h3_state,
@@ -128,8 +120,7 @@ pub const Fleet = struct {
     }
 
     /// Fill in the per-connection `Params`. All connections share the same
-    /// target address/request/schedule; `interval_ns` is the per-connection
-    /// send spacing (total-rate / connections). Each connection gets a stagger
+    /// target address/request/schedule. Each connection gets a stagger
     /// phase of i/n so the fleet's sends interleave uniformly instead of
     /// firing in lockstep waves (see pace.Schedule.offsetNs).
     pub fn buildParams(
@@ -138,10 +129,12 @@ pub const Fleet = struct {
     ) []connection.Params {
         const n: f64 = @floatFromInt(self.params.len);
         for (self.params, 0..) |*p, i| {
+            const shard = &self.shards[i % self.shards.len];
             p.* = template;
-            p.histogram = &self.live_hist[i];
-            p.counters = &self.live_counters[i];
-            p.publish = &self.publish[i];
+            p.histogram = &shard.hist;
+            p.counters = &shard.counters;
+            p.stats_mutex = &shard.mutex;
+            p.publish = null;
             p.phase = @as(f64, @floatFromInt(i)) / n;
             p.index = @intCast(i);
             if (self.tls_state) |ts| p.tls_state = &ts[i];
@@ -150,39 +143,38 @@ pub const Fleet = struct {
         return self.params;
     }
 
-    /// Aggregate the most recently published snapshot from every connection.
+    /// Aggregate the current statistics from every shard.
     /// Safe to call concurrently with running connections.
     ///
-    /// O(connections) in full histograms merged, so this is the pass `Sweeper`
-    /// exists to keep off the executor threads; call it directly only when
-    /// nothing is racing for the CPU.
+    /// Each shard is read under its recording lock, so its histogram and
+    /// counters describe the same events. The merge costs O(shards), and no
+    /// connection needs to copy or publish its own histogram.
     pub fn readSnapshot(self: *Fleet, io: Io, dst: *Snapshot) void {
+        _ = io;
         dst.hist.reset();
         dst.counters = .{};
-        for (self.publish) |*p| {
-            p.mutex.lockUncancelable(io);
-            defer p.mutex.unlock(io);
-            dst.hist.add(p.hist);
-            dst.counters.add(p.counters);
+        for (self.shards) |*shard| {
+            shard.lock();
+            defer shard.mutex.unlock();
+            dst.hist.add(&shard.hist);
+            dst.counters.add(shard.counters);
         }
     }
 
-    /// Aggregate the live histograms/counters. Only call once all connections
+    /// Aggregate the live shards. Only call once all connections
     /// have stopped (no synchronization is performed).
     pub fn readFinal(self: *Fleet, dst: *Snapshot) void {
         dst.hist.reset();
         dst.counters = .{};
-        for (self.live_hist) |*h| dst.hist.add(h);
-        for (self.live_counters) |c| dst.counters.add(c);
+        for (self.shards) |*shard| {
+            dst.hist.add(&shard.hist);
+            dst.counters.add(shard.counters);
+        }
     }
 
     pub fn deinit(self: *Fleet) void {
-        for (self.live_hist) |*h| h.deinit();
-        for (self.snap_hist) |*h| h.deinit();
-        self.allocator.free(self.live_hist);
-        self.allocator.free(self.live_counters);
-        self.allocator.free(self.snap_hist);
-        self.allocator.free(self.publish);
+        for (self.shards) |*shard| shard.hist.deinit();
+        self.allocator.free(self.shards);
         self.allocator.free(self.params);
         // Each session holds libcrypto objects; freeing the block without
         // this leaks one set per connection that ever handshook.
@@ -198,14 +190,9 @@ pub const Fleet = struct {
 
 /// Runs `Fleet.readSnapshot` on a dedicated OS thread.
 ///
-/// The merge adds one full histogram per connection, so its cost scales with
-/// `-c`: at `-c10000` a single pass is ~10^8 u64 adds, on the order of 100ms.
-/// Running that inline stalled the calling thread — which is also zio's
-/// executor 0, servicing 1/threads of the connections — for that whole time,
-/// once per publish interval. Those connections then missed their paced sends,
-/// and because latency is measured from the *scheduled* send, the stall was
-/// charged to the server under test. Bumping `--threads` only shrank the share
-/// of connections caught behind it; moving the work off the executor removes it.
+/// The merge adds one histogram per shard. Keeping this work off executor 0
+/// avoids delaying that executor's scheduled sends while the dashboard reads
+/// statistics. Each shard's recording lock is held only for its own merge.
 ///
 /// The handshake is a plain condvar, but which side it parks differs by caller:
 /// `Io.Mutex`/`Io.Condition` are futex-backed and dispatch through the `Io`
@@ -320,11 +307,8 @@ const zio = @import("zio");
 test "the default histogram's footprint stays within budget" {
     var h = try newHistogram(testing.allocator);
     defer h.deinit();
-    // Every connection owns two of these (live + snapshot slot), so counts_len
-    // is a memory budget rather than an implementation detail: each additional
-    // power-of-two of range adds 1024 u64 = 8KiB here, which is another 160MiB
-    // resident at `-c10000`. Raising `hist_highest` should be a deliberate
-    // trade, so pin the geometry.
+    // Keep the existing range and precision while changing ownership. Each
+    // additional power-of-two of range costs 1024 u64 = 8KiB per shard.
     try testing.expectEqual(@as(u32, 17 * 1024), h.counts_len);
     try testing.expectEqual(@as(usize, 136 * 1024), h.counts.len * @sizeOf(u64));
 
@@ -334,47 +318,93 @@ test "the default histogram's footprint stays within budget" {
     try testing.expectEqual(hist_highest, h.max_value);
 }
 
-test "fleet aggregates live counters and histograms" {
-    var fleet = try Fleet.init(testing.allocator, 3, std.time.ns_per_s, false, false);
-    defer fleet.deinit();
+fn testParams(io: Io, stop: *std.atomic.Value(bool)) connection.Params {
+    return .{
+        .io = io,
+        .address = std.Io.net.IpAddress.parse("127.0.0.1", 80) catch unreachable,
+        .host = "127.0.0.1",
+        .request = "",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .closed,
+        .timeout_ns = 0,
+        .end = .zero,
+        .stop = stop,
+        .histogram = undefined,
+        .counters = undefined,
+    };
+}
 
-    // Simulate each connection having done some work.
-    for (fleet.live_hist, fleet.live_counters, 0..) |*h, *c, i| {
-        h.record(1000 * (@as(u64, @intCast(i)) + 1));
-        c.completed = 10;
-        c.bytes = 100;
+test "fleet preserves the full distribution when connections share shards" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var fleet = try Fleet.init(testing.allocator, 8, 2, false, false);
+    defer fleet.deinit();
+    const params = fleet.buildParams(testParams(threaded.io(), &stop));
+
+    var reference = try newHistogram(testing.allocator);
+    defer reference.deinit();
+
+    for (params, 0..) |*p, i| {
+        const latency = 1000 * (@as(u64, @intCast(i)) + 1);
+        connection.noteResponse(p, latency, 100, 200, 0);
+        reference.record(latency);
+        try testing.expect(p.publish == null);
     }
 
     var snap: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
     defer snap.deinit();
     fleet.readFinal(&snap);
 
-    try testing.expectEqual(@as(u64, 30), snap.counters.completed);
-    try testing.expectEqual(@as(u64, 300), snap.counters.bytes);
-    try testing.expectEqual(@as(u64, 3), snap.hist.count());
+    try testing.expectEqual(@as(u64, 8), snap.counters.completed);
+    try testing.expectEqual(@as(u64, 800), snap.counters.bytes);
+    try testing.expectEqual(@as(u64, 8), snap.counters.status_class[2]);
+    try testing.expectEqualSlices(u64, reference.counts, snap.hist.counts);
+}
+
+test "ten thousand connections fit in a fixed statistics budget" {
+    // Per-connection histograms needed over 2.5GiB for this fleet. The budget
+    // includes Params for every connection and four full-precision shards.
+    const buffer = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(buffer);
+    var fixed = std.heap.FixedBufferAllocator.init(buffer);
+    var fleet = try Fleet.init(fixed.allocator(), 10_000, 4, false, false);
+    defer fleet.deinit();
+    try testing.expectEqual(@as(usize, 4), fleet.shards.len);
+    try testing.expectEqual(@as(usize, 10_000), fleet.params.len);
+}
+
+test "shard count has a nonzero floor and does not exceed connections" {
+    var single = try Fleet.init(testing.allocator, 3, 0, false, false);
+    defer single.deinit();
+    try testing.expectEqual(@as(usize, 1), single.shards.len);
+    var capped = try Fleet.init(testing.allocator, 3, 16, false, false);
+    defer capped.deinit();
+    try testing.expectEqual(@as(usize, 3), capped.shards.len);
 }
 
 test "Fleet.init leaks nothing when any allocation fails" {
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn initAndDeinit(allocator: Allocator) !void {
-            var fleet = try Fleet.init(allocator, 3, std.time.ns_per_s, true, false);
+            var fleet = try Fleet.init(allocator, 3, 2, true, false);
             fleet.deinit();
         }
     }.initAndDeinit, .{});
 }
 
-test "readSnapshot reflects published state" {
+test "readSnapshot sees shared updates without per-connection publication" {
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
     const io = rt.io();
 
-    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false, false);
+    var fleet = try Fleet.init(testing.allocator, 2, 1, false, false);
     defer fleet.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const params = fleet.buildParams(testParams(io, &stop));
 
-    // Publish some values into each connection's snapshot slot directly.
-    for (fleet.publish) |*p| {
-        p.hist.record(5000);
-        p.counters.completed = 7;
+    for (params) |*p| {
+        for (0..7) |_| connection.noteResponse(p, 5000, 1, 200, 0);
     }
 
     var snap: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
@@ -382,7 +412,79 @@ test "readSnapshot reflects published state" {
     fleet.readSnapshot(io, &snap);
 
     try testing.expectEqual(@as(u64, 14), snap.counters.completed);
-    try testing.expectEqual(@as(u64, 2), snap.hist.count());
+    try testing.expectEqual(@as(u64, 14), snap.hist.count());
+}
+
+test "concurrent writers and snapshots preserve samples and all counter kinds" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const writers = 8;
+    const iterations = 8192;
+    var fleet = try Fleet.init(testing.allocator, writers, 2, false, false);
+    defer fleet.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const params = fleet.buildParams(testParams(io, &stop));
+    var finished = std.atomic.Value(u32).init(0);
+
+    var snap: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    var sweeper = try Sweeper.init(testing.allocator, &fleet, io);
+    defer sweeper.deinit();
+    sweeper.start();
+
+    const Worker = struct {
+        fn run(p: *connection.Params, done: *std.atomic.Value(u32)) void {
+            for (0..iterations) |i| {
+                const status: u16 = if (i % 4 == 0) 500 else 200;
+                connection.noteResponse(p, 1000 * (@as(u64, p.index) + 1), 31, status, 0);
+                connection.noteBehind(p, @as(u64, p.index) + 1);
+                if (i % 16 == 0) connection.noteTimeout(p, p.io, connection.now(p.io));
+                if (i % 32 == 0) connection.noteDeadline(p);
+                if (i % 64 == 0) {
+                    connection.noteConnectFailure(p, error.TestConnectFailure);
+                    connection.noteError(p, .read);
+                    connection.noteError(p, .write);
+                }
+            }
+            _ = done.fetchAdd(1, .release);
+        }
+    };
+
+    // Four OS threads write each shard, while the sweeper reads the same
+    // shards. This exercises migration-like contention rather than relying on
+    // the scheduler to happen to run connections on different executors.
+    {
+        var threads: [writers]std.Thread = undefined;
+        var launched: usize = 0;
+        defer for (threads[0..launched]) |thread| thread.join();
+        for (params) |*p| {
+            threads[launched] = try std.Thread.spawn(.{}, Worker.run, .{ p, &finished });
+            launched += 1;
+        }
+        var previous: u64 = 0;
+        while (finished.load(.acquire) < writers) {
+            sweeper.snapshot(&snap);
+            try testing.expect(snap.counters.completed >= previous);
+            try testing.expectEqual(snap.counters.completed + snap.counters.timeouts, snap.hist.count());
+            try testing.expectEqual(snap.counters.completed * 31, snap.counters.bytes);
+            try testing.expectEqual(snap.counters.completed, snap.counters.status_class[2] + snap.counters.status_class[5]);
+            previous = snap.counters.completed;
+            std.Thread.yield() catch {};
+        }
+    }
+    fleet.readFinal(&snap);
+    const completed = writers * iterations;
+    try testing.expectEqual(@as(u64, completed), snap.counters.completed);
+    try testing.expectEqual(@as(u64, completed / 4), snap.counters.status_errors);
+    try testing.expectEqual(@as(u64, completed / 16), snap.counters.timeouts);
+    try testing.expectEqual(@as(u64, completed / 32), snap.counters.deadline_errors);
+    try testing.expectEqual(@as(u64, completed / 64), snap.counters.connect_errors);
+    try testing.expectEqual(@as(u64, completed / 64), snap.counters.read_errors);
+    try testing.expectEqual(@as(u64, completed / 64), snap.counters.write_errors);
+    try testing.expectEqual(@as(u64, writers), snap.counters.max_behind_ns);
+    try testing.expectEqual(@as(?anyerror, error.TestConnectFailure), snap.counters.first_connect_error);
+    try testing.expectEqual(snap.counters.completed + snap.counters.timeouts, snap.hist.count());
 }
 
 test "Sweeper returns the same aggregate as an inline readSnapshot" {
@@ -390,10 +492,10 @@ test "Sweeper returns the same aggregate as an inline readSnapshot" {
     defer rt.deinit();
     const io = rt.io();
 
-    var fleet = try Fleet.init(testing.allocator, 8, std.time.ns_per_s, false, false);
+    var fleet = try Fleet.init(testing.allocator, 8, 2, false, false);
     defer fleet.deinit();
-    for (fleet.publish, 0..) |*p, i| {
-        p.hist.record(1000 * (@as(u64, @intCast(i)) + 1));
+    for (fleet.shards, 0..) |*p, i| {
+        p.hist.recordCount(1000 * (@as(u64, @intCast(i)) + 1), 7);
         p.counters.completed = 7;
         p.counters.bytes = 100;
     }
@@ -426,25 +528,22 @@ test "each Sweeper.snapshot waits for a merge newer than the request" {
     defer rt.deinit();
     const io = rt.io();
 
-    var fleet = try Fleet.init(testing.allocator, 4, std.time.ns_per_s, false, false);
+    var fleet = try Fleet.init(testing.allocator, 4, 2, false, false);
     defer fleet.deinit();
 
     var sweeper = try Sweeper.init(testing.allocator, &fleet, io);
     defer sweeper.deinit();
     sweeper.start();
+    var stop = std.atomic.Value(bool).init(false);
+    const params = fleet.buildParams(testParams(io, &stop));
 
     var snap: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
     defer snap.deinit();
 
-    // Every round publishes one more request per connection; the very next
+    // Every round records one more request per connection; the very next
     // snapshot must already see it, with no intervening sleep.
     for (1..6) |round| {
-        for (fleet.publish) |*p| {
-            p.mutex.lockUncancelable(io);
-            defer p.mutex.unlock(io);
-            p.hist.record(1000);
-            p.counters.completed = round;
-        }
+        for (params) |*p| connection.noteResponse(p, 1000, 1, 200, 0);
         sweeper.snapshot(&snap);
         try testing.expectEqual(@as(u64, round * 4), snap.counters.completed);
         try testing.expectEqual(@as(u64, round * 4), snap.hist.count());
@@ -455,7 +554,7 @@ test "Sweeper stops cleanly when no snapshot was ever taken" {
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
-    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false, false);
+    var fleet = try Fleet.init(testing.allocator, 2, 2, false, false);
     defer fleet.deinit();
 
     var sweeper = try Sweeper.init(testing.allocator, &fleet, rt.io());

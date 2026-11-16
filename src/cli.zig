@@ -92,8 +92,8 @@ pub const Config = struct {
     /// passes (`--deadline-abort`). This resets the connection on every miss, so
     /// it churns under saturation; off by default (shed-before-send suffices).
     deadline_abort: bool = false,
-    /// Stats window: per-connection publish period, `--timeseries` row cadence,
-    /// and the line rate of `--plain` output.
+    /// Stats window: `--timeseries` row cadence and the line rate of `--plain`
+    /// output. The live dashboard reads shared statistics on its own cadence.
     interval_ns: u64 = 1 * std.time.ns_per_s,
     /// Live dashboard redraw period (TTY only). Independent of the stats
     /// window so the TUI can feel realtime without changing measurement or
@@ -479,8 +479,7 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     if (cfg.rate == 0) return error.ZeroRate;
     // A ramp toward 0 req/s has no well-defined schedule; require a positive end.
     if (cfg.rate_end) |e| if (e == 0) return error.ZeroRate;
-    // A zero interval would busy-loop the snapshot thread and take the publish
-    // lock on every request.
+    // A zero interval would busy-loop statistics snapshots and output.
     if (cfg.interval_ns == 0) return error.ZeroInterval;
     // Same busy-loop hazard for the dashboard redraw cadence.
     if (cfg.refresh_ns == 0) return error.ZeroRefresh;
