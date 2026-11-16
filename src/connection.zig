@@ -22,7 +22,8 @@ const pace = @import("pace.zig");
 const workload = @import("workload.zig");
 const StatusClass = httpmod.StatusClass;
 
-/// Per-connection counters. Aggregated across connections for reporting.
+/// Request counters. The fleet shares these within each statistics shard;
+/// standalone connections may keep their own.
 pub const Counters = struct {
     /// Requests that received a complete response.
     completed: u64 = 0,
@@ -109,9 +110,9 @@ pub const Publish = struct {
     next_ns: i128 = 0,
 };
 
-/// Everything a connection coroutine needs. `histogram` and `counters` are owned
-/// by the connection coroutine and must not be shared across coroutines without
-/// external synchronization (that is what `publish` is for).
+/// Everything a connection coroutine needs. The fleet shares `histogram` and
+/// `counters` across connections and supplies `stats_mutex` to guard them.
+/// Standalone callers may omit the mutex when these are exclusively owned.
 pub const Params = struct {
     io: Io,
     address: net.IpAddress,
@@ -200,7 +201,11 @@ pub const Params = struct {
     stop: *std.atomic.Value(bool),
     histogram: *hdr.Histogram,
     counters: *Counters,
-    /// Optional live-snapshot channel for the dashboard.
+    /// Guards both the histogram and counters when they belong to a shard.
+    /// Never held across I/O or a workload callback.
+    stats_mutex: ?*std.atomic.Mutex = null,
+    /// Optional snapshot channel for standalone connections. The fleet reads
+    /// its shared shards directly instead of allocating a slot per connection.
     publish: ?*Publish = null,
     /// Allocator for TLS certificate verification (borrowed).
     allocator: std.mem.Allocator = undefined,
@@ -481,7 +486,7 @@ pub fn run(p: *Params) void {
             // load (when ahead we pace below); feeds the backlog gauge and the
             // deadline check. Both clocks are monotonic, so `behind` fits u64.
             const behind_ns: i128 = t.nanoseconds - scheduled.nanoseconds;
-            if (behind_ns > 0) p.counters.noteBehind(@intCast(behind_ns));
+            if (behind_ns > 0) noteBehind(p, @intCast(behind_ns));
 
             // Deadline shedding: a request already staler than the deadline can
             // never meet it, so fail it now — without touching the wire — and
@@ -568,13 +573,7 @@ pub fn run(p: *Params) void {
                     const done = now(io);
                     const latency_ns = done.nanoseconds - scheduled.nanoseconds;
                     const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
-                    p.histogram.record(latency_us);
-
-                    p.counters.completed += 1;
-                    p.counters.bytes += resp.bytes;
-                    p.counters.recordStatus(resp.status);
-
-                    maybePublish(p, done.nanoseconds);
+                    noteResponse(p, latency_us, resp.bytes, resp.status, done.nanoseconds);
 
                     // After the latency is taken, so the hook's cost is not
                     // the server's. `send_index` already moved past it.
@@ -888,9 +887,9 @@ const Mux = struct {
     /// slot, and touched only under `state`.
     collector: ?*Collector = null,
 
-    /// Guards `slots` and the three flags below — and `p.histogram` and
-    /// `p.counters`, which stop being the sender's private property the moment
-    /// the receiver is the one that knows a request finished.
+    /// Guards `slots` and the three flags below, plus statistics updates on a
+    /// standalone connection. Fleet statistics also take `p.stats_mutex`, since
+    /// other connections can share the same shard on another executor.
     state: Io.Mutex = .init,
     /// Signaled whenever a slot frees or the connection ends: the two things a
     /// sender with nowhere to put a request cares about.
@@ -1018,10 +1017,7 @@ const Mux = struct {
         // *should* have been sent, not when it actually went out.
         const latency_ns = done.nanoseconds - slot.scheduled.nanoseconds;
         const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
-        p.histogram.record(latency_us);
-        p.counters.completed += 1;
-        p.counters.bytes += slot.bytes;
-        p.counters.recordStatus(status);
+        noteResponse(p, latency_us, slot.bytes, status, done.nanoseconds);
         // Before the slot is released, which would let the sender reuse its
         // capture. Under `state`, which is safe to hold across it: the hook
         // may wait for a workload's own lock, but nothing holding that lock
@@ -1032,7 +1028,6 @@ const Mux = struct {
             c.respond(slot.seq, index) catch |err| failWorkload(p, err);
         }
         mux.release(slot);
-        maybePublish(p, done.nanoseconds);
     }
 
     fn slotIndex(mux: *const Mux, slot: *const Slot) usize {
@@ -1148,7 +1143,7 @@ const Mux = struct {
         mux.state.lockUncancelable(mux.io);
         defer mux.state.unlock(mux.io);
         const behind_ns: i128 = t.nanoseconds - scheduled.nanoseconds;
-        if (behind_ns > 0) p.counters.noteBehind(@intCast(behind_ns));
+        if (behind_ns > 0) noteBehind(p, @intCast(behind_ns));
         if (p.deadline_ns == 0 or behind_ns <= p.deadline_ns) return false;
         noteDeadline(p);
         switch (origin) {
@@ -1805,17 +1800,49 @@ pub fn failWorkload(p: *Params, err: anyerror) void {
 
 pub const ErrorKind = enum { connect, write, read };
 
+fn lockStats(p: *const Params) void {
+    if (p.stats_mutex) |mutex| {
+        while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockStats(p: *const Params) void {
+    if (p.stats_mutex) |mutex| mutex.unlock();
+}
+
+/// Record a response and its counters together, so a concurrent shard snapshot
+/// cannot see the latency without the completion (or vice versa). `now_ns` is
+/// taken before acquiring the lock, keeping statistics contention out of the
+/// response's measured latency.
+pub fn noteResponse(p: *Params, latency_us: u64, bytes: u64, status: u16, now_ns: i128) void {
+    lockStats(p);
+    p.histogram.record(latency_us);
+    p.counters.completed += 1;
+    p.counters.bytes += bytes;
+    p.counters.recordStatus(status);
+    unlockStats(p);
+    maybePublish(p, now_ns);
+}
+
+pub fn noteBehind(p: *Params, behind_ns: u64) void {
+    lockStats(p);
+    defer unlockStats(p);
+    p.counters.noteBehind(behind_ns);
+}
+
 /// Record a socket error, unless we are shutting down — errors caused by
 /// cancelling in-flight I/O at end-of-test are artifacts, not real failures.
 /// Publishes so the live dashboard sees error-only periods (a total outage
 /// produces no successful responses to publish through).
 pub fn noteError(p: *Params, kind: ErrorKind) void {
     if (p.stop.load(.monotonic)) return;
+    lockStats(p);
     switch (kind) {
         .connect => p.counters.connect_errors += 1,
         .write => p.counters.write_errors += 1,
         .read => p.counters.read_errors += 1,
     }
+    unlockStats(p);
     maybePublish(p, now(p.io).nanoseconds);
 }
 
@@ -1823,8 +1850,11 @@ pub fn noteError(p: *Params, kind: ErrorKind) void {
 /// first cause kept for the message a run with no successful request ends on.
 pub fn noteConnectFailure(p: *Params, reason: anyerror) void {
     if (p.stop.load(.monotonic)) return;
+    lockStats(p);
     if (p.counters.first_connect_error == null) p.counters.first_connect_error = reason;
-    noteError(p, .connect);
+    p.counters.connect_errors += 1;
+    unlockStats(p);
+    maybePublish(p, now(p.io).nanoseconds);
 }
 
 /// A timed-out request (the watchdog shut the socket down): count it and, unless
@@ -1834,13 +1864,15 @@ pub fn noteConnectFailure(p: *Params, reason: anyerror) void {
 /// timeout is a teardown artifact rather than a real failure.
 pub fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
     if (p.stop.load(.monotonic)) return;
-    p.counters.timeouts += 1;
     const done = now(io);
+    lockStats(p);
+    p.counters.timeouts += 1;
     if (p.record_timeouts) {
         const latency_ns = done.nanoseconds - scheduled.nanoseconds;
         const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
         p.histogram.record(latency_us);
     }
+    unlockStats(p);
     // Publish so a fully stalled target still surfaces on the dashboard.
     maybePublish(p, done.nanoseconds);
 }
@@ -1854,22 +1886,23 @@ pub fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
 /// artifact rather than a real miss.
 pub fn noteDeadline(p: *Params) void {
     if (p.stop.load(.monotonic)) return;
+    lockStats(p);
     p.counters.deadline_errors += 1;
+    unlockStats(p);
     maybePublish(p, now(p.io).nanoseconds);
 }
 
-/// Publish this connection's live state for the dashboard. Counters are
-/// refreshed on EVERY call: they are a few words copied under this
-/// connection's own mutex (contended only by the ~once-a-second snapshot
-/// reader), and batching them to the publish interval quantized the fleet's
-/// per-window request deltas to whole per-connection batches — the reader saw
-/// counts advance in conns-sized steps, a staircase in the throughput
-/// timeseries. The histogram copy — the expensive part — still happens at
-/// most once per publish interval.
+/// Publish a standalone connection's live state. Fleet connections have no
+/// publish slot: their shared statistics are read directly under `stats_mutex`.
+/// Counters are refreshed on every call, while the histogram is copied at most
+/// once per publish interval. The slot's mutex is acquired before `stats_mutex`
+/// so no coroutine can suspend while holding the statistics spin lock.
 pub fn maybePublish(p: *Params, now_ns: i128) void {
     const pub_ptr = p.publish orelse return;
     pub_ptr.mutex.lockUncancelable(p.io);
     defer pub_ptr.mutex.unlock(p.io);
+    lockStats(p);
+    defer unlockStats(p);
     pub_ptr.counters = p.counters.*;
     if (now_ns >= pub_ptr.next_ns) {
         p.histogram.copyInto(pub_ptr.hist);

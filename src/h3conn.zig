@@ -1027,7 +1027,7 @@ fn issue(
         if (scheduled.nanoseconds > t.nanoseconds) return;
 
         const behind_ns: i128 = t.nanoseconds - scheduled.nanoseconds;
-        if (behind_ns > 0) p.counters.noteBehind(@intCast(behind_ns));
+        if (behind_ns > 0) conn.noteBehind(p, @intCast(behind_ns));
 
         // Deadline shedding: a request already staler than the deadline can
         // never meet it, so fail it now — without touching the wire — and move
@@ -1359,17 +1359,11 @@ fn complete(p: *conn.Params, state: *State, slot: *Slot) void {
         @intCast(@divTrunc(latency_ns, std.time.ns_per_us))
     else
         0;
-    p.histogram.record(latency_us);
-
-    p.counters.completed += 1;
-    p.counters.bytes += slot.bytes;
     // A response whose HEADERS never carried a readable `:status` is not a
     // response this tool can classify. `Http3` and `fields.MessageValidator`
     // between them make that unreachable for a conforming peer; 0 lands in the
     // "non-2xx/3xx" bucket, which is the honest answer if it ever happens.
-    p.counters.recordStatus(slot.status orelse 0);
-
-    conn.maybePublish(p, done.nanoseconds);
+    conn.noteResponse(p, latency_us, slot.bytes, slot.status orelse 0, done.nanoseconds);
     // After the latency is taken, so the hook's cost is not the server's.
     if (state.collector) |c| {
         const index = slotIndex(state, slot);

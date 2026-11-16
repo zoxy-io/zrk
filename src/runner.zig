@@ -158,27 +158,23 @@ pub fn run(
     }
     const ca_ptr: ?*tlsmod.CaStore = if (ca_store) |*c| c else null;
 
-    // Publish the (expensive) live-histogram copy as often as the fastest
-    // consumer wakes: the dashboard's `--refresh` when a live TUI is attached,
-    // else the `--interval` stats window. This is what lets the latency bars
-    // step with each redraw instead of only once per stats window — the panel
-    // repaints every frame but the numbers behind it are only as fresh as the
-    // last publish.
-    const publish_ns = if (frame_interval_ns > 0) @min(frame_interval_ns, cfg.interval_ns) else cfg.interval_ns;
+    // One statistics shard per executor thread, shared by connection index.
+    // Shards synchronize updates because coroutines can migrate between
+    // executors. Consumers read them at their own frame/row cadence, without
+    // allocating or publishing a histogram for every connection.
     // `enable_tls` is zssl's per-connection block, which the HTTP/3 path does
     // not use: QUIC's handshake state lives inside `h3conn.State` instead.
     var fleet = try stats.Fleet.init(
         arena,
         cfg.connections,
-        publish_ns,
+        cfg.threads,
         cfg.url.isTls() and !cfg.http3,
         cfg.http3,
     );
     defer fleet.deinit();
 
-    // Merging the fleet's per-connection histograms is O(connections) and does
-    // not yield, so it runs on its own thread instead of on this one — this
-    // thread is executor 0, and stalling it stalls the connections it hosts.
+    // Merge the shared shards on a separate thread so this one — executor 0 —
+    // keeps servicing connections while the dashboard requests a snapshot.
     // Declared after `fleet` so it is joined before those histograms are freed.
     var sweeper = try stats.Sweeper.init(arena, &fleet, io);
     defer sweeper.deinit();
@@ -225,7 +221,7 @@ pub fn run(
         .allocator = arena,
         .ca_store = ca_ptr,
         .dynamic = dynamic_ptr,
-        // histogram/counters/publish/tls_state/index are filled in by buildParams.
+        // histogram/counters/stats_mutex/tls_state/index are filled in by buildParams.
         .histogram = undefined,
         .counters = undefined,
     });
@@ -393,13 +389,11 @@ fn perSecond(count: u64, seconds: f64) f64 {
 /// sliver left by a duration that isn't a whole number of intervals (`-d 10.05s
 /// --interval 1s` ends with a 50ms row), preferring the 1.05s window over it.
 ///
-/// Both ends come from *published* snapshots on purpose. A connection publishes
-/// its counters on its own cadence, so any snapshot lags reality by up to one
-/// publish interval; differencing two of them cancels that lag, while
-/// differencing the last row against the post-join live counters would charge
-/// every connection's unpublished backlog to this one window and overstate it.
-/// It also makes the number identical to the last `--timeseries` row whenever
-/// that row covers a full interval.
+/// Both ends come from progress snapshots, keeping their timestamps on the
+/// row cadence. Post-join counters also include responses that finished during
+/// shutdown; charging those to the last row would overstate that window's
+/// throughput. This also keeps the number identical to the last `--timeseries`
+/// row whenever that row covers a full interval.
 fn tailWindow(ring: []const RowSample, count: usize, interval_ns: u64) ?struct {
     rate: f64,
     bytes_per_sec: f64,

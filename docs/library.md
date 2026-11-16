@@ -57,6 +57,21 @@ set (see [output.md](output.md)); an embedder computing its own headline number
 should make the same choice. Leaving `end_window_s` at 0 says "no window
 measured", and the whole run stands in for it.
 
+Statistics use up to `cfg.threads` shared shards, with one 136KiB latency
+histogram per shard at the existing three significant figures and 60s ceiling.
+Histogram storage and snapshot merges scale with threads, while connection
+parameters, coroutine stacks and transport buffers still scale with connections.
+
+For callers constructing the lower-level fleet directly,
+`stats.Fleet.init(allocator, connections, shards, enable_tls, enable_h3)` now
+takes a shard count as its third argument, replacing the publish interval.
+`buildParams` supplies a shared `stats_mutex` along with each connection's
+histogram and counters. Use the `connection.noteResponse`, `noteTimeout`,
+`noteError`, `noteConnectFailure`, `noteDeadline`, and `noteBehind` helpers for
+updates; they keep the histogram and counters synchronized with live snapshots.
+Standalone connections can still supply their own histogram and counters and
+omit the mutex when they have exclusive access.
+
 ## Generating requests
 
 By default every send replays one request, built once at startup from
