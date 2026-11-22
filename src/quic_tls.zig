@@ -220,7 +220,7 @@ pub const Install = struct {
 
 pub const Options = struct {
     /// The name to put in SNI, and the one this client does not check the
-    /// certificate against.
+    /// certificate against. An IP literal is not sent (`sendsServerName`).
     server_name: []const u8,
     /// The single protocol to offer. `hq-interop` for the HTTP/0.9 test cases,
     /// `h3` for the HTTP/3 ones.
@@ -361,22 +361,27 @@ pub const Client = struct {
     }
 
     fn writeExtensions(self: *Client, out: *Writer) Error!void {
-        // server_name: a list of one, of type `host_name`.
-        try out.int(u16, @backingInt(Extension.server_name));
-        var extension = try out.beginLength(2);
-        {
-            const list = try out.beginLength(2);
-            try out.byte(0);
-            const name = try out.beginLength(2);
-            try out.bytes(self.server_name);
-            try out.endLength(name);
-            try out.endLength(list);
+        // server_name: a list of one, of type `host_name`, left out when the
+        // target is an IP literal. RFC 6066 section 3 does not permit one in
+        // HostName, and QUICHE (envoy's QUIC) closes the handshake that sends
+        // one with QUIC_HANDSHAKE_FAILED_INVALID_HOSTNAME.
+        if (sendsServerName(self.server_name)) {
+            try out.int(u16, @backingInt(Extension.server_name));
+            const extension = try out.beginLength(2);
+            {
+                const list = try out.beginLength(2);
+                try out.byte(0);
+                const name = try out.beginLength(2);
+                try out.bytes(self.server_name);
+                try out.endLength(name);
+                try out.endLength(list);
+            }
+            try out.endLength(extension);
         }
-        try out.endLength(extension);
 
         // supported_groups: X25519 alone. See the module comment on HRR.
         try out.int(u16, @backingInt(Extension.supported_groups));
-        extension = try out.beginLength(2);
+        var extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
             try out.int(u16, group_x25519);
@@ -950,6 +955,14 @@ const Reader = struct {
     }
 };
 
+/// RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted in
+/// HostName." The target's host is sent in SNI only when it is a name.
+fn sendsServerName(host: []const u8) bool {
+    if (host.len == 0) return false;
+    _ = std.Io.net.IpAddress.parse(host, 0) catch return true;
+    return false;
+}
+
 const testing = std.testing;
 
 const test_leaf_der = @embedFile("testdata/leaf.der");
@@ -1124,6 +1137,35 @@ test "the ClientHello carries the transport parameters it was given" {
     const hello = try client.clientHello(&buffer);
     // Extension 57, its length, and then the body verbatim.
     const wanted = [_]u8{ 0x00, 0x39, 0x00, parameters.len } ++ parameters;
+    try testing.expect(std.mem.indexOf(u8, hello, &wanted) != null);
+}
+
+test "the ClientHello names a host in SNI, and leaves an IP literal out" {
+    var buffer: [1024]u8 = undefined;
+    for ([_][]const u8{ "192.0.2.1", "2001:db8::1" }) |literal| {
+        var client: Client = .init(.{
+            .server_name = literal,
+            .alpn = "h3",
+            .transport_parameters = &.{},
+            .offer = &.{.aes_128_gcm_sha256},
+            .random = @splat(0),
+            .key_seed = @splat(1),
+        });
+        const hello = try client.clientHello(&buffer);
+        try testing.expect(std.mem.indexOf(u8, hello, literal) == null);
+    }
+
+    var named: Client = .init(.{
+        .server_name = "server4",
+        .alpn = "h3",
+        .transport_parameters = &.{},
+        .offer = &.{.aes_128_gcm_sha256},
+        .random = @splat(0),
+        .key_seed = @splat(1),
+    });
+    const hello = try named.clientHello(&buffer);
+    // Extension 0, its length, the list's length, host_name, the name's length.
+    const wanted = [_]u8{ 0x00, 0x00, 0x00, 12, 0x00, 10, 0x00, 0x00, 7 } ++ "server4".*;
     try testing.expect(std.mem.indexOf(u8, hello, &wanted) != null);
 }
 
