@@ -54,14 +54,17 @@
         // `src/h3conn.zig` supplies all four, and `src/quic_tls.zig` is the
         // fourth because zssl declines QUIC (see its README, "Out, for now").
         //
-        // Pinned at the commit that fixes the acknowledgement-report
-        // truncation this prototype found: below it, a connection carrying
-        // more than one stream strands them once the congestion window grows
-        // past thirty-two packets. `src/h3conn.zig` has the diagnosis.
+        // Pinned at the commit that reads a frame length in any encoding:
+        // below it, haproxy's DATA frames (their length padded to eight
+        // octets) were frame errors, and every haproxy response failed. It
+        // also carries the acknowledgement-report fix this prototype found
+        // (8c55579): below that, a connection carrying more than one stream
+        // strands them once the congestion window grows past thirty-two
+        // packets. `src/h3conn.zig` has the diagnosis.
         //
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#8c55579794a170e7639ee644c634717c7076b1e5",
-            .hash = "h3-0.0.0-RBkp8pBfFwBQa2xrGOJMBwrtMfzLfONSfNoU3NWiVCKy",
+            .url = "git+https://github.com/zoxy-io/h3#aef8b759f0a4e15bd49f1dbca464a136959a4b2f",
+            .hash = "h3-0.0.0-RBkp8urcGgCQqqsBBrkUyIpkb5HA8Kn5LtGqVrQHLTOb",
         },
         // LuaJIT 2.1, for `--script`: what wrk links, so wrk scripts — Lua 5.1
         // plus `bit` and `unpack` — run unchanged. Built from source by
