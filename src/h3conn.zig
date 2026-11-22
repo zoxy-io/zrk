@@ -212,6 +212,44 @@ const field_section_octets_max: u64 = 64 * 1024;
 /// nothing at all would otherwise hold the connection until the run ended.
 const handshake_deadline_ns: u64 = 10 * std.time.ns_per_s;
 
+/// How long the handshake is given when `--timeout` is set, as a multiple of
+/// it.
+///
+/// Two, because that is what the TCP path gives the same work: one
+/// `--timeout` for the connect and another for the TLS handshake after it.
+/// QUIC does both in one exchange. One `--timeout` also left a lost datagram
+/// no way back: RFC 9002 §6.2.2 starts the RTT estimate at 333 ms, so the
+/// first probe goes out about a second in, which is when a 1 s `--timeout`
+/// gave the attempt up.
+///
+/// Under load the bound decides how long a queue of handshakes may take to
+/// drain. 1,000 connections opening at once against haproxy held to a quarter
+/// of a CPU, at a 1 s `--timeout`, locally: 2,067 connect errors over the first
+/// 6 s at one `--timeout`, and 533, all in the first 3 s, at two together with
+/// `abandon` and `reconnectPause`.
+const handshake_bound_multiple: u64 = 2;
+
+fn handshakeBound(timeout_ns: u64) u64 {
+    return if (timeout_ns != 0) handshake_bound_multiple * timeout_ns else handshake_deadline_ns;
+}
+
+/// How long `run` waits before the next attempt after one failed: 5 ms, so
+/// that a target refusing everything does not spin the CPU building
+/// handshakes, and a share of one `--timeout` (a second without one) taken
+/// from `draw`.
+///
+/// The share is for failures that a shared bound makes all at once.
+/// Connections that opened together and waited in the same queue reach the
+/// handshake bound together, and without it they all come back in the same
+/// millisecond: on c1k-h3, up to 1,000 Initials on one UDP socket at once.
+/// TCP needs none of this, because the listen backlog holds a burst of SYNs,
+/// while a UDP socket's receive buffer at the kernel's default of 208 KiB
+/// holds fewer than two hundred Initials.
+fn reconnectPause(timeout_ns: u64, draw: u64) Io.Duration {
+    const spread_ns: u64 = if (timeout_ns != 0) timeout_ns else std.time.ns_per_s;
+    return .fromNanoseconds(5 * std.time.ns_per_ms + draw % spread_ns);
+}
+
 /// How long an established connection may go without hearing anything from the
 /// peer before it is abandoned and rebuilt, as a multiple of `--timeout`.
 ///
@@ -457,9 +495,9 @@ pub fn run(p: *conn.Params) void {
         // connections is not one: the pause would land in every retried
         // request's latency.
         if (state.goaway != null) continue;
-        // Back off briefly so a target that refuses everything does not spin
-        // the CPU building handshakes.
-        io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
+        var draw: [8]u8 = undefined;
+        io.random(&draw);
+        io.sleep(reconnectPause(p.timeout_ns, std.mem.readInt(u64, &draw, .little)), .awake) catch return;
     }
 }
 
@@ -502,7 +540,7 @@ fn serve(
     // bounded by something: a peer that answers no datagram at all would
     // otherwise hold this coroutine until the run ended, contributing one
     // failure where it should contribute a stream of them.
-    const handshake_bound_ns: u64 = if (p.timeout_ns != 0) p.timeout_ns else handshake_deadline_ns;
+    const handshake_bound_ns = handshakeBound(p.timeout_ns);
 
     // And the same question for a connection that *did* handshake and then
     // stopped hearing anything.
@@ -536,6 +574,7 @@ fn serve(
 
         if (state.connection.state == .handshaking and now_ns > handshake_bound_ns) {
             conn.noteConnectFailure(p, error.HandshakeTimeout);
+            abandon(p, state, &socket, now_ns);
             return;
         }
         // Requests whose own bound already fired were counted and freed by
@@ -546,6 +585,7 @@ fn serve(
         // coming.
         if (state.connection.state == .established and now_ns - progress_ns > progress_bound_ns) {
             _ = abandonAll(p, state, .read);
+            abandon(p, state, &socket, now_ns);
             return;
         }
 
@@ -609,7 +649,24 @@ fn serve(
         );
         if (maybe_error) |err| switch (err) {
             error.Timeout => {
-                state.connection.onTimeout(elapsed(io, origin));
+                // A wait that timed out is not the transport's timer firing.
+                // `waitFor` also wakes for the next scheduled send, a
+                // request's bound, the run's end, and every `idle_slice_ns`;
+                // `onTimeout` is RFC 9002 §A.9's OnLossDetectionTimeout and
+                // takes every call as the loss timer having expired.
+                //
+                // 3.0.3 called it on every wake. On a connection the peer had
+                // not answered within 20 ms, that was a probe timeout every
+                // 20 ms, two probes each, each one resending whatever was
+                // unacknowledged: about 90 Initials a second from a handshake
+                // where RFC 9002 sends one probe after a second and then
+                // waits twice as long each time. On c1k-h3, 1,000 connections
+                // did that to a 1-CPU proxy still working through their first
+                // handshakes, and haproxy completed no request.
+                const woke_ns = elapsed(io, origin);
+                if (state.connection.timeout()) |at| {
+                    if (woke_ns >= at) state.connection.onTimeout(woke_ns);
+                }
                 continue;
             },
             else => {
@@ -1503,6 +1560,25 @@ fn pollTransport(p: *conn.Params, state: *State) bool {
     return true;
 }
 
+/// Tell the peer an attempt is being given up, then leave it.
+///
+/// TCP does this without being asked: closing the socket sends a FIN or RST,
+/// and the server's state for the connection goes with it. A QUIC client that
+/// just stops talking leaves the server holding the connection until its own
+/// idle or handshake timeout, and a server with a bounded pool turns new
+/// connections away meanwhile. On c1k-h3, zoxy's 1,024 QUIC slots ran out
+/// with 1,000 connections offered, which only attempts zrk had already given
+/// up can explain, and it turned 10.1M connection attempts away.
+///
+/// RFC 9000 §10.2's immediate close, NO_ERROR (§20.1) because nothing on the
+/// peer's side failed, at every level this endpoint has keys for. Sent once
+/// and not waited on: the socket closes next, so a lost close costs the peer
+/// no more than silence did before.
+fn abandon(p: *conn.Params, state: *State, socket: *net.Socket, now_ns: u64) void {
+    state.connection.close(.no_error);
+    _ = flush(p, state, socket, now_ns);
+}
+
 /// Build and send datagrams until the connection has nothing more.
 fn flush(p: *conn.Params, state: *State, socket: *net.Socket, now_ns: u64) bool {
     for (0..flush_datagrams_max) |_| {
@@ -2012,4 +2088,79 @@ test "retries go out oldest first and do not advance the schedule" {
     advance(f.state, &send_index, false);
     try testing.expectEqual(@as(u64, 8), send_index);
     try testing.expectEqual(@as(usize, 1), f.state.retry_len);
+}
+
+test "the handshake gets two timeouts, as TCP's connect and TLS handshake do" {
+    try testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), handshakeBound(std.time.ns_per_s));
+    try testing.expectEqual(handshake_deadline_ns, handshakeBound(0));
+}
+
+test "a reconnect waits 5 ms and less than one timeout more" {
+    const ms = std.time.ns_per_ms;
+    const s = std.time.ns_per_s;
+    try testing.expectEqual(@as(i96, 5 * ms), reconnectPause(s, 0).nanoseconds);
+    try testing.expectEqual(@as(i96, 5 * ms + s - 1), reconnectPause(s, s - 1).nanoseconds);
+    try testing.expectEqual(@as(i96, 5 * ms), reconnectPause(s, s).nanoseconds);
+    try testing.expect(reconnectPause(200 * ms, std.math.maxInt(u64)).nanoseconds < 205 * ms);
+    // With no --timeout, the share is of a second.
+    try testing.expect(reconnectPause(0, std.math.maxInt(u64)).nanoseconds < 5 * ms + s);
+}
+
+/// What `silent` has been sent since it was last read: the datagrams from the
+/// first source port among them, and those from any other.
+fn drainSilent(io: Io, silent: *const net.Socket) !struct { first: u32, other: u32 } {
+    var buffer: [2048]u8 = undefined;
+    var first_port: ?u16 = null;
+    var first: u32 = 0;
+    var other: u32 = 0;
+    while (true) {
+        const message = silent.receiveTimeout(io, &buffer, .{ .duration = .{
+            .raw = Io.Duration.fromMilliseconds(20),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout => break,
+            else => return err,
+        };
+        const port = message.from.getPort();
+        if (first_port == null) first_port = port;
+        if (port == first_port.?) first += 1 else other += 1;
+    }
+    return .{ .first = first, .other = other };
+}
+
+test "a silent peer hears one ClientHello, then a CONNECTION_CLOSE after two timeouts" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const io = f.params.io;
+    const ms = std.time.ns_per_ms;
+
+    // A peer that reads nothing and answers nothing, so the handshake can only
+    // run out of time.
+    const loopback = try net.IpAddress.parse("127.0.0.1", 0);
+    var silent = try loopback.bind(io, .{ .mode = .dgram });
+    defer silent.close(io);
+    f.params.address = silent.address;
+    f.params.timeout_ns = 100 * ms;
+    f.params.h3_state = f.state;
+
+    // The run ends at 150 ms: past one timeout, inside two. Nothing is
+    // charged, and what reached the peer is the ClientHello alone, one
+    // datagram, since the first probe timeout is a second away (RFC 9002
+    // §6.2.2's 333 ms initial RTT). 3.0.3 sent 13 here: it took every wake of
+    // the loop, one each `idle_slice_ns`, for the loss timer firing.
+    f.params.end = .{ .nanoseconds = conn.now(io).nanoseconds + 150 * ms };
+    run(&f.params);
+    try testing.expectEqual(@as(u64, 0), f.counters.connect_errors);
+    const hello = try drainSilent(io, &silent);
+    try testing.expectEqual(@as(u32, 1), hello.first);
+    try testing.expectEqual(@as(u32, 0), hello.other);
+
+    // At 300 ms the attempt is given up at 200, and the peer is told: one
+    // datagram more from that attempt's port than the ClientHello took, and
+    // with no probe due yet, nothing else can be it.
+    f.params.end = .{ .nanoseconds = conn.now(io).nanoseconds + 300 * ms };
+    run(&f.params);
+    try testing.expectEqual(@as(u64, 1), f.counters.connect_errors);
+    const given_up = try drainSilent(io, &silent);
+    try testing.expectEqual(hello.first + 1, given_up.first);
 }
