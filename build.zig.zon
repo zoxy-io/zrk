@@ -62,9 +62,19 @@
         // strands them once the congestion window grows past thirty-two
         // packets. `src/h3conn.zig` has the diagnosis.
         //
+        // And past h3#11, which stops refusing a frame for a stream this
+        // client has already retired (the pin is #12 on top of it, zoxy's
+        // pin too). Below it, a server retransmitting
+        // the tail of an answer the client already had, after a probe or a
+        // spurious loss, closed the connection with STREAM_STATE_ERROR: a
+        // read error, then a reconnect. That grew with the request rate and
+        // with how often the server under test retransmits, so it charged
+        // proxies unevenly, and it was 3.0.4's whole HTTP/3 read error count
+        // against zoxy.
+        //
         .h3 = .{
-            .url = "git+https://github.com/zoxy-io/h3#aef8b759f0a4e15bd49f1dbca464a136959a4b2f",
-            .hash = "h3-0.0.0-RBkp8urcGgCQqqsBBrkUyIpkb5HA8Kn5LtGqVrQHLTOb",
+            .url = "git+https://github.com/zoxy-io/h3#004f04a18f40bfcf0fd99fc2a020ae182a726039",
+            .hash = "h3-0.0.0-RBkp8s4DGwAzHjIRBnPAkgl09zr1YfMsm04n_PGCK7aZ",
         },
         // LuaJIT 2.1, for `--script`: what wrk links, so wrk scripts — Lua 5.1
         // plus `bit` and `unpack` — run unchanged. Built from source by
